@@ -157,19 +157,19 @@ func main() {
 			}
 		}
 
-		rateLimiter = smtp.NewRateLimiter(
-			cfg.SMTP.RateLimit.Enabled,
-			cfg.SMTP.RateLimit.ConnectionsPerMinute,
-			cfg.SMTP.RateLimit.WindowSize,
-			cfg.SMTP.RateLimit.GossipEnabled,
-			cfg.SMTP.RateLimit.GossipInterval,
-			peerURLs,
-			logger,
-		)
+		rateLimiter = smtp.NewRateLimiter(cfg.SMTP.RateLimit, peerURLs, logger)
+
+		// Log configured dimensions
 		logger.Info("Rate limiting enabled",
-			zap.Int("connections_per_minute", cfg.SMTP.RateLimit.ConnectionsPerMinute),
-			zap.Duration("window", cfg.SMTP.RateLimit.WindowSize),
+			zap.Int("dimensions", len(cfg.SMTP.RateLimit.Dimensions)),
 			zap.Bool("gossip_enabled", cfg.SMTP.RateLimit.GossipEnabled))
+		for _, dim := range cfg.SMTP.RateLimit.Dimensions {
+			logger.Info("Rate limit dimension configured",
+				zap.String("name", dim.Name),
+				zap.Strings("keys", dim.Keys),
+				zap.Int("limit", dim.Limit),
+				zap.Duration("window", dim.Window))
+		}
 
 		// Register rate limit gossip endpoint with health server
 		if cfg.SMTP.RateLimit.GossipEnabled && healthServer != nil {

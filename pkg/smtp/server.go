@@ -120,8 +120,12 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 	sessionCreated := false
 
 	// Check rate limit (prevent rapid connection attempts)
+	// At this point, we only have IP information, so only IP-based dimensions will be checked
 	if be.RateLimiter != nil {
-		if err := be.RateLimiter.CheckRateLimit(remoteAddr); err != nil {
+		sessionCtx := SessionContext{
+			RemoteAddr: remoteAddr,
+		}
+		if err := be.RateLimiter.CheckRateLimit(sessionCtx); err != nil {
 			be.Logger.Warn("Rate limit exceeded", zap.String("remote_addr", remoteAddr), zap.Error(err))
 			return nil, &smtp.SMTPError{
 				Code:         421,
@@ -307,6 +311,7 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 		dnsResolver:    be.DNSResolver,
 		connTracker:    be.ConnTracker,
 		distTracker:    be.DistTracker,
+		rateLimiter:    be.RateLimiter,
 		ctx:            ctx,
 		Logger:         be.Logger.With(zap.String("trace_id", traceID)),
 		cancel:         cancel,
@@ -337,6 +342,7 @@ type Session struct {
 	dnsResolver    *net.Resolver          // DNS resolver (custom or system default)
 	connTracker    *ConnectionTracker     // Connection tracker for DoS protection
 	distTracker    *DistributedTracker    // Distributed connection tracker (optional, for cluster-wide limits)
+	rateLimiter    *RateLimiter           // Multi-dimensional rate limiter
 	ctx            context.Context        // Session context with deadline for timeout
 	Logger         *zap.Logger            // Structured logger for this session
 	cancel         context.CancelFunc     // Cancel function to clean up resources
@@ -586,6 +592,25 @@ func (s *Session) Mail(from string, opts *smtp.MailOptions) error {
 
 	s.from = from
 	s.commandState = stateMail
+
+	// Check rate limits now that we have FROM information
+	// This allows FROM, FROM_DOMAIN, and IP+FROM combination checks
+	if s.rateLimiter != nil {
+		sessionCtx := SessionContext{
+			RemoteAddr: s.remoteAddr,
+			From:       from,
+			To:         s.to, // May be empty at this point
+		}
+		if err := s.rateLimiter.CheckRateLimit(sessionCtx); err != nil {
+			s.Logger.Warn("Rate limit exceeded for sender", zap.String("from", from), zap.Error(err))
+			return &smtp.SMTPError{
+				Code:         421,
+				EnhancedCode: smtp.EnhancedCode{4, 3, 2},
+				Message:      "rate limit exceeded, please slow down",
+			}
+		}
+	}
+
 	if s.tlsState != nil {
 		s.Logger.Info("MAIL FROM", zap.String("from", from), zap.String("remote_addr", s.remoteAddr), zap.String("tls", tlsVersionString(s.tlsState.Version)))
 	} else {
@@ -640,6 +665,24 @@ func (s *Session) Rcpt(to string, opts *smtp.RcptOptions) error {
 
 	s.to = append(s.to, to)
 	s.commandState = stateRcpt
+
+	// Check rate limits now that we have TO information
+	// This allows TO, TO_DOMAIN, FROM+TO, and other recipient-based combination checks
+	if s.rateLimiter != nil {
+		sessionCtx := SessionContext{
+			RemoteAddr: s.remoteAddr,
+			From:       s.from,
+			To:         s.to,
+		}
+		if err := s.rateLimiter.CheckRateLimit(sessionCtx); err != nil {
+			s.Logger.Warn("Rate limit exceeded for recipient", zap.String("to", to), zap.Error(err))
+			return &smtp.SMTPError{
+				Code:         421,
+				EnhancedCode: smtp.EnhancedCode{4, 3, 2},
+				Message:      "rate limit exceeded, please slow down",
+			}
+		}
+	}
 
 	// Reset to idle timeout to wait for the next command
 	if err := s.setCommandTimeout(IdleTimeout); err != nil {

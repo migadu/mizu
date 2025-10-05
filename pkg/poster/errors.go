@@ -32,7 +32,14 @@ func (e *HTTPStatusError) Error() string {
 // IsRetryable returns true if the status code indicates a retryable error
 func (e *HTTPStatusError) IsRetryable() bool {
 	// 5xx server errors are retryable
-	return e.StatusCode >= 500 && e.StatusCode < 600
+	if e.StatusCode >= 500 && e.StatusCode < 600 {
+		return true
+	}
+	// 429 Too Many Requests is retryable (rate limiting)
+	if e.StatusCode == 429 {
+		return true
+	}
+	return false
 }
 
 // IsRecipientNotFound returns true if the status code indicates recipient not found (404)

@@ -36,11 +36,18 @@ type SMTPConfig struct {
 
 // RateLimitConfig holds rate limiting configuration
 type RateLimitConfig struct {
-	Enabled              bool          `toml:"enabled"`                // Enable rate limiting (default: true)
-	ConnectionsPerMinute int           `toml:"connections_per_minute"` // Max connections per IP per minute (default: 60, 0 = unlimited)
-	WindowSize           time.Duration `toml:"window_size"`            // Sliding window size (default: 1m)
-	GossipEnabled        bool          `toml:"gossip_enabled"`         // Share rate limit state across cluster via gossip (default: false)
-	GossipInterval       time.Duration `toml:"gossip_interval"`        // How often to gossip rate limit data (default: 5s)
+	Enabled        bool                 `toml:"enabled"`         // Enable rate limiting (default: true)
+	GossipEnabled  bool                 `toml:"gossip_enabled"`  // Share rate limit state across cluster via gossip (default: false)
+	GossipInterval time.Duration        `toml:"gossip_interval"` // How often to gossip rate limit data (default: 5s)
+	Dimensions     []RateLimitDimension `toml:"dimensions"`      // Rate limit dimensions (e.g., IP, FROM, FROM_DOMAIN, etc.)
+}
+
+// RateLimitDimension defines a single rate limit dimension with configurable key combination
+type RateLimitDimension struct {
+	Name   string        `toml:"name"`   // Human-readable name for this dimension
+	Keys   []string      `toml:"keys"`   // Dimension keys to combine (IP, FROM, FROM_DOMAIN, TO, TO_DOMAIN)
+	Limit  int           `toml:"limit"`  // Max connections/emails per window (0 = unlimited)
+	Window time.Duration `toml:"window"` // Time window for rate limiting (default: 1m)
 }
 
 // DNSConfig holds DNS resolver configuration (global for all DNS operations)
@@ -147,11 +154,17 @@ func DefaultConfig() *Config {
 			MaxConnections:        100,              // Default max 100 concurrent connections
 			MaxConnectionsPerIP:   10,               // Default max 10 connections per IP
 			RateLimit: RateLimitConfig{
-				Enabled:              true,            // Enabled by default
-				ConnectionsPerMinute: 60,              // Max 60 connections per IP per minute
-				WindowSize:           1 * time.Minute, // 1 minute sliding window
-				GossipEnabled:        false,           // Disabled by default (requires cluster mode)
-				GossipInterval:       5 * time.Second, // Gossip every 5 seconds
+				Enabled:        true,            // Enabled by default
+				GossipEnabled:  false,           // Disabled by default (requires cluster mode)
+				GossipInterval: 5 * time.Second, // Gossip every 5 seconds
+				Dimensions: []RateLimitDimension{
+					{
+						Name:   "per_ip",
+						Keys:   []string{"IP"},
+						Limit:  60,
+						Window: 1 * time.Minute,
+					},
+				},
 			},
 			Distributed: DistributedLimitsConfig{
 				Enabled:           false,            // Disabled by default
