@@ -5,35 +5,36 @@ local = false
 listen_addr = ":25"
 domain = "mail.example.com"
 max_message_size = 10485760
-timeout_duration = "10s"
+timeout_seconds = 10
 min_tls_version = "1.2"
 check_x_spam_flag = true
 dmarc_quarantine_as_junk = true
 require_sender_mx = true
-shutdown_timeout = "1m0s"
+shutdown_timeout_seconds = 60
 max_connections = 100
 max_connections_per_ip = 10
-
 [smtp.rate_limit]
 enabled = true
 gossip_enabled = false
-gossip_interval = "5s"
+gossip_interval_seconds = 5
 
 [[smtp.rate_limit.dimensions]]
 name = "per_ip"
 keys = ["IP"]
 limit = 60
-window = "1m0s"
+window_seconds = 60
 [smtp.distributed]
 enabled = false
 global_max_per_ip = 0
-gossip_interval = "5s"
-s3_sync_interval = "30s"
-recipient_cache_ttl = "15m0s"
+gossip_interval_seconds = 5
+s3_sync_interval_seconds = 30
+recipient_cache_ttl_seconds = 900
 
 [dns]
-servers = []
-timeout = "5s"
+resolvers = []
+timeout_seconds = 5
+cache_ttl_seconds = 300
+cache_negative_ttl = 60
 
 [s3]
 endpoint = "s3.amazonaws.com"
@@ -47,46 +48,53 @@ region = "us-east-1"
 url = "https://your-worker.example.com/email"
 api_key = "your-api-key-here"
 max_retry_attempts = 3
-http_timeout = "30s"
+http_timeout_seconds = 30
 [destination.circuit_breaker]
 enabled = true
 failure_threshold = 5
 success_threshold = 2
-timeout = "30s"
+timeout_seconds = 30
 half_open_max_calls = 1
-reset_timeout = "1m0s"
+reset_timeout_seconds = 60
 
 [tls]
 email = "admin@example.com"
+domains = []
 use_production = true
 use_local_ca = false
 certmagic_verbose = false
+enable_autocert = false
 
 [blacklists]
 enabled = true
 lists = ["zen.spamhaus.org"]
-timeout = "3s"
+timeout_seconds = 3
 check_helo_resolves = false
 
 [health]
 enabled = true
-listen_addr = ":8080"
-username = ""
-password = ""
+listen_addr = ":8080"  # Health checks, stats, and admin API
+username = ""          # HTTP Basic Auth username (empty = no auth, used by mizu-admin)
+password = ""          # HTTP Basic Auth password
+
+[metrics]
+enabled = true         # Enable Prometheus metrics endpoint (recommended for production)
+path = "/metrics"      # Metrics endpoint path
+username = ""          # HTTP Basic Auth username (empty = no auth, set for production scraping)
+password = ""          # HTTP Basic Auth password (use strong password in production)
 
 [stats]
 enabled = true
-retention_duration = "24h0m0s"
+retention_seconds = 86400
 sync_enabled = false
-sync_interval = "1m0s"
+sync_interval_seconds = 60
 max_ip_entries = 100000
 max_domain_entries = 50000
 
 [cluster]
 enabled = false
-node_name = ""         # Auto-detected from hostname if empty
-bind_addr = "0.0.0.0"  # Address to bind memberlist to
-bind_port = 7946       # Memberlist gossip port (standard port)
-advertise_addr = ""    # Address to advertise to peers (auto-detected if empty)
-advertise_port = 0     # Port to advertise (defaults to bind_port if 0)
-seed_nodes = []        # Initial nodes to join, e.g., ["node1.example.com:7946", "node2.example.com:7946"]
+node_name = ""
+bind_addr = "0.0.0.0"
+bind_port = 7946
+peers = []
+secret_key = ""

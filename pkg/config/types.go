@@ -1,7 +1,5 @@
 package config
 
-import "time"
-
 // Config holds all configuration for the SMTP relay server
 type Config struct {
 	SMTP        SMTPConfig        `toml:"smtp"`
@@ -11,6 +9,7 @@ type Config struct {
 	TLS         TLSConfig         `toml:"tls"`
 	Blacklists  BlacklistsConfig  `toml:"blacklists"`
 	Health      HealthConfig      `toml:"health"`
+	Metrics     MetricsConfig     `toml:"metrics"`
 	Stats       StatsConfig       `toml:"stats"`
 	Cluster     ClusterConfig     `toml:"cluster"`    // Global cluster/peering configuration
 	LogFormat   string            `toml:"log_format"` // "json" or "text"
@@ -19,61 +18,62 @@ type Config struct {
 
 // SMTPConfig holds SMTP server configuration
 type SMTPConfig struct {
-	ListenAddr            string                  `toml:"listen_addr"`
-	Domain                string                  `toml:"domain"`
-	MaxMessageSize        int                     `toml:"max_message_size"`
-	TimeoutDuration       time.Duration           `toml:"timeout_duration"`
-	MinTLSVersion         string                  `toml:"min_tls_version"`          // Minimum TLS version: "1.2" or "1.3" (TLS 1.0/1.1 not supported)
-	CheckXSpamFlag        bool                    `toml:"check_x_spam_flag"`        // Enable check for X-Spam-Flag header
-	DMARCQuarantineAsJunk bool                    `toml:"dmarc_quarantine_as_junk"` // Treat DMARC quarantine policy as junk
-	RequireSenderMX       bool                    `toml:"require_sender_mx"`        // Require sender domain to have MX records (default: true)
-	ShutdownTimeout       time.Duration           `toml:"shutdown_timeout"`         // Maximum time to wait for graceful shutdown (default: 60s)
-	MaxConnections        int                     `toml:"max_connections"`          // Maximum total concurrent connections (0 = unlimited, default: 100)
-	MaxConnectionsPerIP   int                     `toml:"max_connections_per_ip"`   // Maximum concurrent connections per IP (0 = unlimited, default: 10)
-	RateLimit             RateLimitConfig         `toml:"rate_limit"`               // Rate limiting configuration
-	Distributed           DistributedLimitsConfig `toml:"distributed"`              // Distributed connection tracking
+	ListenAddr             string                  `toml:"listen_addr"`
+	Domain                 string                  `toml:"domain"`
+	MaxMessageSize         int                     `toml:"max_message_size"`
+	TimeoutSeconds         int                     `toml:"timeout_seconds"`          // SMTP command timeout in seconds (default: 10)
+	MinTLSVersion          string                  `toml:"min_tls_version"`          // Minimum TLS version: "1.2" or "1.3" (TLS 1.0/1.1 not supported)
+	CheckXSpamFlag         bool                    `toml:"check_x_spam_flag"`        // Enable check for X-Spam-Flag header
+	DMARCQuarantineAsJunk  bool                    `toml:"dmarc_quarantine_as_junk"` // Treat DMARC quarantine policy as junk
+	RequireSenderMX        bool                    `toml:"require_sender_mx"`        // Require sender domain to have MX records (default: true)
+	ShutdownTimeoutSeconds int                     `toml:"shutdown_timeout_seconds"` // Maximum time to wait for graceful shutdown in seconds (default: 60)
+	MaxConnections         int                     `toml:"max_connections"`          // Maximum total concurrent connections (0 = unlimited, default: 100)
+	MaxConnectionsPerIP    int                     `toml:"max_connections_per_ip"`   // Maximum concurrent connections per IP (0 = unlimited, default: 10)
+	RateLimit              RateLimitConfig         `toml:"rate_limit"`               // Rate limiting configuration
+	Distributed            DistributedLimitsConfig `toml:"distributed"`              // Distributed connection tracking
 }
 
 // RateLimitConfig holds rate limiting configuration
 type RateLimitConfig struct {
-	Enabled        bool                 `toml:"enabled"`         // Enable rate limiting (default: true)
-	GossipEnabled  bool                 `toml:"gossip_enabled"`  // Share rate limit state across cluster via gossip (default: false)
-	GossipInterval time.Duration        `toml:"gossip_interval"` // How often to gossip rate limit data (default: 5s)
-	Dimensions     []RateLimitDimension `toml:"dimensions"`      // Rate limit dimensions (e.g., IP, FROM, FROM_DOMAIN, etc.)
+	Enabled               bool                 `toml:"enabled"`                 // Enable rate limiting (default: true)
+	GossipEnabled         bool                 `toml:"gossip_enabled"`          // Share rate limit state across cluster via gossip (default: false)
+	GossipIntervalSeconds int                  `toml:"gossip_interval_seconds"` // How often to gossip rate limit data in seconds (default: 5)
+	Dimensions            []RateLimitDimension `toml:"dimensions"`              // Rate limit dimensions (e.g., IP, FROM, FROM_DOMAIN, etc.)
 }
 
 // RateLimitDimension defines a single rate limit dimension with configurable key combination
 type RateLimitDimension struct {
-	Name   string        `toml:"name"`   // Human-readable name for this dimension
-	Keys   []string      `toml:"keys"`   // Dimension keys to combine (IP, FROM, FROM_DOMAIN, TO, TO_DOMAIN)
-	Limit  int           `toml:"limit"`  // Max connections/emails per window (0 = unlimited)
-	Window time.Duration `toml:"window"` // Time window for rate limiting (default: 1m)
+	Name          string   `toml:"name"`           // Human-readable name for this dimension
+	Keys          []string `toml:"keys"`           // Dimension keys to combine (IP, FROM, FROM_DOMAIN, TO, TO_DOMAIN)
+	Limit         int      `toml:"limit"`          // Max connections/emails per window (0 = unlimited)
+	WindowSeconds int      `toml:"window_seconds"` // Time window for rate limiting in seconds (default: 60)
 }
 
 // DNSConfig holds DNS resolver configuration (global for all DNS operations)
 type DNSConfig struct {
-	Servers []string      `toml:"servers"` // Custom DNS servers (e.g., ["1.1.1.1:53", "1.0.0.1:53"]), empty = use system default
-	Timeout time.Duration `toml:"timeout"` // DNS query timeout (default: 5s)
+	Resolvers        []string `toml:"resolvers"`          // Custom DNS resolvers (e.g., ["1.1.1.1:53", "1.0.0.1:53"]), empty = use system default
+	TimeoutSeconds   int      `toml:"timeout_seconds"`    // DNS query timeout in seconds (default: 5)
+	CacheTTLSeconds  int      `toml:"cache_ttl_seconds"`  // DNS cache TTL in seconds for successful lookups (default: 300 = 5m)
+	CacheNegativeTTL int      `toml:"cache_negative_ttl"` // DNS cache TTL in seconds for failed lookups (default: 60 = 1m)
 }
 
 // ClusterConfig holds global cluster/peering configuration (using memberlist)
 type ClusterConfig struct {
-	Enabled       bool     `toml:"enabled"`        // Enable cluster mode (memberlist)
-	NodeName      string   `toml:"node_name"`      // This node's name (defaults to hostname)
-	BindAddr      string   `toml:"bind_addr"`      // Address to bind memberlist to (e.g., "0.0.0.0")
-	BindPort      int      `toml:"bind_port"`      // Port for memberlist (default: 7946)
-	AdvertiseAddr string   `toml:"advertise_addr"` // Address to advertise to peers (optional, auto-detected)
-	AdvertisePort int      `toml:"advertise_port"` // Port to advertise (optional, defaults to bind_port)
-	SeedNodes     []string `toml:"seed_nodes"`     // Initial nodes to join (e.g., ["node1.example.com:7946"])
+	Enabled   bool     `toml:"enabled"`    // Enable cluster mode (memberlist)
+	NodeName  string   `toml:"node_name"`  // This node's name (defaults to hostname)
+	BindAddr  string   `toml:"bind_addr"`  // Address to bind memberlist to (e.g., "0.0.0.0")
+	BindPort  int      `toml:"bind_port"`  // Port for memberlist (default: 7946)
+	Peers     []string `toml:"peers"`      // Other cluster nodes to connect to (e.g., ["node1.example.com:7946"])
+	SecretKey string   `toml:"secret_key"` // 32-byte base64-encoded encryption key (use CLUSTER_SECRET_KEY env var)
 }
 
 // DistributedLimitsConfig holds configuration for distributed connection tracking
 type DistributedLimitsConfig struct {
-	Enabled           bool          `toml:"enabled"`             // Enable distributed tracking (requires cluster.enabled=true)
-	GlobalMaxPerIP    int           `toml:"global_max_per_ip"`   // Global max connections per IP across cluster (0 = use local limit only)
-	GossipInterval    time.Duration `toml:"gossip_interval"`     // How often to broadcast (default: 5s)
-	S3SyncInterval    time.Duration `toml:"s3_sync_interval"`    // How often to sync with S3 (default: 30s)
-	RecipientCacheTTL time.Duration `toml:"recipient_cache_ttl"` // How long to cache recipient validation results (default: 15m)
+	Enabled                  bool `toml:"enabled"`                     // Enable distributed tracking (requires cluster.enabled=true)
+	GlobalMaxPerIP           int  `toml:"global_max_per_ip"`           // Global max connections per IP across cluster (0 = use local limit only)
+	GossipIntervalSeconds    int  `toml:"gossip_interval_seconds"`     // How often to broadcast in seconds (default: 5)
+	S3SyncIntervalSeconds    int  `toml:"s3_sync_interval_seconds"`    // How often to sync with S3 in seconds (default: 30)
+	RecipientCacheTTLSeconds int  `toml:"recipient_cache_ttl_seconds"` // How long to cache recipient validation results in seconds (default: 900 = 15m)
 }
 
 // S3Config holds S3 configuration for certificate storage
@@ -88,21 +88,21 @@ type S3Config struct {
 
 // DestinationConfig holds configuration for the HTTP destination endpoint
 type DestinationConfig struct {
-	URL              string               `toml:"url"`
-	APIKey           string               `toml:"api_key"`
-	MaxRetryAttempts int                  `toml:"max_retry_attempts"`
-	HTTPTimeout      time.Duration        `toml:"http_timeout"` // HTTP client timeout (default: 30s)
-	CircuitBreaker   CircuitBreakerConfig `toml:"circuit_breaker"`
+	URL                string               `toml:"url"`
+	APIKey             string               `toml:"api_key"`
+	MaxRetryAttempts   int                  `toml:"max_retry_attempts"`
+	HTTPTimeoutSeconds int                  `toml:"http_timeout_seconds"` // HTTP client timeout in seconds (default: 30)
+	CircuitBreaker     CircuitBreakerConfig `toml:"circuit_breaker"`
 }
 
 // CircuitBreakerConfig holds configuration for the circuit breaker
 type CircuitBreakerConfig struct {
-	Enabled          bool          `toml:"enabled"`
-	FailureThreshold int           `toml:"failure_threshold"`   // failures before opening (default: 5)
-	SuccessThreshold int           `toml:"success_threshold"`   // successes in half-open to close (default: 2)
-	Timeout          time.Duration `toml:"timeout"`             // time to wait before half-open (default: 30s)
-	HalfOpenMaxCalls int           `toml:"half_open_max_calls"` // max concurrent calls in half-open (default: 1)
-	ResetTimeout     time.Duration `toml:"reset_timeout"`       // time before resetting counters (default: 60s)
+	Enabled             bool `toml:"enabled"`
+	FailureThreshold    int  `toml:"failure_threshold"`     // failures before opening (default: 5)
+	SuccessThreshold    int  `toml:"success_threshold"`     // successes in half-open to close (default: 2)
+	TimeoutSeconds      int  `toml:"timeout_seconds"`       // time to wait before half-open in seconds (default: 30)
+	HalfOpenMaxCalls    int  `toml:"half_open_max_calls"`   // max concurrent calls in half-open (default: 1)
+	ResetTimeoutSeconds int  `toml:"reset_timeout_seconds"` // time before resetting counters in seconds (default: 60)
 }
 
 // HealthConfig holds configuration for the health check endpoint.
@@ -113,72 +113,84 @@ type HealthConfig struct {
 	Password   string `toml:"password"` // HTTP Basic Auth password
 }
 
+// MetricsConfig holds configuration for Prometheus metrics endpoint
+type MetricsConfig struct {
+	Enabled  bool   `toml:"enabled"`  // Enable Prometheus metrics endpoint
+	Path     string `toml:"path"`     // Metrics endpoint path (default: "/metrics")
+	Username string `toml:"username"` // HTTP Basic Auth username (optional, empty = no auth)
+	Password string `toml:"password"` // HTTP Basic Auth password
+}
+
 // BlacklistsConfig holds configuration for DNS blacklists
 type BlacklistsConfig struct {
-	Enabled           bool          `toml:"enabled"`             // Whether to enable blacklist checking
-	Lists             []string      `toml:"lists"`               // DNS blacklist servers to check
-	Timeout           time.Duration `toml:"timeout"`             // Timeout for blacklist queries
-	CheckHELOResolves bool          `toml:"check_helo_resolves"` // Whether to check if HELO hostname resolves
+	Enabled           bool     `toml:"enabled"`             // Whether to enable blacklist checking
+	Lists             []string `toml:"lists"`               // DNS blacklist servers to check
+	TimeoutSeconds    int      `toml:"timeout_seconds"`     // Timeout for blacklist queries in seconds (default: 3)
+	CheckHELOResolves bool     `toml:"check_helo_resolves"` // Whether to check if HELO hostname resolves
 }
 
 // TLSConfig holds TLS/certificate configuration
 type TLSConfig struct {
-	Email            string `toml:"email"`             // Email for Let's Encrypt
-	UseProduction    bool   `toml:"use_production"`    // Use Let's Encrypt production (vs staging)
-	UseLocalCA       bool   `toml:"use_local_ca"`      // Use local CA for testing
-	CertMagicVerbose bool   `toml:"certmagic_verbose"` // Enable verbose certmagic logging
+	Email            string   `toml:"email"`             // Email for Let's Encrypt
+	Domains          []string `toml:"domains"`           // Domains to obtain certificates for
+	UseProduction    bool     `toml:"use_production"`    // Use Let's Encrypt production (vs staging)
+	UseLocalCA       bool     `toml:"use_local_ca"`      // Use local CA for testing
+	CertMagicVerbose bool     `toml:"certmagic_verbose"` // Enable verbose certmagic logging
+	EnableAutocert   bool     `toml:"enable_autocert"`   // Enable autocert for automatic certificate management
 }
 
 // StatsConfig holds configuration for IP and domain reputation tracking
 // Note: Peer and hostname configuration is now in ClusterConfig (cluster.peers + cluster.hostname)
 type StatsConfig struct {
-	Enabled           bool          `toml:"enabled"`            // Enable stats tracking
-	RetentionDuration time.Duration `toml:"retention_duration"` // How long to keep stats
-	SyncEnabled       bool          `toml:"sync_enabled"`       // Enable distributed stats sync (uses cluster.peers)
-	SyncInterval      time.Duration `toml:"sync_interval"`      // How often to sync/export stats
-	MaxIPEntries      int           `toml:"max_ip_entries"`     // Maximum number of IP entries to track (0 = unlimited, default: 100000)
-	MaxDomainEntries  int           `toml:"max_domain_entries"` // Maximum number of domain entries to track (0 = unlimited, default: 50000)
+	Enabled             bool `toml:"enabled"`               // Enable stats tracking
+	RetentionSeconds    int  `toml:"retention_seconds"`     // How long to keep stats in seconds (default: 86400 = 24h)
+	SyncEnabled         bool `toml:"sync_enabled"`          // Enable distributed stats sync (uses cluster.peers)
+	SyncIntervalSeconds int  `toml:"sync_interval_seconds"` // How often to sync/export stats in seconds (default: 60)
+	MaxIPEntries        int  `toml:"max_ip_entries"`        // Maximum number of IP entries to track (0 = unlimited, default: 100000)
+	MaxDomainEntries    int  `toml:"max_domain_entries"`    // Maximum number of domain entries to track (0 = unlimited, default: 50000)
 }
 
-// DefaultConfig returns a Config with default values
-func DefaultConfig() *Config {
-	return &Config{
+// DefaultConfig returns a Config with sensible default values
+func DefaultConfig() Config {
+	return Config{
 		SMTP: SMTPConfig{
-			ListenAddr:            ":25",
-			Domain:                "mail.yourdomain.com",
-			MaxMessageSize:        10 << 20, // 10 MB
-			TimeoutDuration:       10 * time.Second,
-			MinTLSVersion:         "1.2",            // Default to TLS 1.2
-			CheckXSpamFlag:        true,             // Default to enabled
-			DMARCQuarantineAsJunk: true,             // Default to treating quarantine as junk
-			RequireSenderMX:       true,             // Default to requiring MX records
-			ShutdownTimeout:       60 * time.Second, // Default 60s graceful shutdown
-			MaxConnections:        100,              // Default max 100 concurrent connections
-			MaxConnectionsPerIP:   10,               // Default max 10 connections per IP
+			ListenAddr:             ":25",              // Standard SMTP port
+			Domain:                 "mail.example.com", // Default domain
+			MaxMessageSize:         10 * 1024 * 1024,   // Default 10MB max message size
+			TimeoutSeconds:         10,                 // Default 10s SMTP timeout
+			MinTLSVersion:          "1.2",              // Default to TLS 1.2 minimum
+			CheckXSpamFlag:         true,               // Default to checking X-Spam-Flag header
+			DMARCQuarantineAsJunk:  true,               // Default to treating quarantine as junk
+			RequireSenderMX:        true,               // Default to requiring MX records
+			ShutdownTimeoutSeconds: 60,                 // Default 60s graceful shutdown
+			MaxConnections:         100,                // Default max 100 concurrent connections
+			MaxConnectionsPerIP:    10,                 // Default max 10 connections per IP
 			RateLimit: RateLimitConfig{
-				Enabled:        true,            // Enabled by default
-				GossipEnabled:  false,           // Disabled by default (requires cluster mode)
-				GossipInterval: 5 * time.Second, // Gossip every 5 seconds
+				Enabled:               true,  // Enabled by default
+				GossipEnabled:         false, // Disabled by default (requires cluster mode)
+				GossipIntervalSeconds: 5,     // Gossip every 5 seconds
 				Dimensions: []RateLimitDimension{
 					{
-						Name:   "per_ip",
-						Keys:   []string{"IP"},
-						Limit:  60,
-						Window: 1 * time.Minute,
+						Name:          "per_ip",
+						Keys:          []string{"IP"},
+						Limit:         60,
+						WindowSeconds: 60,
 					},
 				},
 			},
 			Distributed: DistributedLimitsConfig{
-				Enabled:           false,            // Disabled by default
-				GlobalMaxPerIP:    0,                // 0 = use local limit only
-				GossipInterval:    5 * time.Second,  // Broadcast every 5 seconds
-				S3SyncInterval:    30 * time.Second, // Sync with S3 every 30 seconds
-				RecipientCacheTTL: 15 * time.Minute, // Cache recipient results for 15 minutes
+				Enabled:                  false, // Disabled by default
+				GlobalMaxPerIP:           0,     // Disabled by default
+				GossipIntervalSeconds:    5,     // Gossip every 5 seconds
+				S3SyncIntervalSeconds:    30,    // Sync with S3 every 30 seconds
+				RecipientCacheTTLSeconds: 900,   // Cache recipient results for 15 minutes
 			},
 		},
 		DNS: DNSConfig{
-			Servers: []string{},      // Empty = use system DNS
-			Timeout: 5 * time.Second, // Default 5s DNS timeout
+			Resolvers:        []string{}, // Empty = use system DNS
+			TimeoutSeconds:   5,          // Default 5s DNS timeout
+			CacheTTLSeconds:  300,        // Default 5m (300s) DNS cache TTL
+			CacheNegativeTTL: 60,         // Default 1m (60s) negative cache TTL
 		},
 		S3: S3Config{
 			Endpoint: "s3.amazonaws.com",
@@ -187,47 +199,59 @@ func DefaultConfig() *Config {
 			Region:   "us-east-1",
 		},
 		Destination: DestinationConfig{
-			MaxRetryAttempts: 3,                // Default to 3 retry attempts
-			HTTPTimeout:      30 * time.Second, // Default 30s HTTP client timeout
+			URL:                "https://your-worker.example.com/email",
+			APIKey:             "your-api-key-here",
+			MaxRetryAttempts:   3,
+			HTTPTimeoutSeconds: 30, // Default 30s HTTP timeout
 			CircuitBreaker: CircuitBreakerConfig{
-				Enabled:          true,             // Enabled by default
-				FailureThreshold: 5,                // Open after 5 consecutive failures
-				SuccessThreshold: 2,                // Close after 2 successes in half-open
-				Timeout:          30 * time.Second, // Wait 30s before trying half-open
-				HalfOpenMaxCalls: 1,                // Only 1 request in half-open state
-				ResetTimeout:     60 * time.Second, // Reset counters after 60s of no failures
+				Enabled:             true,
+				FailureThreshold:    5,
+				SuccessThreshold:    2,
+				TimeoutSeconds:      30,
+				HalfOpenMaxCalls:    1,
+				ResetTimeoutSeconds: 60,
 			},
 		},
 		TLS: TLSConfig{
+			Email:            "admin@example.com",
+			Domains:          []string{},
 			UseProduction:    true,
+			UseLocalCA:       false,
 			CertMagicVerbose: false,
-		},
-		Health: HealthConfig{
-			Enabled:    true,
-			ListenAddr: ":8080",
+			EnableAutocert:   false,
 		},
 		Blacklists: BlacklistsConfig{
 			Enabled:           true,
 			Lists:             []string{"zen.spamhaus.org"},
-			Timeout:           3 * time.Second,
-			CheckHELOResolves: false,
+			TimeoutSeconds:    3,     // Default 3s blacklist timeout
+			CheckHELOResolves: false, // Default to not checking HELO resolves
+		},
+		Health: HealthConfig{
+			Enabled:    true,
+			ListenAddr: ":8080",
+			Username:   "",
+			Password:   "",
+		},
+		Metrics: MetricsConfig{
+			Enabled:  true,
+			Path:     "/metrics",
+			Username: "",
+			Password: "",
 		},
 		Stats: StatsConfig{
-			Enabled:           true,
-			RetentionDuration: 24 * time.Hour,
-			SyncEnabled:       false,
-			SyncInterval:      1 * time.Minute,
-			MaxIPEntries:      100000, // 100k IP entries
-			MaxDomainEntries:  50000,  // 50k domain entries
+			Enabled:             true,
+			RetentionSeconds:    86400,  // Default 24h (86400s) retention
+			SyncEnabled:         false,  // Disabled by default
+			SyncIntervalSeconds: 60,     // Default 1m (60s) sync interval
+			MaxIPEntries:        100000, // 100k IP entries
+			MaxDomainEntries:    50000,  // 50k domain entries
 		},
 		Cluster: ClusterConfig{
-			Enabled:       false,
-			NodeName:      "",         // Auto-detected if empty
-			BindAddr:      "0.0.0.0",  // Bind to all interfaces
-			BindPort:      7946,       // Standard memberlist port
-			AdvertiseAddr: "",         // Auto-detected
-			AdvertisePort: 0,          // Defaults to BindPort
-			SeedNodes:     []string{}, // No seed nodes by default
+			Enabled:  false,
+			NodeName: "",         // Auto-detected if empty
+			BindAddr: "0.0.0.0",  // Bind to all interfaces
+			BindPort: 7946,       // Standard memberlist port
+			Peers:    []string{}, // No peers by default
 		},
 		LogFormat: "text",
 		Local:     false,

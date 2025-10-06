@@ -84,7 +84,7 @@ func NewRateLimiter(rlConfig config.RateLimitConfig, cluster RateLimiterCluster,
 				name:   d.Name,
 				keys:   d.Keys,
 				limit:  d.Limit,
-				window: d.Window,
+				window: time.Duration(d.WindowSeconds) * time.Second,
 			})
 		}
 	}
@@ -94,7 +94,7 @@ func NewRateLimiter(rlConfig config.RateLimitConfig, cluster RateLimiterCluster,
 		dimensions:     dimensions,
 		windows:        make(map[string]*connectionWindow),
 		gossipEnabled:  rlConfig.GossipEnabled,
-		gossipInterval: rlConfig.GossipInterval,
+		gossipInterval: time.Duration(rlConfig.GossipIntervalSeconds) * time.Second,
 		logger:         logger,
 		cluster:        cluster,
 		ctx:            ctx,

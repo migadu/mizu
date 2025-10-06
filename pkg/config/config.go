@@ -3,7 +3,6 @@ package config
 import (
 	"errors"
 	"fmt"
-	"time"
 )
 
 // Validate checks the configuration for required fields and placeholder values.
@@ -17,11 +16,11 @@ func (c *Config) Validate() error {
 	}
 
 	// Validate HTTP timeout
-	if c.Destination.HTTPTimeout < 1*time.Second {
-		return fmt.Errorf("destination.http_timeout must be >= 1s (got %v)", c.Destination.HTTPTimeout)
+	if c.Destination.HTTPTimeoutSeconds < 1 {
+		return fmt.Errorf("destination.http_timeout_seconds must be >= 1 (got %d)", c.Destination.HTTPTimeoutSeconds)
 	}
-	if c.Destination.HTTPTimeout > 5*time.Minute {
-		return fmt.Errorf("destination.http_timeout must be <= 5m (got %v) to prevent blocking SMTP sessions", c.Destination.HTTPTimeout)
+	if c.Destination.HTTPTimeoutSeconds > 300 {
+		return fmt.Errorf("destination.http_timeout_seconds must be <= 300 (5m) (got %d) to prevent blocking SMTP sessions", c.Destination.HTTPTimeoutSeconds)
 	}
 
 	// Validate distributed tracking settings
@@ -29,8 +28,8 @@ func (c *Config) Validate() error {
 		if !c.Cluster.Enabled {
 			return errors.New("smtp.distributed.enabled requires cluster.enabled=true")
 		}
-		if c.SMTP.Distributed.RecipientCacheTTL < 1*time.Minute {
-			return fmt.Errorf("smtp.distributed.recipient_cache_ttl must be >= 1m (got %v)", c.SMTP.Distributed.RecipientCacheTTL)
+		if c.SMTP.Distributed.RecipientCacheTTLSeconds < 60 {
+			return fmt.Errorf("smtp.distributed.recipient_cache_ttl_seconds must be >= 60 (1m) (got %d)", c.SMTP.Distributed.RecipientCacheTTLSeconds)
 		}
 	}
 
@@ -56,6 +55,16 @@ func (c *Config) Validate() error {
 	}
 	if c.TLS.Email == "" || c.TLS.Email == "admin@example.com" {
 		return errors.New("tls.email must be set for Let's Encrypt certificate management")
+	}
+
+	// Validate autocert settings
+	if c.TLS.EnableAutocert {
+		if len(c.TLS.Domains) == 0 {
+			return errors.New("tls.domains must be set when tls.enable_autocert=true")
+		}
+		if !c.Cluster.Enabled {
+			return errors.New("tls.enable_autocert requires cluster.enabled=true for leader election")
+		}
 	}
 
 	return nil

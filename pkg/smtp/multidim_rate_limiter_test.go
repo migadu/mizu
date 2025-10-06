@@ -11,15 +11,15 @@ import (
 // TestRateLimiter_IPDimension tests IP-based rate limiting
 func TestRateLimiter_IPDimension(t *testing.T) {
 	cfg := config.RateLimitConfig{
-		Enabled:        true,
-		GossipEnabled:  false,
-		GossipInterval: 5 * time.Second,
+		Enabled:               true,
+		GossipEnabled:         false,
+		GossipIntervalSeconds: 5,
 		Dimensions: []config.RateLimitDimension{
 			{
-				Name:   "per_ip",
-				Keys:   []string{"IP"},
-				Limit:  3,
-				Window: 1 * time.Minute,
+				Name:          "per_ip",
+				Keys:          []string{"IP"},
+				Limit:         3,
+				WindowSeconds: 60,
 			},
 		},
 	}
@@ -55,15 +55,15 @@ func TestRateLimiter_IPDimension(t *testing.T) {
 // TestRateLimiter_FromDimension tests sender-based rate limiting
 func TestRateLimiter_FromDimension(t *testing.T) {
 	cfg := config.RateLimitConfig{
-		Enabled:        true,
-		GossipEnabled:  false,
-		GossipInterval: 5 * time.Second,
+		Enabled:               true,
+		GossipEnabled:         false,
+		GossipIntervalSeconds: 5,
 		Dimensions: []config.RateLimitDimension{
 			{
-				Name:   "per_sender",
-				Keys:   []string{"FROM"},
-				Limit:  5,
-				Window: 1 * time.Minute,
+				Name:          "per_sender",
+				Keys:          []string{"FROM"},
+				Limit:         5,
+				WindowSeconds: 60,
 			},
 		},
 	}
@@ -104,15 +104,15 @@ func TestRateLimiter_FromDimension(t *testing.T) {
 // TestRateLimiter_FromDomainDimension tests sender domain-based rate limiting
 func TestRateLimiter_FromDomainDimension(t *testing.T) {
 	cfg := config.RateLimitConfig{
-		Enabled:        true,
-		GossipEnabled:  false,
-		GossipInterval: 5 * time.Second,
+		Enabled:               true,
+		GossipEnabled:         false,
+		GossipIntervalSeconds: 5,
 		Dimensions: []config.RateLimitDimension{
 			{
-				Name:   "per_sender_domain",
-				Keys:   []string{"FROM_DOMAIN"},
-				Limit:  10,
-				Window: 1 * time.Minute,
+				Name:          "per_sender_domain",
+				Keys:          []string{"FROM_DOMAIN"},
+				Limit:         10,
+				WindowSeconds: 60,
 			},
 		},
 	}
@@ -153,15 +153,15 @@ func TestRateLimiter_FromDomainDimension(t *testing.T) {
 // TestRateLimiter_ToDimension tests recipient-based rate limiting
 func TestRateLimiter_ToDimension(t *testing.T) {
 	cfg := config.RateLimitConfig{
-		Enabled:        true,
-		GossipEnabled:  false,
-		GossipInterval: 5 * time.Second,
+		Enabled:               true,
+		GossipEnabled:         false,
+		GossipIntervalSeconds: 5,
 		Dimensions: []config.RateLimitDimension{
 			{
-				Name:   "per_recipient",
-				Keys:   []string{"TO"},
-				Limit:  3,
-				Window: 1 * time.Minute,
+				Name:          "per_recipient",
+				Keys:          []string{"TO"},
+				Limit:         3,
+				WindowSeconds: 60,
 			},
 		},
 	}
@@ -205,15 +205,15 @@ func TestRateLimiter_ToDimension(t *testing.T) {
 // TestRateLimiter_CompositeKeys tests composite key rate limiting (FROM+TO)
 func TestRateLimiter_CompositeKeys(t *testing.T) {
 	cfg := config.RateLimitConfig{
-		Enabled:        true,
-		GossipEnabled:  false,
-		GossipInterval: 5 * time.Second,
+		Enabled:               true,
+		GossipEnabled:         false,
+		GossipIntervalSeconds: 5,
 		Dimensions: []config.RateLimitDimension{
 			{
-				Name:   "per_sender_recipient_pair",
-				Keys:   []string{"FROM", "TO"},
-				Limit:  2,
-				Window: 1 * time.Minute,
+				Name:          "per_sender_recipient_pair",
+				Keys:          []string{"FROM", "TO"},
+				Limit:         2,
+				WindowSeconds: 60,
 			},
 		},
 	}
@@ -263,21 +263,21 @@ func TestRateLimiter_CompositeKeys(t *testing.T) {
 // TestRateLimiter_MultipleDimensions tests multiple dimensions enforced simultaneously
 func TestRateLimiter_MultipleDimensions(t *testing.T) {
 	cfg := config.RateLimitConfig{
-		Enabled:        true,
-		GossipEnabled:  false,
-		GossipInterval: 5 * time.Second,
+		Enabled:               true,
+		GossipEnabled:         false,
+		GossipIntervalSeconds: 5,
 		Dimensions: []config.RateLimitDimension{
 			{
-				Name:   "per_ip",
-				Keys:   []string{"IP"},
-				Limit:  10,
-				Window: 1 * time.Minute,
+				Name:          "per_ip",
+				Keys:          []string{"IP"},
+				Limit:         10,
+				WindowSeconds: 60,
 			},
 			{
-				Name:   "per_sender",
-				Keys:   []string{"FROM"},
-				Limit:  5,
-				Window: 1 * time.Minute,
+				Name:          "per_sender",
+				Keys:          []string{"FROM"},
+				Limit:         5,
+				WindowSeconds: 60,
 			},
 		},
 	}
@@ -330,15 +330,15 @@ func TestRateLimiter_MultipleDimensions(t *testing.T) {
 // TestRateLimiter_SlidingWindow tests that rate limits respect sliding windows
 func TestRateLimiter_SlidingWindow(t *testing.T) {
 	cfg := config.RateLimitConfig{
-		Enabled:        true,
-		GossipEnabled:  false,
-		GossipInterval: 5 * time.Second,
+		Enabled:               true,
+		GossipEnabled:         false,
+		GossipIntervalSeconds: 5,
 		Dimensions: []config.RateLimitDimension{
 			{
-				Name:   "per_ip",
-				Keys:   []string{"IP"},
-				Limit:  2,
-				Window: 100 * time.Millisecond, // Very short window for testing
+				Name:          "per_ip",
+				Keys:          []string{"IP"},
+				Limit:         2,
+				WindowSeconds: 1, // Very short window for testing (1 second)
 			},
 		},
 	}
@@ -363,7 +363,7 @@ func TestRateLimiter_SlidingWindow(t *testing.T) {
 	}
 
 	// Wait for window to expire
-	time.Sleep(150 * time.Millisecond)
+	time.Sleep(1100 * time.Millisecond) // Slightly more than 1 second
 
 	// Should be allowed again
 	if err := rl.CheckRateLimit(ctx); err != nil {
@@ -374,21 +374,21 @@ func TestRateLimiter_SlidingWindow(t *testing.T) {
 // TestRateLimiter_GetStats tests the stats endpoint
 func TestRateLimiter_GetStats(t *testing.T) {
 	cfg := config.RateLimitConfig{
-		Enabled:        true,
-		GossipEnabled:  false,
-		GossipInterval: 5 * time.Second,
+		Enabled:               true,
+		GossipEnabled:         false,
+		GossipIntervalSeconds: 5,
 		Dimensions: []config.RateLimitDimension{
 			{
-				Name:   "per_ip",
-				Keys:   []string{"IP"},
-				Limit:  10,
-				Window: 1 * time.Minute,
+				Name:          "per_ip",
+				Keys:          []string{"IP"},
+				Limit:         10,
+				WindowSeconds: 60,
 			},
 			{
-				Name:   "per_sender",
-				Keys:   []string{"FROM"},
-				Limit:  5,
-				Window: 1 * time.Minute,
+				Name:          "per_sender",
+				Keys:          []string{"FROM"},
+				Limit:         5,
+				WindowSeconds: 60,
 			},
 		},
 	}

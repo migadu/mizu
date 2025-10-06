@@ -12,7 +12,8 @@ import (
 // LoadConfig loads configuration from file and command line flags
 func LoadConfig(args []string) (*Config, error) {
 	// Start with default configuration
-	cfg := DefaultConfig()
+	defaultCfg := DefaultConfig()
+	cfg := &defaultCfg
 
 	// Define command line flags
 	fs := pflag.NewFlagSet("smtp-relay", pflag.ContinueOnError)
@@ -24,7 +25,7 @@ func LoadConfig(args []string) (*Config, error) {
 	fs.StringVar(&cfg.SMTP.ListenAddr, "smtp.listen", cfg.SMTP.ListenAddr, "SMTP listen address")
 	fs.StringVar(&cfg.SMTP.Domain, "smtp.domain", cfg.SMTP.Domain, "SMTP domain")
 	fs.IntVar(&cfg.SMTP.MaxMessageSize, "smtp.max-message-size", cfg.SMTP.MaxMessageSize, "Maximum message size in bytes")
-	fs.DurationVar(&cfg.SMTP.TimeoutDuration, "smtp.timeout", cfg.SMTP.TimeoutDuration, "SMTP timeout duration")
+	fs.IntVar(&cfg.SMTP.TimeoutSeconds, "smtp.timeout-seconds", cfg.SMTP.TimeoutSeconds, "SMTP timeout in seconds")
 	fs.BoolVar(&cfg.SMTP.CheckXSpamFlag, "smtp.check-x-spam-flag", cfg.SMTP.CheckXSpamFlag, "Enable check for X-Spam-Flag header")
 	fs.BoolVar(&cfg.SMTP.DMARCQuarantineAsJunk, "smtp.dmarc-quarantine-as-junk", cfg.SMTP.DMARCQuarantineAsJunk, "Treat DMARC quarantine policy as junk")
 
@@ -99,6 +100,15 @@ func LoadConfig(args []string) (*Config, error) {
 }
 
 // loadTOMLConfig loads configuration from a TOML file
+// LoadConfigFromFile loads configuration from a TOML file (for mizu-admin)
+func LoadConfigFromFile(filename string) (*Config, error) {
+	cfg := DefaultConfig()
+	if err := loadTOMLConfig(filename, &cfg); err != nil {
+		return nil, err
+	}
+	return &cfg, nil
+}
+
 func loadTOMLConfig(filename string, cfg *Config) error {
 	data, err := os.ReadFile(filename)
 	if err != nil {
@@ -175,7 +185,8 @@ func validateConfig(cfg *Config) error {
 
 // SaveExample saves an example configuration file
 func SaveExample(filename string) error {
-	cfg := DefaultConfig()
+	defaultCfg := DefaultConfig()
+	cfg := &defaultCfg
 	cfg.SMTP.Domain = "mail.example.com"
 	cfg.TLS.Email = "admin@example.com"
 	cfg.Destination.URL = "https://your-worker.example.com/email"

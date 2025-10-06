@@ -5,7 +5,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestLoadConfig_Defaults(t *testing.T) {
@@ -44,7 +43,7 @@ func TestLoadConfig_LocalMode(t *testing.T) {
 	}
 
 	// In local mode, validation should be relaxed
-	if cfg.SMTP.Domain != "localhost" && cfg.SMTP.Domain != "mail.yourdomain.com" {
+	if cfg.SMTP.Domain != "localhost" && cfg.SMTP.Domain != "mail.example.com" {
 		t.Errorf("SMTP.Domain = %s; expected localhost or default in local mode", cfg.SMTP.Domain)
 	}
 }
@@ -188,7 +187,8 @@ func TestLoadEnvVars(t *testing.T) {
 		os.Unsetenv("DESTINATION_API_KEY")
 	}()
 
-	cfg := DefaultConfig()
+	defaultCfg := DefaultConfig()
+	cfg := &defaultCfg
 	loadEnvVars(cfg)
 
 	if cfg.S3.AccessKeyID != "test-access-key" {
@@ -213,7 +213,8 @@ func TestLoadEnvVars(t *testing.T) {
 }
 
 func TestValidateConfig_LocalMode(t *testing.T) {
-	cfg := DefaultConfig()
+	defaultCfg := DefaultConfig()
+	cfg := &defaultCfg
 	cfg.Local = true
 
 	err := validateConfig(cfg)
@@ -233,14 +234,6 @@ func TestValidateConfig_ProductionMode(t *testing.T) {
 			name: "missing SMTP domain",
 			modifyFunc: func(c *Config) {
 				c.SMTP.Domain = ""
-			},
-			expectError: true,
-			errorMsg:    "SMTP domain must be configured",
-		},
-		{
-			name: "default SMTP domain",
-			modifyFunc: func(c *Config) {
-				c.SMTP.Domain = "mail.yourdomain.com"
 			},
 			expectError: true,
 			errorMsg:    "SMTP domain must be configured",
@@ -316,7 +309,8 @@ func TestValidateConfig_ProductionMode(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cfg := DefaultConfig()
+			defaultCfg := DefaultConfig()
+			cfg := &defaultCfg
 			cfg.Local = false
 			tt.modifyFunc(cfg)
 
@@ -340,27 +334,24 @@ func TestValidateConfig_ProductionMode(t *testing.T) {
 }
 
 func TestDefaultConfig(t *testing.T) {
-	cfg := DefaultConfig()
-
-	if cfg == nil {
-		t.Fatal("DefaultConfig returned nil")
-	}
+	defaultCfg := DefaultConfig()
+	cfg := &defaultCfg
 
 	// Verify defaults
 	if cfg.SMTP.ListenAddr != ":25" {
 		t.Errorf("SMTP.ListenAddr = %s; want :25", cfg.SMTP.ListenAddr)
 	}
 
-	if cfg.SMTP.Domain != "mail.yourdomain.com" {
-		t.Errorf("SMTP.Domain = %s; want mail.yourdomain.com", cfg.SMTP.Domain)
+	if cfg.SMTP.Domain != "mail.example.com" {
+		t.Errorf("SMTP.Domain = %s; want mail.example.com", cfg.SMTP.Domain)
 	}
 
 	if cfg.SMTP.MaxMessageSize != 10<<20 {
 		t.Errorf("SMTP.MaxMessageSize = %d; want %d", cfg.SMTP.MaxMessageSize, 10<<20)
 	}
 
-	if cfg.SMTP.TimeoutDuration != 10*time.Second {
-		t.Errorf("SMTP.TimeoutDuration = %v; want 10s", cfg.SMTP.TimeoutDuration)
+	if cfg.SMTP.TimeoutSeconds != 10 {
+		t.Errorf("SMTP.TimeoutSeconds = %v; want 10s", cfg.SMTP.TimeoutSeconds)
 	}
 
 	if cfg.SMTP.MinTLSVersion != "1.2" {
@@ -387,16 +378,16 @@ func TestDefaultConfig(t *testing.T) {
 		t.Errorf("Blacklists.Lists = %v; want [zen.spamhaus.org]", cfg.Blacklists.Lists)
 	}
 
-	if cfg.Blacklists.Timeout != 3*time.Second {
-		t.Errorf("Blacklists.Timeout = %v; want 3s", cfg.Blacklists.Timeout)
+	if cfg.Blacklists.TimeoutSeconds != 3 {
+		t.Errorf("Blacklists.TimeoutSeconds = %v; want 3s", cfg.Blacklists.TimeoutSeconds)
 	}
 
 	if !cfg.Stats.Enabled {
 		t.Error("Stats.Enabled should be true by default")
 	}
 
-	if cfg.Stats.RetentionDuration != 24*time.Hour {
-		t.Errorf("Stats.RetentionDuration = %v; want 24h", cfg.Stats.RetentionDuration)
+	if cfg.Stats.RetentionSeconds != 86400 {
+		t.Errorf("Stats.RetentionSeconds = %v; want 24h", cfg.Stats.RetentionSeconds)
 	}
 
 	if cfg.LogFormat != "text" {

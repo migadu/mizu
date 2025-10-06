@@ -33,7 +33,8 @@ func TestTLSVersionString(t *testing.T) {
 
 func TestBackend_Configuration(t *testing.T) {
 	logger := zap.NewNop()
-	cfg := config.DefaultConfig()
+	defaultCfg := config.DefaultConfig()
+	cfg := &defaultCfg
 	cfg.Local = true
 	statsMgr := stats.NewManager(true, 0, "test", false, 0, nil, 0, 0, logger)
 

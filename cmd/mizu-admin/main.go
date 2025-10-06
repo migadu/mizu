@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"migadu/mizu/pkg/config"
 	"net/http"
 	"os"
 	"sort"
@@ -13,25 +14,47 @@ import (
 	"time"
 )
 
-const version = "1.0.0"
+// Version information, injected at build time
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
 
 var (
-	serverURL string
-	timeout   time.Duration
-	username  string
-	password  string
+	serverURL   string
+	timeout     time.Duration
+	username    string
+	password    string
+	configFile  string
+	showVersion bool
 )
 
 func init() {
 	flag.StringVar(&serverURL, "server", "http://localhost:8080", "Mizu server URL")
 	flag.DurationVar(&timeout, "timeout", 10*time.Second, "Request timeout")
-	flag.StringVar(&username, "username", "", "HTTP Basic Auth username")
-	flag.StringVar(&password, "password", "", "HTTP Basic Auth password")
+	flag.StringVar(&configFile, "config", "config.toml", "Path to config file for auth credentials")
+	flag.BoolVar(&showVersion, "version", false, "Show version information")
 }
 
 func main() {
 	flag.Usage = usage
 	flag.Parse()
+
+	// Check for -version flag
+	if showVersion {
+		cmdVersion()
+		os.Exit(0)
+	}
+
+	// Load credentials from config file
+	if configFile != "" {
+		if cfg, err := config.LoadConfigFromFile(configFile); err == nil {
+			username = cfg.Health.Username
+			password = cfg.Health.Password
+		}
+		// Silently ignore config file errors - server might not require auth
+	}
 
 	if flag.NArg() < 1 {
 		usage()
@@ -53,7 +76,7 @@ func main() {
 		cmdRenewCert()
 	case "flush-cache":
 		cmdFlushCache()
-	case "version":
+	case "version", "-version", "--version":
 		cmdVersion()
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n\n", command)
@@ -80,13 +103,18 @@ Commands:
 Flags:
   -server string     Mizu server URL (default "http://localhost:8080")
   -timeout duration  Request timeout (default 10s)
-  -username string   HTTP Basic Auth username
-  -password string   HTTP Basic Auth password
+  -config string     Path to config file for auth credentials (default "config.toml")
+  -version           Show version information
+
+Authentication:
+  mizu-admin reads HTTP Basic Auth credentials from config.toml [health] section.
+  If no credentials are configured, requests are sent without authentication.
 
 Examples:
-  mizu-admin health
-  mizu-admin -server http://smtp.example.com:8080 -username admin -password secret health
-  mizu-admin -username admin -password secret stats
+  mizu-admin version                          # Show version information
+  mizu-admin health                           # Uses credentials from config.toml
+  mizu-admin -config /etc/mizu/config.toml health
+  mizu-admin -server http://smtp.example.com:8080 stats
   mizu-admin certs
   mizu-admin flush-cache
 
@@ -94,7 +122,9 @@ Examples:
 }
 
 func cmdVersion() {
-	fmt.Printf("mizu-admin version %s\n", version)
+	fmt.Printf("mizu-admin %s\n", version)
+	fmt.Printf("  commit: %s\n", commit)
+	fmt.Printf("  built:  %s\n", date)
 }
 
 // Health response structures
@@ -141,9 +171,10 @@ func cmdHealth() {
 	for _, name := range names {
 		comp := health.Components[name]
 		icon := "✓"
-		if comp.Status == "unhealthy" {
+		switch comp.Status {
+		case "unhealthy":
 			icon = "✗"
-		} else if comp.Status == "degraded" {
+		case "degraded":
 			icon = "⚠"
 		}
 
@@ -360,9 +391,10 @@ func cmdCerts() {
 	fmt.Println()
 
 	statusIcon := "✓"
-	if certComp.Status == "unhealthy" {
+	switch certComp.Status {
+	case "unhealthy":
 		statusIcon = "✗"
-	} else if certComp.Status == "degraded" {
+	case "degraded":
 		statusIcon = "⚠"
 	}
 

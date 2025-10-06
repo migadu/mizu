@@ -45,7 +45,7 @@ func TestNewResilientResolver(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			resolver := NewResilientResolver(tt.servers, tt.timeout)
+			resolver, rr := NewResilientResolver(tt.servers, tt.timeout, 5*time.Minute)
 			if resolver == nil {
 				t.Fatal("NewResilientResolver returned nil")
 			}
@@ -55,10 +55,16 @@ func TestNewResilientResolver(t *testing.T) {
 				if resolver != net.DefaultResolver {
 					t.Error("expected default resolver for empty servers")
 				}
+				if rr != nil {
+					t.Error("expected nil ResilientResolver for default resolver")
+				}
 			} else {
 				// For non-empty servers, we return a custom resolver
 				if resolver == net.DefaultResolver {
 					t.Error("expected custom resolver for non-empty servers")
+				}
+				if rr == nil {
+					t.Error("expected non-nil ResilientResolver for custom resolver")
 				}
 			}
 		})
@@ -98,7 +104,7 @@ func TestResilientResolverFailover(t *testing.T) {
 		"8.8.8.8:53",     // Valid Google DNS
 	}
 
-	resolver := NewResilientResolver(servers, 2*time.Second)
+	resolver, _ := NewResilientResolver(servers, 2*time.Second, 5*time.Minute)
 
 	// Try to lookup a known domain - should succeed via failover to 8.8.8.8
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -143,7 +149,7 @@ func TestResilientResolverTimeout(t *testing.T) {
 	// Use an IP that will timeout (192.0.2.0/24 is reserved for documentation)
 	servers := []string{"192.0.2.1:53"}
 
-	resolver := NewResilientResolver(servers, 100*time.Millisecond)
+	resolver, _ := NewResilientResolver(servers, 100*time.Millisecond, 5*time.Minute)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
@@ -213,7 +219,7 @@ func TestResilientResolverUpdateServers(t *testing.T) {
 func TestResilientResolverConcurrency(t *testing.T) {
 	// Test that concurrent DNS lookups work correctly
 	servers := []string{"8.8.8.8:53", "8.8.4.4:53"}
-	resolver := NewResilientResolver(servers, 5*time.Second)
+	resolver, _ := NewResilientResolver(servers, 5*time.Second, 5*time.Minute)
 
 	const numGoroutines = 10
 	errCh := make(chan error, numGoroutines)
@@ -243,7 +249,7 @@ func TestResilientResolverConcurrency(t *testing.T) {
 
 func TestResilientResolverContextCancellation(t *testing.T) {
 	servers := []string{"8.8.8.8:53"}
-	resolver := NewResilientResolver(servers, 30*time.Second)
+	resolver, _ := NewResilientResolver(servers, 30*time.Second, 5*time.Minute)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // Cancel immediately
@@ -261,7 +267,7 @@ func TestResilientResolverContextCancellation(t *testing.T) {
 func TestResilientResolverRealDNSLookup(t *testing.T) {
 	// Integration test with real DNS servers
 	servers := []string{"8.8.8.8:53", "1.1.1.1:53"}
-	resolver := NewResilientResolver(servers, 5*time.Second)
+	resolver, _ := NewResilientResolver(servers, 5*time.Second, 5*time.Minute)
 
 	tests := []struct {
 		name     string

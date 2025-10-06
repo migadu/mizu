@@ -50,11 +50,17 @@ func generateTraceID() string {
 }
 
 // NewDNSResolver creates a DNS resolver based on configuration.
-// If custom DNS servers are configured, uses them with round-robin and failover;
+// If custom DNS servers are configured, uses them with round-robin, failover, and caching;
 // otherwise uses system default resolver.
-func NewDNSResolver(dnsServers []string, timeout time.Duration) *net.Resolver {
-	// Use the resilient resolver which implements round-robin and failover
-	return dns.NewResilientResolver(dnsServers, timeout)
+// Returns both the resolver and a caching wrapper for cache-aware operations.
+func NewDNSResolver(dnsServers []string, timeout time.Duration, cacheTTL time.Duration) (*net.Resolver, *dns.CachingWrapper) {
+	// Use the resilient resolver which implements round-robin, failover, and caching
+	resolver, rr := dns.NewResilientResolver(dnsServers, timeout, cacheTTL)
+
+	// Wrap with caching layer
+	wrapper := dns.WrapWithCache(resolver, rr)
+
+	return resolver, wrapper
 }
 
 // Backend implements smtp.Backend interface for our custom SMTP server.
@@ -212,7 +218,7 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 
 		// Check DNS blacklists (RBLs) to prevent spam
 		if be.Config.Blacklists.Enabled && len(be.Config.Blacklists.Lists) > 0 {
-			checker := blacklist.NewChecker(be.Config.Blacklists.Lists, be.Config.Blacklists.Timeout, be.Logger)
+			checker := blacklist.NewChecker(be.Config.Blacklists.Lists, time.Duration(be.Config.Blacklists.TimeoutSeconds)*time.Second, be.Logger)
 			isListed, reason, err := checker.CheckIP(ip)
 			if err != nil {
 				be.Logger.Error("Blacklist check error", zap.Error(err), zap.String("ip", host))
@@ -229,7 +235,7 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 
 		// Require valid reverse DNS (PTR record) - helps prevent spam from compromised hosts
 		// Use context with timeout to prevent hanging on unresponsive DNS servers
-		rdnsCtx, rdnsCancel := context.WithTimeout(context.Background(), be.Config.DNS.Timeout)
+		rdnsCtx, rdnsCancel := context.WithTimeout(context.Background(), time.Duration(be.Config.DNS.TimeoutSeconds)*time.Second)
 		names, err := be.DNSResolver.LookupAddr(rdnsCtx, host)
 		rdnsCancel()
 		if err != nil || len(names) == 0 {
@@ -418,7 +424,7 @@ func (s *Session) Helo(hostname string) error {
 
 		// Optional: Verify HELO hostname has valid DNS records
 		if s.config.Blacklists.CheckHELOResolves {
-			resolves, err := blacklist.CheckHELOResolves(hostname, s.config.Blacklists.Timeout)
+			resolves, err := blacklist.CheckHELOResolves(hostname, time.Duration(s.config.Blacklists.TimeoutSeconds)*time.Second)
 			if err != nil || !resolves {
 				s.Logger.Warn("Rejecting HELO/EHLO - hostname mismatch", zap.String("remote_addr", s.remoteAddr), zap.String("hostname", hostname))
 				return &smtp.SMTPError{
@@ -538,40 +544,65 @@ func (s *Session) Mail(from string, opts *smtp.MailOptions) error {
 	// The worker can reject messages for unknown users by returning 404
 	// This allows dynamic user management without syncing mailbox lists
 
-	// Perform SPF check (skip in local mode)
+	// Perform SPF and MX checks in parallel (skip in local mode)
 	if !s.config.Local {
+		var wg sync.WaitGroup
+		var spfMu sync.Mutex // Protect SPF result writes
+
+		// SPF check in parallel
 		ipStr := stats.GetIPFromRemoteAddr(s.remoteAddr)
 		ip := net.ParseIP(ipStr)
 		if ip != nil {
-			res, err := validation.CheckSPF(context.Background(), ip, s.helo, from)
-			if err != nil {
-				s.Logger.Debug("SPF check error", zap.String("from", from), zap.Error(err))
-			} else if res != nil {
-				s.Logger.Debug("SPF result", zap.String("from", from), zap.String("result", string(*res)))
-				s.spfResult = &validation.SPFResult{
-					Domain: s.senderDomain,
-					Result: authres.SPFResult{
-						Value: validation.ConvertSPFResult(*res),
-					},
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				res, err := validation.CheckSPF(context.Background(), ip, s.helo, from)
+				if err != nil {
+					s.Logger.Debug("SPF check error", zap.String("from", from), zap.Error(err))
+				} else if res != nil {
+					s.Logger.Debug("SPF result", zap.String("from", from), zap.String("result", string(*res)))
+					spfMu.Lock()
+					s.spfResult = &validation.SPFResult{
+						Domain: s.senderDomain,
+						Result: authres.SPFResult{
+							Value: validation.ConvertSPFResult(*res),
+						},
+					}
+					spfMu.Unlock()
 				}
-			}
+			}()
 		}
 
-		// Check sender domain has MX records (anti-spam)
+		// MX check in parallel
+		var mxErr error
+		var hasMX bool
 		if s.config.SMTP.RequireSenderMX && senderDomain != "" {
-			hasMX, err := validation.CheckMXRecord(context.Background(), senderDomain, s.dnsResolver, s.config.DNS.Timeout)
-			if err != nil {
-				s.Logger.Warn("MX lookup error for sender domain", zap.String("from", from), zap.String("domain", senderDomain), zap.Error(err))
-				// Continue despite lookup error - don't fail on temporary DNS issues
-			} else if !hasMX {
-				s.Logger.Warn("Rejecting sender - domain has no MX records", zap.String("from", from), zap.String("domain", senderDomain))
-				return &smtp.SMTPError{
-					Code:         550,
-					EnhancedCode: smtp.EnhancedCode{5, 7, 1},
-					Message:      "sender domain has no mail servers (no MX records)",
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				var err error
+				hasMX, err = validation.CheckMXRecord(context.Background(), senderDomain, s.dnsResolver, time.Duration(s.config.DNS.TimeoutSeconds)*time.Second)
+				if err != nil {
+					s.Logger.Warn("MX lookup error for sender domain", zap.String("from", from), zap.String("domain", senderDomain), zap.Error(err))
+					mxErr = err
+					// Continue despite lookup error - don't fail on temporary DNS issues
+				} else if !hasMX {
+					s.Logger.Warn("Sender domain has no MX records", zap.String("from", from), zap.String("domain", senderDomain))
+				} else {
+					s.Logger.Debug("Sender domain has valid MX records", zap.String("from", from), zap.String("domain", senderDomain))
 				}
-			} else {
-				s.Logger.Debug("Sender domain has valid MX records", zap.String("from", from), zap.String("domain", senderDomain))
+			}()
+		}
+
+		// Wait for both DNS queries to complete
+		wg.Wait()
+
+		// Check MX result after parallel execution
+		if s.config.SMTP.RequireSenderMX && senderDomain != "" && mxErr == nil && !hasMX {
+			return &smtp.SMTPError{
+				Code:         550,
+				EnhancedCode: smtp.EnhancedCode{5, 7, 1},
+				Message:      "sender domain has no mail servers (no MX records)",
 			}
 		}
 	}

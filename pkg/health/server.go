@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/minio/minio-go/v7"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 )
 
@@ -38,15 +39,20 @@ type CacheFlusher interface {
 
 // Server represents the health check HTTP server.
 type Server struct {
-	listenAddr    string
-	logger        *zap.Logger
-	checkers      []Checker
-	statsProvider StatsProvider
-	cacheFlusher  CacheFlusher
-	httpServer    *http.Server
-	mux           *http.ServeMux
-	username      string // HTTP Basic Auth username (empty = no auth)
-	password      string // HTTP Basic Auth password
+	listenAddr      string
+	logger          *zap.Logger
+	checkers        []Checker
+	statsProvider   StatsProvider
+	cacheFlusher    CacheFlusher
+	httpServer      *http.Server
+	mux             *http.ServeMux
+	username        string // HTTP Basic Auth username (empty = no auth)
+	password        string // HTTP Basic Auth password
+	acmeHandler     http.Handler
+	metricsEnabled  bool   // Enable Prometheus metrics endpoint
+	metricsPath     string // Metrics endpoint path
+	metricsUsername string // Metrics HTTP Basic Auth username (empty = no auth)
+	metricsPassword string // Metrics HTTP Basic Auth password
 }
 
 // NewServer creates a new health check server.
@@ -72,6 +78,11 @@ func (s *Server) SetCacheFlusher(flusher CacheFlusher) {
 	s.cacheFlusher = flusher
 }
 
+// SetACMEHandler registers an HTTP handler for the ACME challenge
+func (s *Server) SetACMEHandler(handler http.Handler) {
+	s.acmeHandler = handler
+}
+
 // SetBasicAuth configures HTTP Basic Authentication for the health endpoint
 func (s *Server) SetBasicAuth(username, password string) {
 	s.username = username
@@ -81,43 +92,109 @@ func (s *Server) SetBasicAuth(username, password string) {
 	}
 }
 
+// SetMetricsConfig configures Prometheus metrics endpoint
+func (s *Server) SetMetricsConfig(enabled bool, path, username, password string) {
+	s.metricsEnabled = enabled
+	s.metricsPath = path
+	s.metricsUsername = username
+	s.metricsPassword = password
+	if enabled {
+		s.logger.Info("Prometheus metrics endpoint enabled",
+			zap.String("path", path),
+			zap.Bool("auth_enabled", username != ""))
+	}
+}
+
 // basicAuthMiddleware wraps a handler with HTTP Basic Auth
 func (s *Server) basicAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return s.basicAuthMiddlewareWithCreds(next, s.username, s.password, "Health Check")
+}
+
+// metricsAuthMiddleware wraps a handler with HTTP Basic Auth for metrics endpoint
+func (s *Server) metricsAuthMiddleware(next http.Handler) http.Handler {
+	return s.basicAuthMiddlewareWithCredsHandler(next, s.metricsUsername, s.metricsPassword, "Metrics")
+}
+
+// basicAuthMiddlewareWithCreds creates auth middleware with custom credentials
+func (s *Server) basicAuthMiddlewareWithCreds(next http.HandlerFunc, username, password, realm string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Skip auth if no username configured
-		if s.username == "" {
+		if username == "" {
 			next(w, r)
 			return
 		}
 
 		// Get credentials from request
-		username, password, ok := r.BasicAuth()
+		reqUsername, reqPassword, ok := r.BasicAuth()
 		if !ok {
-			w.Header().Set("WWW-Authenticate", `Basic realm="Health Check"`)
+			w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Basic realm="%s"`, realm))
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
-			s.logger.Warn("Health check access denied - no credentials provided",
+			s.logger.Warn("Access denied - no credentials provided",
 				zap.String("remote_addr", r.RemoteAddr),
-				zap.String("path", r.URL.Path))
+				zap.String("path", r.URL.Path),
+				zap.String("realm", realm))
 			return
 		}
 
 		// Use constant-time comparison to prevent timing attacks
-		usernameMatch := subtle.ConstantTimeCompare([]byte(username), []byte(s.username)) == 1
-		passwordMatch := subtle.ConstantTimeCompare([]byte(password), []byte(s.password)) == 1
+		usernameMatch := subtle.ConstantTimeCompare([]byte(reqUsername), []byte(username)) == 1
+		passwordMatch := subtle.ConstantTimeCompare([]byte(reqPassword), []byte(password)) == 1
 
 		if !usernameMatch || !passwordMatch {
-			w.Header().Set("WWW-Authenticate", `Basic realm="Health Check"`)
+			w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Basic realm="%s"`, realm))
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
-			s.logger.Warn("Health check access denied - invalid credentials",
+			s.logger.Warn("Access denied - invalid credentials",
 				zap.String("remote_addr", r.RemoteAddr),
-				zap.String("username", username),
-				zap.String("path", r.URL.Path))
+				zap.String("username", reqUsername),
+				zap.String("path", r.URL.Path),
+				zap.String("realm", realm))
 			return
 		}
 
 		// Credentials valid, proceed
 		next(w, r)
 	}
+}
+
+// basicAuthMiddlewareWithCredsHandler creates auth middleware for http.Handler
+func (s *Server) basicAuthMiddlewareWithCredsHandler(next http.Handler, username, password, realm string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Skip auth if no username configured
+		if username == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// Get credentials from request
+		reqUsername, reqPassword, ok := r.BasicAuth()
+		if !ok {
+			w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Basic realm="%s"`, realm))
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			s.logger.Warn("Access denied - no credentials provided",
+				zap.String("remote_addr", r.RemoteAddr),
+				zap.String("path", r.URL.Path),
+				zap.String("realm", realm))
+			return
+		}
+
+		// Use constant-time comparison to prevent timing attacks
+		usernameMatch := subtle.ConstantTimeCompare([]byte(reqUsername), []byte(username)) == 1
+		passwordMatch := subtle.ConstantTimeCompare([]byte(reqPassword), []byte(password)) == 1
+
+		if !usernameMatch || !passwordMatch {
+			w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Basic realm="%s"`, realm))
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			s.logger.Warn("Access denied - invalid credentials",
+				zap.String("remote_addr", r.RemoteAddr),
+				zap.String("username", reqUsername),
+				zap.String("path", r.URL.Path),
+				zap.String("realm", realm))
+			return
+		}
+
+		// Credentials valid, proceed
+		next.ServeHTTP(w, r)
+	})
 }
 
 // RegisterHandler registers an additional HTTP handler
@@ -130,10 +207,27 @@ func (s *Server) RegisterHandler(pattern string, handler http.HandlerFunc) {
 // Start runs the HTTP server in a new goroutine.
 func (s *Server) Start() {
 	s.mux = http.NewServeMux()
+
+	// Register ACME handler if provided
+	if s.acmeHandler != nil {
+		s.mux.Handle("/.well-known/acme-challenge/", s.acmeHandler)
+		s.logger.Info("ACME HTTP-01 challenge handler registered")
+	}
+
 	// Wrap all handlers with Basic Auth middleware
 	s.mux.HandleFunc("/health", s.basicAuthMiddleware(s.healthHandler))
 	s.mux.HandleFunc("/api/stats", s.basicAuthMiddleware(s.statsHandler))
 	s.mux.HandleFunc("/api/flush-cache", s.basicAuthMiddleware(s.flushCacheHandler))
+
+	// Prometheus metrics endpoint (optional auth based on config)
+	if s.metricsEnabled {
+		metricsPath := s.metricsPath
+		if metricsPath == "" {
+			metricsPath = "/metrics"
+		}
+		s.mux.Handle(metricsPath, s.metricsAuthMiddleware(s.metricsHandler()))
+		s.logger.Info("Metrics endpoint registered", zap.String("path", metricsPath))
+	}
 
 	s.httpServer = &http.Server{
 		Addr:    s.listenAddr,
@@ -490,4 +584,9 @@ func (s *Server) flushCacheHandler(w http.ResponseWriter, r *http.Request) {
 		"message": "Caches flushed successfully",
 		"flushed": flushed,
 	})
+}
+
+// metricsHandler returns the Prometheus metrics handler
+func (s *Server) metricsHandler() http.Handler {
+	return promhttp.Handler()
 }

@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -19,10 +21,12 @@ import (
 	"migadu/mizu/pkg/config"
 	"migadu/mizu/pkg/health"
 	"migadu/mizu/pkg/logging"
+	"migadu/mizu/pkg/metrics"
 	"migadu/mizu/pkg/poster"
 	"migadu/mizu/pkg/smtp"
 	"migadu/mizu/pkg/stats"
 	"migadu/mizu/pkg/storage"
+	tlsmgr "migadu/mizu/pkg/tls"
 
 	"github.com/caddyserver/certmagic"
 	gosmtp "github.com/emersion/go-smtp"
@@ -31,8 +35,15 @@ import (
 	"go.uber.org/zap"
 )
 
+// Version information, injected at build time
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
 func main() {
-	// Handle special command-line arguments like 'generate-config'
+	// Handle special command-line arguments like 'generate-config' and '-version'
 	handleCLIArgs()
 
 	// Load configuration
@@ -65,22 +76,7 @@ func main() {
 		cancel()
 	}()
 
-	// Initialize core components
-	statsManager := initStatsManager(cfg, logger)
-
-	var tlsConfig *tls.Config
-	var s3Client *minio.Client
-	if cfg.Local {
-		logger.Sugar().Info("Running in LOCAL mode - TLS disabled, messages will be dumped to terminal")
-	} else {
-		tlsConfig, s3Client, err = initTLS(cfg, logger)
-		if err != nil {
-			logger.Sugar().Fatalf("Failed to initialize TLS: %v", err)
-		}
-	}
-	circuitBreaker := initCircuitBreaker(cfg, logger)
-
-	// Initialize memberlist cluster (if enabled)
+	// Initialize memberlist cluster first (required for TLS leader election)
 	var clusterMgr *cluster.Cluster
 	if cfg.Cluster.Enabled {
 		clusterMgr, err = initCluster(cfg, logger)
@@ -90,8 +86,52 @@ func main() {
 		defer clusterMgr.Shutdown()
 	}
 
+	// Initialize core components
+	statsManager := initStatsManager(cfg, logger)
+
+	// Initialize Prometheus metrics
+	_ = metrics.New("mizu")
+	logger.Info("Prometheus metrics initialized")
+
+	var tlsConfig *tls.Config
+	var s3Client *minio.Client
+	var tlsMgr *tlsmgr.Manager
+	if cfg.Local {
+		logger.Sugar().Info("Running in LOCAL mode - TLS disabled, messages will be dumped to terminal")
+	} else {
+		tlsConfig, s3Client, tlsMgr, err = initTLS(cfg, clusterMgr, logger)
+		if err != nil {
+			logger.Sugar().Fatalf("Failed to initialize TLS: %v", err)
+		}
+
+		// Start ACME challenge servers for autocert
+		if cfg.TLS.EnableAutocert && tlsMgr != nil {
+			// Start HTTPS server on port 443 for TLS-ALPN-01 challenges (primary method)
+			go func() {
+				logger.Info("Starting HTTPS server for ACME TLS-ALPN-01 challenges on :443")
+				server := &http.Server{
+					Addr:      ":443",
+					TLSConfig: tlsMgr.TLSConfig(),
+				}
+				// Empty cert/key files - TLSConfig.GetCertificate handles everything
+				if err := server.ListenAndServeTLS("", ""); err != nil {
+					logger.Error("TLS-ALPN-01 challenge server failed", zap.Error(err))
+				}
+			}()
+
+			// Start HTTP server on port 80 for HTTP-01 challenges (fallback)
+			go func() {
+				logger.Info("Starting HTTP server for ACME HTTP-01 challenges on :80")
+				if err := http.ListenAndServe(":80", tlsMgr.HTTPHandler()); err != nil {
+					logger.Error("HTTP-01 challenge server failed", zap.Error(err))
+				}
+			}()
+		}
+	}
+	circuitBreaker := initCircuitBreaker(cfg, logger)
+
 	// Create HTTP client with configured timeout for posting emails to destination
-	httpClient := poster.NewHTTPClient(cfg.Destination.HTTPTimeout)
+	httpClient := poster.NewHTTPClient(time.Duration(cfg.Destination.HTTPTimeoutSeconds) * time.Second)
 
 	// Create connection tracker for DoS protection (global and per-IP limits)
 	connTracker := smtp.NewConnectionTracker(cfg.SMTP.MaxConnections, cfg.SMTP.MaxConnectionsPerIP)
@@ -121,10 +161,10 @@ func main() {
 			smtp.DistributedConfig{
 				Hostname:          nodeName,
 				Cluster:           clusterMgr, // Pass memberlist cluster
-				GossipInterval:    cfg.SMTP.Distributed.GossipInterval,
-				S3SyncInterval:    cfg.SMTP.Distributed.S3SyncInterval,
+				GossipInterval:    time.Duration(cfg.SMTP.Distributed.GossipIntervalSeconds) * time.Second,
+				S3SyncInterval:    time.Duration(cfg.SMTP.Distributed.S3SyncIntervalSeconds) * time.Second,
 				GlobalMaxPerIP:    cfg.SMTP.Distributed.GlobalMaxPerIP,
-				RecipientCacheTTL: cfg.SMTP.Distributed.RecipientCacheTTL,
+				RecipientCacheTTL: time.Duration(cfg.SMTP.Distributed.RecipientCacheTTLSeconds) * time.Second,
 			},
 			logger,
 		)
@@ -136,19 +176,27 @@ func main() {
 	// Initialize and start health check server
 	healthServer := startHealthServer(cfg, logger, statsManager, circuitBreaker, connTracker, distTracker, s3Client)
 
+	// Set ACME handler on health server if autocert is enabled
+	if healthServer != nil && tlsMgr != nil {
+		healthServer.SetACMEHandler(tlsMgr.HTTPHandler())
+	}
+
 	// Start stats manager and sync/export loops
 	statsManager.Start()
 	startStatsLoops(ctx, statsManager, s3Client, cfg)
 
 	// --- SMTP Server Setup ---
 
-	// Create DNS resolver (custom or system default)
-	dnsResolver := smtp.NewDNSResolver(cfg.DNS.Servers, cfg.DNS.Timeout)
-	if len(cfg.DNS.Servers) > 0 {
-		logger.Info("Using custom DNS servers: " + strings.Join(cfg.DNS.Servers, ", ") + " (timeout: " + cfg.DNS.Timeout.String() + ")")
+	// Create DNS resolver with caching (custom or system default)
+	dnsTimeout := time.Duration(cfg.DNS.TimeoutSeconds) * time.Second
+	dnsCacheTTL := time.Duration(cfg.DNS.CacheTTLSeconds) * time.Second
+	dnsResolver, dnsCache := smtp.NewDNSResolver(cfg.DNS.Resolvers, dnsTimeout, dnsCacheTTL)
+	if len(cfg.DNS.Resolvers) > 0 {
+		logger.Info("Using custom DNS resolvers with application-level caching: " + strings.Join(cfg.DNS.Resolvers, ", ") + " (timeout: " + dnsTimeout.String() + ", cache TTL: " + dnsCacheTTL.String() + ")")
 	} else {
-		logger.Info("Using system default DNS resolver (timeout: " + cfg.DNS.Timeout.String() + ")")
+		logger.Info("Using system default DNS resolver with OS-level caching (timeout: " + dnsTimeout.String() + ")")
 	}
+	_ = dnsCache // Cache wrapper for future use
 
 	// Create rate limiter
 	var rateLimiter *smtp.RateLimiter
@@ -169,7 +217,7 @@ func main() {
 				zap.String("name", dim.Name),
 				zap.Strings("keys", dim.Keys),
 				zap.Int("limit", dim.Limit),
-				zap.Duration("window", dim.Window))
+				zap.Duration("window", time.Duration(dim.WindowSeconds)*time.Second))
 		}
 	}
 
@@ -197,14 +245,22 @@ func main() {
 	runSMTPServer(ctx, cfg, be, tlsConfig, healthServer, logger)
 }
 
-// handleCLIArgs checks for special command-line arguments, like 'generate-config'.
+// handleCLIArgs checks for special command-line arguments, like 'generate-config' and '-version'.
 func handleCLIArgs() {
-	if len(os.Args) > 1 && os.Args[1] == "generate-config" {
-		if err := config.SaveExample("config.toml.example"); err != nil {
-			log.Fatalf("Failed to generate example config: %v", err)
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "generate-config":
+			if err := config.SaveExample("config.toml.example"); err != nil {
+				log.Fatalf("Failed to generate example config: %v", err)
+			}
+			fmt.Println("Generated example configuration file: config.toml.example")
+			os.Exit(0)
+		case "-version", "--version", "version":
+			fmt.Printf("mizu-server %s\n", version)
+			fmt.Printf("  commit: %s\n", commit)
+			fmt.Printf("  built:  %s\n", date)
+			os.Exit(0)
 		}
-		fmt.Println("Generated example configuration file: config.toml.example")
-		os.Exit(0)
 	}
 }
 
@@ -219,13 +275,13 @@ func initStatsManager(cfg *config.Config, logger *zap.Logger) *stats.Manager {
 	// Build peer URLs from seed nodes for stats HTTP sync
 	var syncServers []string
 	if cfg.Stats.SyncEnabled && cfg.Cluster.Enabled {
-		// Convert seed nodes to HTTP URLs (assuming health server port 8080)
-		syncServers = make([]string, len(cfg.Cluster.SeedNodes))
-		for i, seedNode := range cfg.Cluster.SeedNodes {
+		// Convert peers to HTTP URLs (assuming health server port 8080)
+		syncServers = make([]string, len(cfg.Cluster.Peers))
+		for i, peer := range cfg.Cluster.Peers {
 			// Extract hostname from "hostname:port" format
-			host, _, _ := net.SplitHostPort(seedNode)
+			host, _, _ := net.SplitHostPort(peer)
 			if host == "" {
-				host = seedNode // No port specified
+				host = peer // No port specified
 			}
 			syncServers[i] = fmt.Sprintf("http://%s:8080", host)
 		}
@@ -240,26 +296,21 @@ func initStatsManager(cfg *config.Config, logger *zap.Logger) *stats.Manager {
 		}
 	}
 
-	statsManager := stats.NewManager(true, cfg.Stats.RetentionDuration, hostname,
-		cfg.Stats.SyncEnabled, cfg.Stats.SyncInterval, syncServers,
+	statsManager := stats.NewManager(true, time.Duration(cfg.Stats.RetentionSeconds)*time.Second, hostname,
+		cfg.Stats.SyncEnabled, time.Duration(cfg.Stats.SyncIntervalSeconds)*time.Second, syncServers,
 		cfg.Stats.MaxIPEntries, cfg.Stats.MaxDomainEntries, logger)
 	logger.Sugar().Infof("Stats tracking enabled with %v retention, max entries: IPs=%d, Domains=%d",
-		cfg.Stats.RetentionDuration, cfg.Stats.MaxIPEntries, cfg.Stats.MaxDomainEntries)
+		time.Duration(cfg.Stats.RetentionSeconds)*time.Second, cfg.Stats.MaxIPEntries, cfg.Stats.MaxDomainEntries)
 
 	if cfg.Stats.SyncEnabled {
 		logger.Sugar().Infof("Stats sync enabled with %v interval, syncing with %d servers",
-			cfg.Stats.SyncInterval, len(syncServers))
+			time.Duration(cfg.Stats.SyncIntervalSeconds)*time.Second, len(syncServers))
 	}
 	return statsManager
 }
 
-// initTLS sets up the S3 client and CertMagic for automatic TLS certificate management.
-func initTLS(cfg *config.Config, logger *zap.Logger) (*tls.Config, *minio.Client, error) {
-	// Configure certmagic logging for debugging TLS certificate issues
-	if cfg.TLS.CertMagicVerbose {
-		certmagic.Default.Logger = logger
-	}
-
+// initTLS sets up the S3 client and TLS certificate management (autocert or certmagic).
+func initTLS(cfg *config.Config, clusterMgr *cluster.Cluster, logger *zap.Logger) (*tls.Config, *minio.Client, *tlsmgr.Manager, error) {
 	// Initialize S3 client for MinIO (S3-compatible)
 	s3Client, err := minio.New(cfg.S3.Endpoint, &minio.Options{
 		Creds:  credentials.NewStaticV4(cfg.S3.AccessKeyID, cfg.S3.SecretAccessKey, ""),
@@ -267,7 +318,7 @@ func initTLS(cfg *config.Config, logger *zap.Logger) (*tls.Config, *minio.Client
 		Secure: true, // Use HTTPS
 	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to init S3 client: %w", err)
+		return nil, nil, nil, fmt.Errorf("failed to init S3 client: %w", err)
 	}
 
 	// Validate S3 credentials early by checking bucket access
@@ -278,7 +329,7 @@ func initTLS(cfg *config.Config, logger *zap.Logger) (*tls.Config, *minio.Client
 
 	exists, err := s3Client.BucketExists(ctx, cfg.S3.Bucket)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to validate S3 credentials/access: %w (check S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY)", err)
+		return nil, nil, nil, fmt.Errorf("failed to validate S3 credentials/access: %w (check S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY)", err)
 	}
 	if !exists {
 		// Bucket doesn't exist - try to create it
@@ -287,36 +338,86 @@ func initTLS(cfg *config.Config, logger *zap.Logger) (*tls.Config, *minio.Client
 			Region: cfg.S3.Region,
 		})
 		if err != nil {
-			return nil, nil, fmt.Errorf("S3 bucket '%s' does not exist and could not be created: %w (ensure credentials have s3:CreateBucket permission)", cfg.S3.Bucket, err)
+			return nil, nil, nil, fmt.Errorf("S3 bucket '%s' does not exist and could not be created: %w (ensure credentials have s3:CreateBucket permission)", cfg.S3.Bucket, err)
 		}
 		logger.Sugar().Infof("Successfully created S3 bucket '%s'", cfg.S3.Bucket)
 	} else {
 		logger.Sugar().Infof("Successfully validated S3 access to bucket '%s'", cfg.S3.Bucket)
 	}
 
-	// Set up Certmagic storage to use S3
-	certmagic.Default.Storage = storage.NewS3CertStorage(s3Client, cfg.S3.Bucket, cfg.S3.Prefix, logger)
+	var tlsConfig *tls.Config
+	var tlsMgr *tlsmgr.Manager
 
-	// Configure Certmagic for ACME (Let's Encrypt)
-	if cfg.TLS.Email != "" {
-		certmagic.DefaultACME.Email = cfg.TLS.Email
-	}
+	// Use autocert if enabled (requires cluster for leader election)
+	if cfg.TLS.EnableAutocert {
+		logger.Sugar().Info("Using autocert for TLS certificate management")
 
-	if !cfg.TLS.UseProduction || cfg.TLS.UseLocalCA {
-		certmagic.DefaultACME.CA = certmagic.LetsEncryptStagingCA
-		logger.Sugar().Info("Using Let's Encrypt staging CA")
+		// Get leader function from cluster
+		var isLeaderF func() bool
+		if clusterMgr != nil {
+			isLeaderF = clusterMgr.IsLeader
+		} else {
+			// Fallback: always return true if no cluster (single-node mode)
+			isLeaderF = func() bool { return true }
+			logger.Sugar().Warn("No cluster configured - autocert running in single-node mode")
+		}
+
+		// Create TLS manager with autocert
+		tlsMgr, err = tlsmgr.NewManager(tlsmgr.Config{
+			Enabled:   true,
+			Email:     cfg.TLS.Email,
+			Domains:   cfg.TLS.Domains,
+			S3Client:  s3Client,
+			S3Bucket:  cfg.S3.Bucket,
+			S3Prefix:  cfg.S3.Prefix,
+			IsLeaderF: isLeaderF,
+			Staging:   !cfg.TLS.UseProduction,
+		}, logger)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("failed to create TLS manager: %w", err)
+		}
+
+		tlsConfig = tlsMgr.TLSConfig()
+		if tlsConfig == nil {
+			return nil, nil, nil, fmt.Errorf("TLS manager returned nil config")
+		}
+
+		logger.Sugar().Infof("Autocert initialized for domains: %v", cfg.TLS.Domains)
 	} else {
-		certmagic.DefaultACME.CA = certmagic.LetsEncryptProductionCA
-		logger.Sugar().Info("Using Let's Encrypt production CA")
-	}
+		// Use certmagic (existing behavior)
+		logger.Sugar().Info("Using certmagic for TLS certificate management")
 
-	certmagic.Default.OnDemand = &certmagic.OnDemandConfig{} // Enable on-demand certs
+		// Configure certmagic logging for debugging TLS certificate issues
+		if cfg.TLS.CertMagicVerbose {
+			certmagic.Default.Logger = logger
+		}
 
-	// Load or issue initial certificate
-	logger.Sugar().Infof("Attempting to get TLS certificate for %s...", cfg.SMTP.Domain)
-	tlsConfig, err := certmagic.TLS([]string{cfg.SMTP.Domain})
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to get initial TLS certificate: %w", err)
+		// Set up Certmagic storage to use S3
+		certmagic.Default.Storage = storage.NewS3CertStorage(s3Client, cfg.S3.Bucket, cfg.S3.Prefix, logger)
+
+		// Configure Certmagic for ACME (Let's Encrypt)
+		if cfg.TLS.Email != "" {
+			certmagic.DefaultACME.Email = cfg.TLS.Email
+		}
+
+		if !cfg.TLS.UseProduction || cfg.TLS.UseLocalCA {
+			certmagic.DefaultACME.CA = certmagic.LetsEncryptStagingCA
+			logger.Sugar().Info("Using Let's Encrypt staging CA")
+		} else {
+			certmagic.DefaultACME.CA = certmagic.LetsEncryptProductionCA
+			logger.Sugar().Info("Using Let's Encrypt production CA")
+		}
+
+		certmagic.Default.OnDemand = &certmagic.OnDemandConfig{} // Enable on-demand certs
+
+		// Load or issue initial certificate
+		logger.Sugar().Infof("Attempting to get TLS certificate for %s...", cfg.SMTP.Domain)
+		tlsConfig, err = certmagic.TLS([]string{cfg.SMTP.Domain})
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("failed to get initial TLS certificate: %w", err)
+		}
+
+		logger.Sugar().Infof("Successfully configured TLS certificate for %s", cfg.SMTP.Domain)
 	}
 
 	// Configure minimum TLS version
@@ -326,8 +427,7 @@ func initTLS(cfg *config.Config, logger *zap.Logger) (*tls.Config, *minio.Client
 		logger.Sugar().Warnf("Unsupported TLS version '%s' requested - using default TLS 1.2.", cfg.SMTP.MinTLSVersion)
 	}
 
-	logger.Sugar().Infof("Successfully configured TLS certificate for %s", cfg.SMTP.Domain)
-	return tlsConfig, s3Client, nil
+	return tlsConfig, s3Client, tlsMgr, nil
 }
 
 // initCircuitBreaker initializes the circuit breaker for the destination endpoint.
@@ -340,13 +440,13 @@ func initCircuitBreaker(cfg *config.Config, logger *zap.Logger) *poster.CircuitB
 		Enabled:          cfg.Destination.CircuitBreaker.Enabled,
 		FailureThreshold: cfg.Destination.CircuitBreaker.FailureThreshold,
 		SuccessThreshold: cfg.Destination.CircuitBreaker.SuccessThreshold,
-		Timeout:          cfg.Destination.CircuitBreaker.Timeout,
+		Timeout:          time.Duration(cfg.Destination.CircuitBreaker.TimeoutSeconds) * time.Second,
 		HalfOpenMaxCalls: cfg.Destination.CircuitBreaker.HalfOpenMaxCalls,
-		ResetTimeout:     cfg.Destination.CircuitBreaker.ResetTimeout,
+		ResetTimeout:     time.Duration(cfg.Destination.CircuitBreaker.ResetTimeoutSeconds) * time.Second,
 	}, logger)
 	logger.Sugar().Infof("Circuit breaker enabled: failure_threshold=%d, timeout=%v",
 		cfg.Destination.CircuitBreaker.FailureThreshold,
-		cfg.Destination.CircuitBreaker.Timeout)
+		time.Duration(cfg.Destination.CircuitBreaker.TimeoutSeconds)*time.Second)
 	return cb
 }
 
@@ -363,21 +463,46 @@ func initCluster(cfg *config.Config, logger *zap.Logger) (*cluster.Cluster, erro
 		}
 	}
 
+	// Read secret key from environment variable (preferred) or config file
+	var secretKey []byte
+	secretKeyStr := os.Getenv("CLUSTER_SECRET_KEY")
+	if secretKeyStr != "" {
+		decoded, err := base64.StdEncoding.DecodeString(secretKeyStr)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode CLUSTER_SECRET_KEY: %w", err)
+		}
+		if len(decoded) != 32 {
+			return nil, fmt.Errorf("CLUSTER_SECRET_KEY must be 32 bytes when decoded, got %d", len(decoded))
+		}
+		secretKey = decoded
+		logger.Info("Using cluster secret key from CLUSTER_SECRET_KEY environment variable")
+	} else if cfg.Cluster.SecretKey != "" {
+		// Fallback to config file (not recommended for production)
+		decoded, err := base64.StdEncoding.DecodeString(cfg.Cluster.SecretKey)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode cluster.secret_key from config: %w", err)
+		}
+		if len(decoded) != 32 {
+			return nil, fmt.Errorf("cluster.secret_key must be 32 bytes when decoded, got %d", len(decoded))
+		}
+		secretKey = decoded
+		logger.Warn("Using cluster secret key from config file - use CLUSTER_SECRET_KEY env var instead")
+	}
+
 	clusterCfg := cluster.Config{
-		NodeName:      nodeName,
-		BindAddr:      cfg.Cluster.BindAddr,
-		BindPort:      cfg.Cluster.BindPort,
-		AdvertiseAddr: cfg.Cluster.AdvertiseAddr,
-		AdvertisePort: cfg.Cluster.AdvertisePort,
-		SeedNodes:     cfg.Cluster.SeedNodes,
-		Logger:        logger,
+		NodeName:  nodeName,
+		BindAddr:  cfg.Cluster.BindAddr,
+		BindPort:  cfg.Cluster.BindPort,
+		Peers:     cfg.Cluster.Peers,
+		SecretKey: secretKey,
+		Logger:    logger,
 	}
 
 	logger.Info("Initializing memberlist cluster",
 		zap.String("node_name", nodeName),
 		zap.String("bind_addr", cfg.Cluster.BindAddr),
 		zap.Int("bind_port", cfg.Cluster.BindPort),
-		zap.Int("seed_nodes", len(cfg.Cluster.SeedNodes)))
+		zap.Int("peers", len(cfg.Cluster.Peers)))
 
 	return cluster.NewCluster(clusterCfg)
 }
@@ -426,6 +551,14 @@ func startHealthServer(cfg *config.Config, logger *zap.Logger, statsManager *sta
 		healthServer.SetBasicAuth(cfg.Health.Username, cfg.Health.Password)
 	}
 
+	// Configure Prometheus metrics endpoint
+	healthServer.SetMetricsConfig(
+		cfg.Metrics.Enabled,
+		cfg.Metrics.Path,
+		cfg.Metrics.Username,
+		cfg.Metrics.Password,
+	)
+
 	// Set stats provider
 	healthServer.SetStatsProvider(statsManager)
 
@@ -456,13 +589,13 @@ func startStatsLoops(ctx context.Context, statsMgr *stats.Manager, s3Client *min
 	// Start export loop
 	go func() {
 		statsMgr.StartExportLoop(ctx, s3Client, cfg.S3.Bucket, cfg.S3.Prefix,
-			hostname, cfg.Stats.SyncInterval)
+			hostname, time.Duration(cfg.Stats.SyncIntervalSeconds)*time.Second)
 	}()
 
 	// Start sync loop
 	go func() {
 		statsMgr.StartSyncLoop(ctx, s3Client, cfg.S3.Bucket, cfg.S3.Prefix,
-			cfg.Stats.SyncInterval)
+			time.Duration(cfg.Stats.SyncIntervalSeconds)*time.Second)
 	}()
 }
 
@@ -470,13 +603,13 @@ func startStatsLoops(ctx context.Context, statsMgr *stats.Manager, s3Client *min
 func runSMTPServer(ctx context.Context, cfg *config.Config, be *smtp.Backend, tlsConfig *tls.Config, healthServer *health.Server, logger *zap.Logger) {
 	server := gosmtp.NewServer(be)
 	// Configure SMTP server parameters
-	server.Addr = cfg.SMTP.ListenAddr                       // e.g., ":25" for standard SMTP port
-	server.Domain = cfg.SMTP.Domain                         // Server's hostname for HELO/EHLO responses
-	server.ReadTimeout = cfg.SMTP.TimeoutDuration           // Timeout for reading client commands
-	server.WriteTimeout = cfg.SMTP.TimeoutDuration          // Timeout for writing responses
-	server.MaxMessageBytes = int64(cfg.SMTP.MaxMessageSize) // Limit email size to prevent abuse
-	server.AllowInsecureAuth = false                        // Require TLS for authentication
-	server.EnableSMTPUTF8 = true                            // Support international characters in addresses
+	server.Addr = cfg.SMTP.ListenAddr                                          // e.g., ":25" for standard SMTP port
+	server.Domain = cfg.SMTP.Domain                                            // Server's hostname for HELO/EHLO responses
+	server.ReadTimeout = time.Duration(cfg.SMTP.TimeoutSeconds) * time.Second  // Timeout for reading client commands
+	server.WriteTimeout = time.Duration(cfg.SMTP.TimeoutSeconds) * time.Second // Timeout for writing responses
+	server.MaxMessageBytes = int64(cfg.SMTP.MaxMessageSize)                    // Limit email size to prevent abuse
+	server.AllowInsecureAuth = false                                           // Require TLS for authentication
+	server.EnableSMTPUTF8 = true                                               // Support international characters in addresses
 	// Use the TLS config from certmagic which handles certificate management
 	server.TLSConfig = tlsConfig
 
@@ -529,7 +662,7 @@ func runSMTPServer(ctx context.Context, cfg *config.Config, be *smtp.Backend, tl
 		logger.Sugar().Info("Stopped accepting new connections")
 
 		// Phase 2: Wait for active sessions to complete (with timeout)
-		logger.Sugar().Infof("Waiting up to %v for active SMTP sessions to complete...", cfg.SMTP.ShutdownTimeout)
+		logger.Sugar().Infof("Waiting up to %v for active SMTP sessions to complete...", time.Duration(cfg.SMTP.ShutdownTimeoutSeconds)*time.Second)
 
 		waitDone := make(chan struct{})
 		go func() {
@@ -540,7 +673,7 @@ func runSMTPServer(ctx context.Context, cfg *config.Config, be *smtp.Backend, tl
 		select {
 		case <-waitDone:
 			logger.Sugar().Info("All SMTP sessions completed gracefully")
-		case <-time.After(cfg.SMTP.ShutdownTimeout):
+		case <-time.After(time.Duration(cfg.SMTP.ShutdownTimeoutSeconds) * time.Second):
 			logger.Sugar().Warn("Shutdown timeout reached, forcing termination of remaining sessions")
 		}
 
