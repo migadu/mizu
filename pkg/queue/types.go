@@ -35,6 +35,9 @@ type DeliveryJob struct {
 
 	// Timestamps
 	CreatedAt time.Time // When job was created
+
+	// Priority
+	Priority int // Job priority (higher value means higher priority)
 }
 
 // GetEmailContent retrieves the email content, from storage key or inline
@@ -91,6 +94,10 @@ type QueueStats struct {
 	CurrentSize    int // Current number of jobs in queue
 	WorkersActive  int // Number of worker goroutines
 	WorkersRunning int // Number of workers currently processing jobs
+
+	// DLQ statistics
+	DLQSize      int     // Current number of jobs in DLQ
+	DLQOldestAge float64 // Age of oldest DLQ entry in seconds (0 if empty)
 }
 
 // QueueConfig holds configuration for the delivery queue
@@ -98,6 +105,9 @@ type QueueConfig struct {
 	// Capacity
 	MaxSize int // Maximum jobs in queue (0 = unlimited)
 	Workers int // Number of concurrent worker goroutines
+
+	// Priority processing
+	PriorityMode bool // Enable priority-based job processing (default: false)
 
 	// Retry behavior (in-memory queue)
 	MaxRetryAttempts int           // Maximum retry attempts per job
@@ -130,4 +140,12 @@ func DefaultQueueConfig() QueueConfig {
 		ShutdownTimeout:      30 * time.Second,
 		ShutdownDrainTimeout: 60 * time.Second,
 	}
+}
+
+// DLQEntry represents a job in the dead letter queue
+type DLQEntry struct {
+	Job       *DeliveryJob `json:"job"`
+	Reason    string       `json:"reason"`
+	MovedAt   time.Time    `json:"moved_at"`
+	ExpiresAt time.Time    `json:"expires_at"` // Keep DLQ entries for 7 days
 }

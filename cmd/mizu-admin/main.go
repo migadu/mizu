@@ -76,6 +76,8 @@ func main() {
 		cmdRenewCert()
 	case "flush-cache":
 		cmdFlushCache()
+	case "dlq":
+		cmdDLQ()
 	case "version", "-version", "--version":
 		cmdVersion()
 	default:
@@ -98,6 +100,7 @@ Commands:
   certs              Show TLS certificate status and expiry
   renew-cert         Force certificate renewal (requires server support)
   flush-cache        Flush recipient and IP block caches
+  dlq <subcommand>   Manage dead letter queue (list, inspect, reprocess, delete)
   version            Show version information
 
 Flags:
@@ -570,4 +573,305 @@ func httpPost(path string, data io.Reader) ([]byte, error) {
 func fatal(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "Error: "+format+"\n", args...)
 	os.Exit(1)
+}
+
+func cmdDLQ() {
+	if flag.NArg() < 2 {
+		fmt.Fprintln(os.Stderr, "DLQ subcommand required")
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "Usage:")
+		fmt.Fprintln(os.Stderr, "  mizu-admin dlq list [--limit N]     List DLQ entries (default limit: 100)")
+		fmt.Fprintln(os.Stderr, "  mizu-admin dlq inspect <job-id>     Show details of a specific DLQ entry")
+		fmt.Fprintln(os.Stderr, "  mizu-admin dlq reprocess <job-id>   Move job back to active queue for retry")
+		fmt.Fprintln(os.Stderr, "  mizu-admin dlq delete <job-id>      Permanently delete a DLQ entry")
+		os.Exit(1)
+	}
+
+	subcommand := flag.Arg(1)
+
+	switch subcommand {
+	case "list":
+		cmdDLQList()
+	case "inspect":
+		if flag.NArg() < 3 {
+			fatal("Job ID required for 'inspect' command")
+		}
+		cmdDLQInspect(flag.Arg(2))
+	case "reprocess":
+		if flag.NArg() < 3 {
+			fatal("Job ID required for 'reprocess' command")
+		}
+		cmdDLQReprocess(flag.Arg(2))
+	case "delete":
+		if flag.NArg() < 3 {
+			fatal("Job ID required for 'delete' command")
+		}
+		cmdDLQDelete(flag.Arg(2))
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown DLQ subcommand: %s\n", subcommand)
+		os.Exit(1)
+	}
+}
+
+func cmdDLQList() {
+	resp, err := httpGet("/api/dlq")
+	if err != nil {
+		if strings.Contains(err.Error(), "404") || strings.Contains(err.Error(), "not configured") {
+			fmt.Println("✗ DLQ not available")
+			fmt.Println("  Server does not have persistent queue enabled")
+			os.Exit(1)
+		}
+		fatal("Failed to get DLQ entries: %v", err)
+	}
+
+	var result map[string]any
+	if err := json.Unmarshal(resp, &result); err != nil {
+		fatal("Failed to parse response: %v", err)
+	}
+
+	entries, ok := result["entries"].([]any)
+	if !ok {
+		fatal("Invalid response format")
+	}
+
+	if len(entries) == 0 {
+		fmt.Println("Dead Letter Queue is empty")
+		return
+	}
+
+	fmt.Printf("Dead Letter Queue (%d entries)\n\n", len(entries))
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+	fmt.Fprintln(w, "JOB ID\tFROM\tRECIPIENTS\tATTEMPTS\tREASON\tMOVED AT\tEXPIRES")
+	fmt.Fprintln(w, "──────\t────\t──────────\t────────\t──────\t────────\t───────")
+
+	for _, entry := range entries {
+		entryMap, ok := entry.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		jobMap, ok := entryMap["job"].(map[string]any)
+		if !ok {
+			continue
+		}
+
+		jobID := getString(jobMap, "id")
+		from := getString(jobMap, "from")
+		reason := getString(entryMap, "reason")
+		attempts := getInt(jobMap, "attempts")
+
+		recipients := getStringSlice(jobMap, "recipients")
+		recipientsStr := strings.Join(recipients, ", ")
+		if len(recipientsStr) > 30 {
+			recipientsStr = recipientsStr[:27] + "..."
+		}
+
+		movedAt := getTime(entryMap, "moved_at")
+		expiresAt := getTime(entryMap, "expires_at")
+
+		if len(reason) > 40 {
+			reason = reason[:37] + "..."
+		}
+
+		fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\t%s\t%s\n",
+			jobID[:8]+"...", // Shorten job ID for display
+			from,
+			recipientsStr,
+			attempts,
+			reason,
+			movedAt,
+			expiresAt,
+		)
+	}
+	w.Flush()
+}
+
+func cmdDLQInspect(jobID string) {
+	resp, err := httpGet("/api/dlq/" + jobID)
+	if err != nil {
+		if strings.Contains(err.Error(), "404") {
+			fatal("DLQ entry not found: %s", jobID)
+		}
+		fatal("Failed to get DLQ entry: %v", err)
+	}
+
+	var result map[string]any
+	if err := json.Unmarshal(resp, &result); err != nil {
+		fatal("Failed to parse response: %v", err)
+	}
+
+	entryMap, ok := result["entry"].(map[string]any)
+	if !ok {
+		fatal("Invalid response format")
+	}
+
+	jobMap, ok := entryMap["job"].(map[string]any)
+	if !ok {
+		fatal("Invalid entry format")
+	}
+
+	fmt.Println("DLQ Entry Details")
+	fmt.Println("=================")
+	fmt.Println()
+
+	fmt.Printf("Job ID:           %s\n", getString(jobMap, "id"))
+	fmt.Printf("From:             %s\n", getString(jobMap, "from"))
+	fmt.Printf("Original To:      %s\n", getString(jobMap, "original_to"))
+
+	recipients := getStringSlice(jobMap, "recipients")
+	fmt.Printf("Recipients:       %s\n", strings.Join(recipients, ", "))
+
+	fmt.Printf("Endpoint:         %s\n", getString(jobMap, "endpoint"))
+	fmt.Printf("Is Forwarding:    %t\n", getBool(jobMap, "is_forwarding"))
+	fmt.Printf("Is Custom Endpoint: %t\n", getBool(jobMap, "is_custom_endpoint"))
+	fmt.Printf("Is Junk:          %t\n", getBool(jobMap, "is_junk"))
+	fmt.Println()
+
+	fmt.Printf("Attempts:         %d\n", getInt(jobMap, "attempts"))
+	fmt.Printf("Max Attempts:     %d\n", getInt(jobMap, "max_attempts"))
+	fmt.Printf("Created At:       %s\n", getTime(jobMap, "created_at"))
+	fmt.Printf("Last Attempt:     %s\n", getTime(jobMap, "last_attempt"))
+	fmt.Println()
+
+	fmt.Printf("Moved to DLQ:     %s\n", getTime(entryMap, "moved_at"))
+	fmt.Printf("Expires At:       %s\n", getTime(entryMap, "expires_at"))
+	fmt.Printf("Reason:           %s\n", getString(entryMap, "reason"))
+	fmt.Println()
+
+	// Show email content if not too large
+	emailContent := getString(jobMap, "email_content")
+	if emailContent != "" && len(emailContent) < 2000 {
+		fmt.Println("Email Content Preview:")
+		fmt.Println("----------------------")
+		fmt.Println(emailContent)
+	} else if getString(jobMap, "email_storage_key") != "" {
+		fmt.Printf("Email stored separately (key: %s)\n", getString(jobMap, "email_storage_key"))
+	}
+}
+
+func cmdDLQReprocess(jobID string) {
+	fmt.Printf("Reprocessing job %s...\n", jobID)
+
+	resp, err := httpPost("/api/dlq/"+jobID, nil)
+	if err != nil {
+		if strings.Contains(err.Error(), "404") {
+			fatal("DLQ entry not found: %s", jobID)
+		}
+		fatal("Failed to reprocess job: %v", err)
+	}
+
+	var result map[string]any
+	if err := json.Unmarshal(resp, &result); err != nil {
+		fatal("Failed to parse response: %v", err)
+	}
+
+	if status, ok := result["status"].(string); ok && status == "success" {
+		fmt.Println("✓ Job moved back to active queue for reprocessing")
+		if msg, ok := result["message"].(string); ok {
+			fmt.Printf("  %s\n", msg)
+		}
+	} else {
+		fmt.Println("✗ Reprocessing failed")
+		if msg, ok := result["error"].(string); ok {
+			fmt.Printf("  Error: %s\n", msg)
+		}
+	}
+}
+
+func cmdDLQDelete(jobID string) {
+	fmt.Printf("Deleting DLQ entry %s...\n", jobID)
+	fmt.Println("Warning: This permanently deletes the job and cannot be undone.")
+	fmt.Print("Continue? (y/N): ")
+
+	var response string
+	fmt.Scanln(&response)
+	if strings.ToLower(response) != "y" && strings.ToLower(response) != "yes" {
+		fmt.Println("Cancelled")
+		return
+	}
+
+	req, err := http.NewRequest("DELETE", serverURL+"/api/dlq/"+jobID, nil)
+	if err != nil {
+		fatal("Failed to create request: %v", err)
+	}
+
+	if username != "" {
+		req.SetBasicAuth(username, password)
+	}
+
+	client := &http.Client{Timeout: timeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		fatal("Failed to delete entry: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if strings.Contains(string(body), "not found") {
+			fatal("DLQ entry not found: %s", jobID)
+		}
+		fatal("Failed to delete entry: HTTP %d: %s", resp.StatusCode, string(body))
+	}
+
+	var result map[string]any
+	if err := json.Unmarshal(body, &result); err != nil {
+		fatal("Failed to parse response: %v", err)
+	}
+
+	if status, ok := result["status"].(string); ok && status == "success" {
+		fmt.Println("✓ DLQ entry deleted successfully")
+	} else {
+		fmt.Println("✗ Deletion failed")
+		if msg, ok := result["error"].(string); ok {
+			fmt.Printf("  Error: %s\n", msg)
+		}
+	}
+}
+
+// Helper functions for extracting values from JSON maps
+func getString(m map[string]any, key string) string {
+	if v, ok := m[key].(string); ok {
+		return v
+	}
+	return ""
+}
+
+func getInt(m map[string]any, key string) int {
+	if v, ok := m[key].(float64); ok {
+		return int(v)
+	}
+	return 0
+}
+
+func getBool(m map[string]any, key string) bool {
+	if v, ok := m[key].(bool); ok {
+		return v
+	}
+	return false
+}
+
+func getStringSlice(m map[string]any, key string) []string {
+	if v, ok := m[key].([]any); ok {
+		result := make([]string, 0, len(v))
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				result = append(result, s)
+			}
+		}
+		return result
+	}
+	return []string{}
+}
+
+func getTime(m map[string]any, key string) string {
+	if v, ok := m[key].(string); ok {
+		if t, err := time.Parse(time.RFC3339, v); err == nil {
+			return t.Format("2006-01-02 15:04:05")
+		}
+		return v
+	}
+	return ""
 }

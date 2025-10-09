@@ -369,14 +369,21 @@ func TestBuildCacheKey(t *testing.T) {
 
 	key1 := client.buildCacheKey("user@example.com", "sender1@example.com")
 	key2 := client.buildCacheKey("user@example.com", "sender2@example.com")
+	key3 := client.buildCacheKey("user@example.com", "sender1@example.com")
 
-	// Currently implementation uses only recipient
-	if key1 != "user@example.com" {
-		t.Errorf("Unexpected cache key: %s", key1)
+	// Implementation now uses recipient:sender
+	expected1 := "user@example.com:sender1@example.com"
+	if key1 != expected1 {
+		t.Errorf("Expected cache key '%s', got '%s'", expected1, key1)
 	}
 
-	// Keys should be same for same recipient (current implementation)
-	if key1 != key2 {
-		t.Error("Cache keys should be same for same recipient")
+	// Keys should be different for different senders
+	if key1 == key2 {
+		t.Error("Cache keys should be different for different senders")
+	}
+
+	// Keys should be same for same recipient+sender
+	if key1 != key3 {
+		t.Error("Cache keys should be same for same recipient and sender")
 	}
 }

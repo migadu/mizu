@@ -62,18 +62,22 @@ type Metrics struct {
 	RecipientCacheSize   *prometheus.GaugeVec
 
 	// Queue metrics
-	QueueJobsTotal        prometheus.Counter   // Total jobs enqueued
-	QueueJobsActive       prometheus.Gauge     // Current jobs in queue
-	QueueJobsDelivered    prometheus.Counter   // Total jobs successfully delivered
-	QueueJobsFailed       prometheus.Counter   // Total jobs failed
-	QueueJobsRetries      prometheus.Counter   // Total retry attempts
-	QueueJobsDLQ          prometheus.Gauge     // Jobs in dead letter queue
-	QueueWorkers          prometheus.Gauge     // Number of active workers
-	QueueDeliveryDuration prometheus.Histogram // Time to deliver a job
-	QueueJobAge           prometheus.Histogram // Age of jobs when delivered
-	QueueStorageSize      prometheus.Gauge     // Storage size in bytes
-	QueueEmailFiles       prometheus.Gauge     // Number of email files on disk
-	QueueScheduleEntries  prometheus.Gauge     // Number of schedule entries
+	QueueJobsTotal        prometheus.Counter     // Total jobs enqueued
+	QueueJobsActive       prometheus.Gauge       // Current jobs in queue
+	QueueJobsDelivered    prometheus.Counter     // Total jobs successfully delivered
+	QueueJobsFailed       prometheus.Counter     // Total jobs failed
+	QueueJobsRetries      prometheus.Counter     // Total retry attempts
+	QueueJobsDLQ          prometheus.Gauge       // Jobs in dead letter queue
+	QueueDLQMovedTotal    *prometheus.CounterVec // Total jobs moved to DLQ by reason
+	QueueDLQReprocessed   prometheus.Counter     // Total jobs reprocessed from DLQ
+	QueueDLQDeleted       prometheus.Counter     // Total jobs deleted from DLQ
+	QueueDLQOldestAge     prometheus.Gauge       // Age of oldest DLQ entry in seconds
+	QueueWorkers          prometheus.Gauge       // Number of active workers
+	QueueDeliveryDuration prometheus.Histogram   // Time to deliver a job
+	QueueJobAge           prometheus.Histogram   // Age of jobs when delivered
+	QueueStorageSize      prometheus.Gauge       // Storage size in bytes
+	QueueEmailFiles       prometheus.Gauge       // Number of email files on disk
+	QueueScheduleEntries  prometheus.Gauge       // Number of schedule entries
 }
 
 // New creates and registers all Prometheus metrics
@@ -358,6 +362,30 @@ func New(namespace string) *Metrics {
 			Subsystem: "queue",
 			Name:      "jobs_dlq",
 			Help:      "Current number of jobs in dead letter queue",
+		}),
+		QueueDLQMovedTotal: promauto.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace,
+			Subsystem: "queue",
+			Name:      "dlq_moved_total",
+			Help:      "Total number of jobs moved to DLQ by reason",
+		}, []string{"reason"}),
+		QueueDLQReprocessed: promauto.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace,
+			Subsystem: "queue",
+			Name:      "dlq_reprocessed_total",
+			Help:      "Total number of jobs reprocessed from DLQ",
+		}),
+		QueueDLQDeleted: promauto.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace,
+			Subsystem: "queue",
+			Name:      "dlq_deleted_total",
+			Help:      "Total number of jobs deleted from DLQ",
+		}),
+		QueueDLQOldestAge: promauto.NewGauge(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Subsystem: "queue",
+			Name:      "dlq_oldest_age_seconds",
+			Help:      "Age of oldest entry in DLQ in seconds",
 		}),
 		QueueWorkers: promauto.NewGauge(prometheus.GaugeOpts{
 			Namespace: namespace,

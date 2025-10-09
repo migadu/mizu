@@ -133,7 +133,13 @@ workers = 10                           # Number of concurrent worker goroutines
 max_retry_hours = 48                   # Maximum hours to retry before giving up (~39 attempts over 48h)
 shutdown_timeout_seconds = 30          # Max time to wait for graceful shutdown
 
-# Retry Schedule:
+# Priority-based job processing (optional, default: false)
+# When enabled, jobs are processed by priority instead of strict FIFO order
+# Priority is set by the routing endpoint in the "priority" field (0-100, higher = more urgent)
+# Use cases: prioritize transactional emails over marketing, VIP senders, time-sensitive alerts
+priority_mode = false                  # Enable priority-based processing (default: FIFO/time-based)
+
+# Retry Schedule (time-based exponential backoff):
 # Age Range        | Retry Interval | Attempts
 # -----------------|----------------|----------
 # 0-1 min          | immediate      | 1
@@ -144,6 +150,16 @@ shutdown_timeout_seconds = 30          # Max time to wait for graceful shutdown
 # 6-24 hours       | 2 hours        | 9
 # 24-48 hours      | 4 hours        | 6
 # Total: ~39 attempts over 48 hours (configurable via max_retry_hours)
+#
+# Priority Recommendations (when priority_mode=true):
+#   0-4   = Low priority (bulk emails, newsletters, notifications)
+#   5-9   = Normal priority (standard user emails) - DEFAULT
+#   10-14 = High priority (transactional, password resets)
+#   15-19 = Urgent (security alerts, time-sensitive)
+#   20+   = Critical (system alerts, emergency notifications)
+#
+# Note: Priority only affects processing order of due jobs (NextRetry <= now)
+#       Jobs still retry according to the schedule above regardless of priority
 
 # TLS certificate management via Let's Encrypt
 [tls]

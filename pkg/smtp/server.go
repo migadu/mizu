@@ -1215,7 +1215,8 @@ func (s *Session) createDeliveryJobs(signedEmail string, routing *routing.Resolv
 			From:             s.from,
 			OriginalTo:       s.to[0], // Original RCPT TO
 			IsJunk:           s.isJunk,
-			MaxAttempts:      0, // Not used by persistent queue (uses time-based retries)
+			MaxAttempts:      0,                // Not used by persistent queue (uses time-based retries)
+			Priority:         routing.Priority, // Priority from routing response
 		}
 
 		jobs = append(jobs, job)
@@ -1253,7 +1254,8 @@ func (s *Session) createDeliveryJobs(signedEmail string, routing *routing.Resolv
 			From:             s.from,
 			OriginalTo:       s.to[0],
 			IsJunk:           s.isJunk,
-			MaxAttempts:      0, // Not used by persistent queue (uses time-based retries)
+			MaxAttempts:      0,                // Not used by persistent queue (uses time-based retries)
+			Priority:         routing.Priority, // Priority from routing response
 		}
 
 		jobs = append(jobs, job)

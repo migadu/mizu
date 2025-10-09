@@ -22,6 +22,9 @@ type ResolveResponse struct {
 
 	IsCatchall bool `json:"is_catchall,omitempty"` // Whether this matched a catchall rule
 
+	// Priority for queueing
+	Priority int `json:"priority,omitempty"` // Job priority for queueing
+
 	// Error information if not accepted
 	ErrorCode    string `json:"error_code,omitempty"`    // Machine-readable error code
 	ErrorMessage string `json:"error_message,omitempty"` // Human-readable error message

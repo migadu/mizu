@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,6 +17,15 @@ import (
 	"go.uber.org/zap"
 )
 
+// NonRetryableError is an error that should not be retried.
+type NonRetryableError struct {
+	Err error
+}
+
+func (e *NonRetryableError) Error() string {
+	return e.Err.Error()
+}
+
 // Client handles routing lookups with caching and retries
 type Client struct {
 	endpoint       string
@@ -26,6 +36,7 @@ type Client struct {
 
 	// Caching
 	cache            *expirable.LRU[string, *ResolveResponse]
+	negativeCache    *expirable.LRU[string, *ResolveResponse]
 	cacheTTL         time.Duration
 	cacheNegativeTTL time.Duration
 
@@ -87,11 +98,18 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		Timeout: time.Duration(cfg.TimeoutMS) * time.Millisecond,
 	}
 
-	// Create LRU cache with TTL
+	// Create LRU cache for positive responses
 	cache := expirable.NewLRU[string, *ResolveResponse](
 		cfg.CacheMaxEntries,
 		nil, // no eviction callback
 		time.Duration(cfg.CacheTTLSeconds)*time.Second,
+	)
+
+	// Create a separate LRU cache for negative responses
+	negativeCache := expirable.NewLRU[string, *ResolveResponse](
+		cfg.CacheMaxEntries, // Use the same max entries for now
+		nil,
+		time.Duration(cfg.CacheNegativeTTLSeconds)*time.Second,
 	)
 
 	return &Client{
@@ -101,6 +119,7 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		circuitBreaker:   cfg.CircuitBreaker,
 		logger:           cfg.Logger,
 		cache:            cache,
+		negativeCache:    negativeCache,
 		cacheTTL:         time.Duration(cfg.CacheTTLSeconds) * time.Second,
 		cacheNegativeTTL: time.Duration(cfg.CacheNegativeTTLSeconds) * time.Second,
 		maxRetries:       cfg.MaxRetries,
@@ -111,10 +130,19 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 
 // Resolve looks up routing information for a recipient
 func (c *Client) Resolve(ctx context.Context, recipient, sender, clientIP, subject string) (*ResolveResponse, error) {
-	// Check cache first (cache by recipient+sender, not subject since subject varies)
 	cacheKey := c.buildCacheKey(recipient, sender)
+
+	// Check positive cache first
 	if cached, ok := c.cache.Get(cacheKey); ok {
-		c.logger.Debug("Routing cache hit",
+		c.logger.Debug("Routing cache hit (positive)",
+			zap.String("recipient", recipient),
+			zap.String("cache_key", cacheKey))
+		return cached, nil
+	}
+
+	// Check negative cache
+	if cached, ok := c.negativeCache.Get(cacheKey); ok {
+		c.logger.Debug("Routing cache hit (negative)",
 			zap.String("recipient", recipient),
 			zap.String("cache_key", cacheKey))
 		return cached, nil
@@ -166,6 +194,12 @@ func (c *Client) queryEndpoint(ctx context.Context, req ResolveRequest) (*Resolv
 			return resp, nil
 		}
 
+		// Don't retry on non-retryable errors (e.g., 4xx)
+		var nonRetryable *NonRetryableError
+		if errors.As(err, &nonRetryable) {
+			return nil, nonRetryable.Err
+		}
+
 		lastErr = err
 		c.logger.Debug("Routing query attempt failed",
 			zap.Int("attempt", attempt+1),
@@ -179,9 +213,8 @@ func (c *Client) queryEndpoint(ctx context.Context, req ResolveRequest) (*Resolv
 // makeHTTPRequest performs the actual HTTP call with circuit breaker protection
 func (c *Client) makeHTTPRequest(ctx context.Context, req ResolveRequest) (*ResolveResponse, error) {
 	var result *ResolveResponse
-	var requestErr error
 
-	// Wrap the HTTP call in circuit breaker if configured
+	// This function is wrapped by the circuit breaker
 	executeRequest := func() error {
 		// Marshal request
 		body, err := json.Marshal(req)
@@ -215,13 +248,13 @@ func (c *Client) makeHTTPRequest(ctx context.Context, req ResolveRequest) (*Reso
 
 		// Check status code
 		if httpResp.StatusCode != http.StatusOK {
-			// 5xx errors are returned as errors (circuit breaker will count them)
+			err := fmt.Errorf("routing endpoint returned status %d: %s", httpResp.StatusCode, string(respBody))
+			// 5xx errors are returned as retryable errors (circuit breaker will count them)
 			if httpResp.StatusCode >= 500 {
-				return fmt.Errorf("routing endpoint returned status %d: %s", httpResp.StatusCode, string(respBody))
+				return err
 			}
-			// 4xx errors don't fail the circuit (client errors)
-			requestErr = fmt.Errorf("routing endpoint returned status %d: %s", httpResp.StatusCode, string(respBody))
-			return nil // Return nil to not trip circuit breaker
+			// 4xx errors are wrapped in NonRetryableError
+			return &NonRetryableError{Err: err}
 		}
 
 		// Parse response
@@ -234,50 +267,43 @@ func (c *Client) makeHTTPRequest(ctx context.Context, req ResolveRequest) (*Reso
 		return nil
 	}
 
-	// Execute with circuit breaker if configured
+	// Execute with circuit breaker
 	if c.circuitBreaker != nil {
-		err := c.circuitBreaker.Call(executeRequest)
-		if err != nil {
+		if err := c.circuitBreaker.Call(executeRequest); err != nil {
 			return nil, err
 		}
 	} else {
-		err := executeRequest()
-		if err != nil {
+		if err := executeRequest(); err != nil {
 			return nil, err
 		}
-	}
-
-	// Check if we had a client error (4xx)
-	if requestErr != nil {
-		return nil, requestErr
 	}
 
 	return result, nil
 }
 
-// cacheResult stores the result in cache with appropriate TTL
+// cacheResult stores the result in the appropriate cache with appropriate TTL
 func (c *Client) cacheResult(key string, resp *ResolveResponse) {
-	// Use negative TTL for rejected recipients
-	ttl := c.cacheTTL
 	if !resp.Accepted {
-		ttl = c.cacheNegativeTTL
+		// Cache negative responses in the negative cache
+		c.negativeCache.Add(key, resp)
+		c.logger.Debug("Cached routing result (negative)",
+			zap.String("key", key),
+			zap.Bool("accepted", resp.Accepted),
+			zap.Duration("ttl", c.cacheNegativeTTL))
+	} else {
+		// Cache positive responses in the main cache
+		c.cache.Add(key, resp)
+		c.logger.Debug("Cached routing result (positive)",
+			zap.String("key", key),
+			zap.Bool("accepted", resp.Accepted),
+			zap.Duration("ttl", c.cacheTTL))
 	}
-
-	// Note: expirable.LRU doesn't support per-item TTL, so we use the default TTL
-	// For different TTLs, we'd need to implement a custom cache or use different cache instances
-	c.cache.Add(key, resp)
-
-	c.logger.Debug("Cached routing result",
-		zap.String("key", key),
-		zap.Bool("accepted", resp.Accepted),
-		zap.Duration("ttl", ttl))
 }
 
 // buildCacheKey creates a cache key from request parameters
 func (c *Client) buildCacheKey(recipient, sender string) string {
-	// For now, just use recipient as key
-	// In future, could include sender for per-sender policies
-	return recipient
+	// Use a combination of recipient and sender for more granular caching
+	return fmt.Sprintf("%s:%s", recipient, sender)
 }
 
 // GetStats returns cache statistics
@@ -286,13 +312,15 @@ func (c *Client) GetStats() map[string]interface{} {
 	defer c.mu.RUnlock()
 
 	return map[string]interface{}{
-		"cache_entries": c.cache.Len(),
-		"endpoint":      c.endpoint,
+		"cache_entries":          c.cache.Len(),
+		"negative_cache_entries": c.negativeCache.Len(),
+		"endpoint":               c.endpoint,
 	}
 }
 
 // FlushCache clears all cached entries
 func (c *Client) FlushCache() {
 	c.cache.Purge()
-	c.logger.Info("Routing cache flushed")
+	c.negativeCache.Purge()
+	c.logger.Info("Routing caches flushed")
 }

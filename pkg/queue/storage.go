@@ -12,8 +12,16 @@ import (
 
 // Storage provides persistent storage for the queue using BadgerDB
 type Storage struct {
-	db     *badger.DB
-	logger *zap.Logger
+	db      *badger.DB
+	logger  *zap.Logger
+	metrics MetricsRecorder
+}
+
+// MetricsRecorder defines metrics that can be recorded by storage operations
+type MetricsRecorder interface {
+	RecordDLQMoved(reason string)
+	RecordDLQReprocessed()
+	RecordDLQDeleted()
 }
 
 // StorageConfig holds configuration for the storage backend
@@ -21,6 +29,7 @@ type StorageConfig struct {
 	DataDir    string // Directory for BadgerDB files
 	SyncWrites bool   // Enable sync writes for durability (default: true for mail queue)
 	Logger     *zap.Logger
+	Metrics    MetricsRecorder // Optional metrics recorder
 }
 
 // NewStorage creates a new persistent storage backend
@@ -54,8 +63,9 @@ func NewStorage(config StorageConfig) (*Storage, error) {
 	}
 
 	s := &Storage{
-		db:     db,
-		logger: config.Logger,
+		db:      db,
+		logger:  config.Logger,
+		metrics: config.Metrics,
 	}
 
 	// Start garbage collection
@@ -217,12 +227,7 @@ func (s *Storage) GetDueJobs(limit int) ([]*DeliveryJob, error) {
 // MoveToDLQ moves a job to the dead letter queue
 func (s *Storage) MoveToDLQ(job *DeliveryJob, reason string) error {
 	// Add DLQ metadata
-	dlqEntry := struct {
-		Job       *DeliveryJob `json:"job"`
-		Reason    string       `json:"reason"`
-		MovedAt   time.Time    `json:"moved_at"`
-		ExpiresAt time.Time    `json:"expires_at"` // Keep DLQ entries for 7 days
-	}{
+	dlqEntry := &DLQEntry{
 		Job:       job,
 		Reason:    reason,
 		MovedAt:   time.Now(),
@@ -234,7 +239,7 @@ func (s *Storage) MoveToDLQ(job *DeliveryJob, reason string) error {
 		return fmt.Errorf("failed to marshal DLQ entry: %w", err)
 	}
 
-	return s.db.Update(func(txn *badger.Txn) error {
+	err = s.db.Update(func(txn *badger.Txn) error {
 		// Save to DLQ
 		dlqKey := []byte("dlq:" + job.ID)
 		entry := badger.NewEntry(dlqKey, data).WithTTL(7 * 24 * time.Hour)
@@ -255,6 +260,160 @@ func (s *Storage) MoveToDLQ(job *DeliveryJob, reason string) error {
 
 		return nil
 	})
+
+	if err == nil && s.metrics != nil {
+		s.metrics.RecordDLQMoved(reason)
+	}
+
+	return err
+}
+
+// GetDLQEntries returns DLQ entries with optional limit
+func (s *Storage) GetDLQEntries(limit int) ([]*DLQEntry, error) {
+	entries := make([]*DLQEntry, 0)
+
+	err := s.db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchSize = 100
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		prefix := []byte("dlq:")
+		count := 0
+		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+			if limit > 0 && count >= limit {
+				break
+			}
+
+			item := it.Item()
+			var entry DLQEntry
+			err := item.Value(func(val []byte) error {
+				return json.Unmarshal(val, &entry)
+			})
+			if err != nil {
+				s.logger.Error("Failed to unmarshal DLQ entry", zap.Error(err))
+				continue
+			}
+
+			entries = append(entries, &entry)
+			count++
+		}
+
+		return nil
+	})
+
+	return entries, err
+}
+
+// GetDLQEntry retrieves a specific DLQ entry by job ID
+func (s *Storage) GetDLQEntry(jobID string) (*DLQEntry, error) {
+	var entry DLQEntry
+
+	err := s.db.View(func(txn *badger.Txn) error {
+		item, err := txn.Get([]byte("dlq:" + jobID))
+		if err != nil {
+			return err
+		}
+
+		return item.Value(func(val []byte) error {
+			return json.Unmarshal(val, &entry)
+		})
+	})
+
+	if err == badger.ErrKeyNotFound {
+		return nil, fmt.Errorf("DLQ entry not found: %s", jobID)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return &entry, nil
+}
+
+// ReprocessDLQJob moves a job from DLQ back to the active queue for retry
+func (s *Storage) ReprocessDLQJob(jobID string) error {
+	err := s.db.Update(func(txn *badger.Txn) error {
+		// Get DLQ entry
+		dlqKey := []byte("dlq:" + jobID)
+		item, err := txn.Get(dlqKey)
+		if err == badger.ErrKeyNotFound {
+			return fmt.Errorf("DLQ entry not found: %s", jobID)
+		}
+		if err != nil {
+			return err
+		}
+
+		var dlqEntry DLQEntry
+		err = item.Value(func(val []byte) error {
+			return json.Unmarshal(val, &dlqEntry)
+		})
+		if err != nil {
+			return fmt.Errorf("failed to unmarshal DLQ entry: %w", err)
+		}
+
+		job := dlqEntry.Job
+
+		// Reset job for reprocessing
+		job.Attempts = 0
+		job.LastAttempt = time.Time{} // Zero value
+		job.NextRetry = time.Now()    // Schedule for immediate retry
+		job.CreatedAt = time.Now()    // Reset created time to extend retry window
+
+		// Save job back to active queue
+		jobData, err := json.Marshal(job)
+		if err != nil {
+			return fmt.Errorf("failed to marshal job: %w", err)
+		}
+
+		jobKey := []byte("job:" + job.ID)
+		if err := txn.Set(jobKey, jobData); err != nil {
+			return err
+		}
+
+		// Add schedule entry
+		scheduleKey := s.scheduleKey(job.NextRetry, job.ID)
+		if err := txn.Set(scheduleKey, []byte{}); err != nil {
+			return err
+		}
+
+		// Delete from DLQ
+		if err := txn.Delete(dlqKey); err != nil {
+			return err
+		}
+
+		return nil
+	})
+
+	if err == nil && s.metrics != nil {
+		s.metrics.RecordDLQReprocessed()
+	}
+
+	return err
+}
+
+// DeleteDLQEntry removes a specific entry from the DLQ
+func (s *Storage) DeleteDLQEntry(jobID string) error {
+	err := s.db.Update(func(txn *badger.Txn) error {
+		dlqKey := []byte("dlq:" + jobID)
+
+		// Check if entry exists first
+		_, err := txn.Get(dlqKey)
+		if err == badger.ErrKeyNotFound {
+			return fmt.Errorf("DLQ entry not found: %s", jobID)
+		}
+		if err != nil {
+			return err
+		}
+
+		// Delete the entry
+		return txn.Delete(dlqKey)
+	})
+
+	if err == nil && s.metrics != nil {
+		s.metrics.RecordDLQDeleted()
+	}
+
+	return err
 }
 
 // GetAllJobs returns all jobs in the queue (for recovery/inspection)

@@ -27,12 +27,17 @@ type PersistentQueue struct {
 	schedule     *RetrySchedule
 
 	// Worker management
-	workers    int
-	workersWg  sync.WaitGroup
-	shutdownCh chan struct{}
-	isShutdown atomic.Bool
-	activeJobs atomic.Int64      // Number of jobs currently being processed
-	jobsChan   chan *DeliveryJob // Channel for dispatching jobs to workers
+	workers      int
+	workersWg    sync.WaitGroup
+	shutdownCh   chan struct{}
+	isShutdown   atomic.Bool
+	activeJobs   atomic.Int64      // Number of jobs currently being processed
+	jobsChan     chan *DeliveryJob // Channel for dispatching jobs to workers
+	priorityMode bool              // Enable priority-based processing
+
+	// Priority queue (used when priorityMode is enabled)
+	priorityQueue     *PriorityQueue
+	priorityQueueCond *sync.Cond
 
 	// Scheduler ticker
 	schedulerTicker *time.Ticker
@@ -75,12 +80,19 @@ func NewPersistentQueue(
 		return nil, fmt.Errorf("data_dir is required for persistent queue")
 	}
 
+	// Create metrics recorder for storage operations
+	var metricsRecorder *queueMetricsRecorder
+	if m != nil {
+		metricsRecorder = &queueMetricsRecorder{metrics: m}
+	}
+
 	// Create storage with sync writes enabled
 	// CRITICAL: Sync writes guarantee messages are durably stored BEFORE sending SMTP 250 OK
 	storage, err := NewStorage(StorageConfig{
 		DataDir:    dataDir,
 		SyncWrites: true, // REQUIRED for mail queue - never lose messages after SMTP acceptance
 		Logger:     logger,
+		Metrics:    metricsRecorder,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create storage: %w", err)
@@ -109,11 +121,19 @@ func NewPersistentQueue(
 		shutdownCh:               make(chan struct{}),
 		schedulerDone:            make(chan struct{}),
 		jobsChan:                 make(chan *DeliveryJob, config.Workers*2), // Buffered channel for job dispatch
+		priorityMode:             config.PriorityMode,
 		httpClient:               httpClient,
 		deliveryCircuitBreaker:   deliveryCircuitBreaker,
 		forwardingCircuitBreaker: forwardingCircuitBreaker,
 		logger:                   logger,
 		metrics:                  m,
+	}
+
+	// Initialize priority queue if priority mode is enabled
+	if config.PriorityMode {
+		q.priorityQueue = NewPriorityQueue()
+		q.priorityQueueCond = sync.NewCond(&sync.Mutex{})
+		logger.Info("Priority-based job processing enabled")
 	}
 
 	return q, nil
@@ -209,16 +229,56 @@ func (q *PersistentQueue) Enqueue(job *DeliveryJob) error {
 	return nil
 }
 
-// worker processes jobs from the jobs channel
+// worker processes jobs from the jobs channel or priority queue
 func (q *PersistentQueue) worker(workerID int) {
-	q.logger.Debug("Persistent queue worker started", zap.Int("worker_id", workerID))
+	q.logger.Debug("Persistent queue worker started",
+		zap.Int("worker_id", workerID),
+		zap.Bool("priority_mode", q.priorityMode))
 
+	if q.priorityMode {
+		q.workerPriorityMode(workerID)
+	} else {
+		q.workerFIFOMode(workerID)
+	}
+}
+
+// workerFIFOMode processes jobs in FIFO order from channel
+func (q *PersistentQueue) workerFIFOMode(workerID int) {
 	for {
 		select {
 		case <-q.shutdownCh:
 			q.logger.Debug("Persistent queue worker shutting down", zap.Int("worker_id", workerID))
 			return
 		case job := <-q.jobsChan:
+			if job != nil {
+				q.processJob(job, time.Now())
+			}
+		}
+	}
+}
+
+// workerPriorityMode processes jobs by priority from priority queue
+func (q *PersistentQueue) workerPriorityMode(workerID int) {
+	for {
+		select {
+		case <-q.shutdownCh:
+			q.logger.Debug("Persistent queue worker shutting down (priority mode)", zap.Int("worker_id", workerID))
+			return
+		default:
+			// Wait for jobs in priority queue
+			q.priorityQueueCond.L.Lock()
+			for q.priorityQueue.Len() == 0 && !q.isShutdown.Load() {
+				q.priorityQueueCond.Wait()
+			}
+
+			if q.isShutdown.Load() {
+				q.priorityQueueCond.L.Unlock()
+				return
+			}
+
+			job := q.priorityQueue.PopJob()
+			q.priorityQueueCond.L.Unlock()
+
 			if job != nil {
 				q.processJob(job, time.Now())
 			}
@@ -256,16 +316,31 @@ func (q *PersistentQueue) processDueJobs() {
 	}
 
 	q.logger.Debug("Dispatching due jobs to workers",
-		zap.Int("count", len(jobs)))
+		zap.Int("count", len(jobs)),
+		zap.Bool("priority_mode", q.priorityMode))
 
-	// Dispatch each job to worker pool
-	// Block if channel is full to ensure all jobs get dispatched
-	for _, job := range jobs {
-		select {
-		case <-q.shutdownCh:
-			return
-		case q.jobsChan <- job:
-			// Job dispatched to worker
+	if q.priorityMode {
+		// Priority mode: Add jobs to priority queue
+		q.priorityQueueCond.L.Lock()
+		for _, job := range jobs {
+			if q.isShutdown.Load() {
+				q.priorityQueueCond.L.Unlock()
+				return
+			}
+			q.priorityQueue.PushJob(job)
+		}
+		// Signal all waiting workers
+		q.priorityQueueCond.Broadcast()
+		q.priorityQueueCond.L.Unlock()
+	} else {
+		// FIFO mode: Dispatch to channel
+		for _, job := range jobs {
+			select {
+			case <-q.shutdownCh:
+				return
+			case q.jobsChan <- job:
+				// Job dispatched to worker
+			}
 		}
 	}
 }
@@ -481,6 +556,11 @@ func (q *PersistentQueue) Shutdown(ctx context.Context) error {
 		close(q.shutdownCh)
 	}
 
+	// Wake up priority queue workers if in priority mode
+	if q.priorityMode {
+		q.priorityQueueCond.Broadcast()
+	}
+
 	// Wait for scheduler to finish (only if it was started)
 	if q.schedulerDone != nil {
 		select {
@@ -530,6 +610,19 @@ func (q *PersistentQueue) GetStats() QueueStats {
 		jobCount = count
 	}
 
+	dlqSize := 0
+	if count, ok := storageStats["dlq_entries"].(int); ok {
+		dlqSize = count
+	}
+
+	// Get oldest DLQ entry age
+	var dlqOldestAge float64
+	if dlqSize > 0 {
+		if entries, err := q.storage.GetDLQEntries(1); err == nil && len(entries) > 0 {
+			dlqOldestAge = time.Since(entries[0].MovedAt).Seconds()
+		}
+	}
+
 	return QueueStats{
 		TotalEnqueued:  q.statsTotal.enqueued.Load(),
 		TotalDelivered: q.statsTotal.delivered.Load(),
@@ -538,6 +631,8 @@ func (q *PersistentQueue) GetStats() QueueStats {
 		CurrentSize:    jobCount,
 		WorkersActive:  q.workers,
 		WorkersRunning: int(q.activeJobs.Load()),
+		DLQSize:        dlqSize,
+		DLQOldestAge:   dlqOldestAge,
 	}
 }
 
@@ -638,6 +733,9 @@ func (q *PersistentQueue) UpdateMetrics() {
 		q.metrics.QueueJobsDLQ.Set(float64(dlqCount))
 	}
 
+	// Update DLQ oldest age
+	q.updateDLQOldestAge()
+
 	// Update schedule entries
 	if scheduleCount, ok := storageStats["schedule_entries"].(int); ok {
 		q.metrics.QueueScheduleEntries.Set(float64(scheduleCount))
@@ -651,5 +749,106 @@ func (q *PersistentQueue) UpdateMetrics() {
 		if bytes, ok := emailStats["total_bytes"].(int64); ok {
 			q.metrics.QueueStorageSize.Set(float64(bytes))
 		}
+	}
+}
+
+// updateDLQOldestAge updates the metric for oldest DLQ entry age
+func (q *PersistentQueue) updateDLQOldestAge() {
+	entries, err := q.storage.GetDLQEntries(1) // Get oldest entry
+	if err != nil || len(entries) == 0 {
+		q.metrics.QueueDLQOldestAge.Set(0)
+		return
+	}
+
+	age := time.Since(entries[0].MovedAt).Seconds()
+	q.metrics.QueueDLQOldestAge.Set(age)
+}
+
+// GetDLQEntries returns DLQ entries with optional limit
+func (q *PersistentQueue) GetDLQEntries(limit int) ([]*DLQEntry, error) {
+	return q.storage.GetDLQEntries(limit)
+}
+
+// GetDLQEntry retrieves a specific DLQ entry by job ID
+func (q *PersistentQueue) GetDLQEntry(jobID string) (*DLQEntry, error) {
+	return q.storage.GetDLQEntry(jobID)
+}
+
+// ReprocessDLQJob moves a job from DLQ back to the active queue for retry
+func (q *PersistentQueue) ReprocessDLQJob(jobID string) error {
+	q.logger.Info("Reprocessing DLQ job", zap.String("job_id", jobID))
+	return q.storage.ReprocessDLQJob(jobID)
+}
+
+// DeleteDLQEntry removes a specific entry from the DLQ
+func (q *PersistentQueue) DeleteDLQEntry(jobID string) error {
+	// Get the DLQ entry first to clean up email file if needed
+	entry, err := q.storage.GetDLQEntry(jobID)
+	if err != nil {
+		return err
+	}
+
+	// Delete email file if stored on filesystem
+	if entry.Job.EmailStorageKey != "" {
+		if err := q.emailStorage.Delete(entry.Job.EmailStorageKey); err != nil {
+			q.logger.Warn("Failed to delete email file for DLQ entry",
+				zap.String("job_id", jobID),
+				zap.String("storage_key", entry.Job.EmailStorageKey),
+				zap.Error(err))
+			// Continue with deletion even if file cleanup fails
+		}
+	}
+
+	q.logger.Info("Deleting DLQ entry", zap.String("job_id", jobID))
+	return q.storage.DeleteDLQEntry(jobID)
+}
+
+// DLQProviderWrapper wraps PersistentQueue to implement health.DLQProvider interface
+// This allows the queue to be used with the health server's DLQ endpoints
+type DLQProviderWrapper struct {
+	queue *PersistentQueue
+}
+
+// NewDLQProviderWrapper creates a wrapper that implements health.DLQProvider
+func NewDLQProviderWrapper(queue *PersistentQueue) *DLQProviderWrapper {
+	return &DLQProviderWrapper{queue: queue}
+}
+
+func (w *DLQProviderWrapper) GetDLQEntries(limit int) (any, error) {
+	return w.queue.GetDLQEntries(limit)
+}
+
+func (w *DLQProviderWrapper) GetDLQEntry(jobID string) (any, error) {
+	return w.queue.GetDLQEntry(jobID)
+}
+
+func (w *DLQProviderWrapper) ReprocessDLQJob(jobID string) error {
+	return w.queue.ReprocessDLQJob(jobID)
+}
+
+func (w *DLQProviderWrapper) DeleteDLQEntry(jobID string) error {
+	return w.queue.DeleteDLQEntry(jobID)
+}
+
+// queueMetricsRecorder implements storage.MetricsRecorder
+type queueMetricsRecorder struct {
+	metrics *metrics.Metrics
+}
+
+func (r *queueMetricsRecorder) RecordDLQMoved(reason string) {
+	if r != nil && r.metrics != nil {
+		r.metrics.QueueDLQMovedTotal.WithLabelValues(reason).Inc()
+	}
+}
+
+func (r *queueMetricsRecorder) RecordDLQReprocessed() {
+	if r != nil && r.metrics != nil {
+		r.metrics.QueueDLQReprocessed.Inc()
+	}
+}
+
+func (r *queueMetricsRecorder) RecordDLQDeleted() {
+	if r != nil && r.metrics != nil {
+		r.metrics.QueueDLQDeleted.Inc()
 	}
 }

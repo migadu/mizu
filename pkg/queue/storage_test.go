@@ -586,3 +586,189 @@ func TestStorage_InvalidJobID(t *testing.T) {
 		t.Error("Loading non-existent job should return error")
 	}
 }
+
+// TestStorage_DLQManagement tests DLQ entry retrieval, reprocessing, and deletion
+func TestStorage_DLQManagement(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "storage-dlq-mgmt-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	storage, err := NewStorage(StorageConfig{
+		DataDir: tmpDir,
+		Logger:  zap.NewNop(),
+	})
+	if err != nil {
+		t.Fatalf("Failed to create storage: %v", err)
+	}
+	defer storage.Close()
+
+	// Create and save multiple jobs
+	job1 := &DeliveryJob{
+		ID:           GenerateJobID(),
+		EmailContent: "Failed job 1",
+		Endpoint:     "https://example.com",
+		Recipients:   []string{"test1@example.com"},
+		CreatedAt:    time.Now().Add(-48 * time.Hour),
+		NextRetry:    time.Now(),
+		Attempts:     39,
+	}
+
+	job2 := &DeliveryJob{
+		ID:           GenerateJobID(),
+		EmailContent: "Failed job 2",
+		Endpoint:     "https://example.com",
+		Recipients:   []string{"test2@example.com"},
+		CreatedAt:    time.Now().Add(-24 * time.Hour),
+		NextRetry:    time.Now(),
+		Attempts:     20,
+	}
+
+	// Save jobs
+	if err := storage.SaveJob(job1); err != nil {
+		t.Fatalf("Failed to save job1: %v", err)
+	}
+	if err := storage.SaveJob(job2); err != nil {
+		t.Fatalf("Failed to save job2: %v", err)
+	}
+
+	// Move both to DLQ with different reasons
+	if err := storage.MoveToDLQ(job1, "Exceeded max retry hours (48h)"); err != nil {
+		t.Fatalf("Failed to move job1 to DLQ: %v", err)
+	}
+	if err := storage.MoveToDLQ(job2, "Permanent HTTP 404 error"); err != nil {
+		t.Fatalf("Failed to move job2 to DLQ: %v", err)
+	}
+
+	// Test GetDLQEntries
+	t.Run("GetDLQEntries", func(t *testing.T) {
+		entries, err := storage.GetDLQEntries(100)
+		if err != nil {
+			t.Fatalf("Failed to get DLQ entries: %v", err)
+		}
+
+		if len(entries) != 2 {
+			t.Errorf("Expected 2 DLQ entries, got %d", len(entries))
+		}
+
+		// Verify entry structure
+		for _, entry := range entries {
+			if entry.Job == nil {
+				t.Error("DLQ entry should have Job field")
+			}
+			if entry.Reason == "" {
+				t.Error("DLQ entry should have Reason field")
+			}
+			if entry.MovedAt.IsZero() {
+				t.Error("DLQ entry should have MovedAt timestamp")
+			}
+			if entry.ExpiresAt.IsZero() {
+				t.Error("DLQ entry should have ExpiresAt timestamp")
+			}
+		}
+	})
+
+	// Test GetDLQEntries with limit
+	t.Run("GetDLQEntries_WithLimit", func(t *testing.T) {
+		entries, err := storage.GetDLQEntries(1)
+		if err != nil {
+			t.Fatalf("Failed to get DLQ entries: %v", err)
+		}
+
+		if len(entries) != 1 {
+			t.Errorf("Expected 1 DLQ entry (limit), got %d", len(entries))
+		}
+	})
+
+	// Test GetDLQEntry for specific entry
+	t.Run("GetDLQEntry", func(t *testing.T) {
+		entry, err := storage.GetDLQEntry(job1.ID)
+		if err != nil {
+			t.Fatalf("Failed to get DLQ entry: %v", err)
+		}
+
+		if entry.Job.ID != job1.ID {
+			t.Errorf("Expected job ID %s, got %s", job1.ID, entry.Job.ID)
+		}
+		if entry.Reason != "Exceeded max retry hours (48h)" {
+			t.Errorf("Unexpected reason: %s", entry.Reason)
+		}
+	})
+
+	// Test GetDLQEntry for non-existent entry
+	t.Run("GetDLQEntry_NotFound", func(t *testing.T) {
+		_, err := storage.GetDLQEntry("non-existent-id")
+		if err == nil {
+			t.Error("GetDLQEntry should return error for non-existent entry")
+		}
+		if !strings.Contains(err.Error(), "not found") {
+			t.Errorf("Error should mention 'not found', got: %v", err)
+		}
+	})
+
+	// Test ReprocessDLQJob
+	t.Run("ReprocessDLQJob", func(t *testing.T) {
+		// Reprocess job1
+		if err := storage.ReprocessDLQJob(job1.ID); err != nil {
+			t.Fatalf("Failed to reprocess DLQ job: %v", err)
+		}
+
+		// Job should be removed from DLQ
+		_, err := storage.GetDLQEntry(job1.ID)
+		if err == nil {
+			t.Error("Job should be removed from DLQ after reprocessing")
+		}
+
+		// Job should be back in active queue
+		reprocessedJob, err := storage.GetJob(job1.ID)
+		if err != nil {
+			t.Fatalf("Failed to load reprocessed job: %v", err)
+		}
+
+		// Job should be reset for retry
+		if reprocessedJob.Attempts != 0 {
+			t.Errorf("Reprocessed job should have 0 attempts, got %d", reprocessedJob.Attempts)
+		}
+		if reprocessedJob.NextRetry.After(time.Now().Add(1 * time.Minute)) {
+			t.Error("Reprocessed job should be scheduled for immediate retry")
+		}
+
+		// DLQ should now have only 1 entry
+		entries, _ := storage.GetDLQEntries(100)
+		if len(entries) != 1 {
+			t.Errorf("Expected 1 DLQ entry after reprocessing, got %d", len(entries))
+		}
+	})
+
+	// Test DeleteDLQEntry
+	t.Run("DeleteDLQEntry", func(t *testing.T) {
+		// Delete job2 from DLQ
+		if err := storage.DeleteDLQEntry(job2.ID); err != nil {
+			t.Fatalf("Failed to delete DLQ entry: %v", err)
+		}
+
+		// Entry should be removed from DLQ
+		_, err := storage.GetDLQEntry(job2.ID)
+		if err == nil {
+			t.Error("Entry should be removed from DLQ after deletion")
+		}
+
+		// DLQ should now be empty
+		entries, _ := storage.GetDLQEntries(100)
+		if len(entries) != 0 {
+			t.Errorf("Expected 0 DLQ entries after deletion, got %d", len(entries))
+		}
+	})
+
+	// Test DeleteDLQEntry for non-existent entry
+	t.Run("DeleteDLQEntry_NotFound", func(t *testing.T) {
+		err := storage.DeleteDLQEntry("non-existent-id")
+		if err == nil {
+			t.Error("DeleteDLQEntry should return error for non-existent entry")
+		}
+		if !strings.Contains(err.Error(), "not found") {
+			t.Errorf("Error should mention 'not found', got: %v", err)
+		}
+	})
+}
