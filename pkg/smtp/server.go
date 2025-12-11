@@ -153,7 +153,10 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 			RemoteAddr: remoteAddr,
 		}
 		if err := be.RateLimiter.CheckRateLimit(sessionCtx); err != nil {
-			be.Logger.Warn("Rate limit exceeded", "remote_addr", remoteAddr, "error", err)
+			be.Logger.Info("Rejecting connection - rate limit exceeded",
+				"server", be.ServerConfig.Name,
+				"remote_addr", remoteAddr,
+				"error", err)
 
 			// Record rejection in metrics
 			if be.Metrics != nil {
@@ -174,7 +177,10 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 	if be.DistTracker != nil {
 		// Distributed tracker wraps local tracker
 		if err := be.DistTracker.TryAcquire(remoteAddr); err != nil {
-			be.Logger.Warn("Distributed connection limit exceeded", "remote_addr", remoteAddr, "error", err)
+			be.Logger.Info("Rejecting connection - distributed connection limit exceeded",
+				"server", be.ServerConfig.Name,
+				"remote_addr", remoteAddr,
+				"error", err)
 			return nil, &smtp.SMTPError{
 				Code:         421,
 				EnhancedCode: smtp.EnhancedCode{4, 3, 2},
@@ -189,7 +195,10 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 		}()
 	} else if tracker != nil {
 		if err := tracker.TryAcquire(remoteAddr); err != nil {
-			be.Logger.Warn("Connection limit exceeded", "remote_addr", remoteAddr, "error", err)
+			be.Logger.Info("Rejecting connection - connection limit exceeded",
+				"server", be.ServerConfig.Name,
+				"remote_addr", remoteAddr,
+				"error", err)
 			return nil, &smtp.SMTPError{
 				Code:         421,
 				EnhancedCode: smtp.EnhancedCode{4, 3, 2},
@@ -241,8 +250,6 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 		}()
 	}
 
-	be.Logger.Info("New session", "remote_addr", remoteAddr)
-
 	ipStr := stats.GetIPFromRemoteAddr(remoteAddr)
 	hasRDNS := true
 	var ptrRecord string // Store PTR (reverse DNS) record for use in validation
@@ -282,8 +289,6 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 					action = "reject" // Default to reject
 				}
 
-				be.Logger.Warn("IP blacklisted", "remote_addr", remoteAddr, "reason", reason, "action", action)
-
 				// Record blacklist detection in metrics
 				if be.Metrics != nil {
 					be.Metrics.SMTPBlacklistChecks.WithLabelValues(be.ServerConfig.Name, "blocked").Inc()
@@ -292,6 +297,10 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 				switch action {
 				case "reject":
 					// Reject the connection
+					be.Logger.Info("Rejecting connection - IP blacklisted",
+						"server", be.ServerConfig.Name,
+						"remote_addr", remoteAddr,
+						"reason", reason)
 					if be.Metrics != nil {
 						be.Metrics.SMTPMessagesRejected.WithLabelValues(be.ServerConfig.Name, be.ServerConfig.Type, "blacklist").Inc()
 					}
@@ -331,7 +340,9 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 				be.Metrics.SMTPMessagesRejected.WithLabelValues(be.ServerConfig.Name, be.ServerConfig.Type, "no_rdns").Inc()
 			}
 
-			be.Logger.Warn("Rejecting session - no reverse DNS", "remote_addr", remoteAddr)
+			be.Logger.Info("Rejecting connection - no reverse DNS",
+				"server", be.ServerConfig.Name,
+				"remote_addr", remoteAddr)
 			return nil, &smtp.SMTPError{
 				Code:         550,
 				EnhancedCode: smtp.EnhancedCode{5, 7, 25},
@@ -350,7 +361,10 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 
 			// Check IP reputation
 			if shouldDeny, reputation := be.StatsManager.CheckIPReputation(ipStr); shouldDeny {
-				be.Logger.Warn("Rejecting session - poor reputation", "remote_addr", remoteAddr, "score", reputation)
+				be.Logger.Info("Rejecting connection - poor IP reputation",
+					"server", be.ServerConfig.Name,
+					"remote_addr", remoteAddr,
+					"score", reputation)
 				return nil, &smtp.SMTPError{
 					Code:         421,
 					EnhancedCode: smtp.EnhancedCode{4, 7, 1},
@@ -413,6 +427,13 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 	}
 
 	sessionCreated = true
+
+	// Log successful connection
+	be.Logger.Info("Client connected",
+		"server", be.ServerConfig.Name,
+		"remote_addr", remoteAddr,
+		"remote_ptr", ptrRecord)
+
 	return session, nil
 }
 
