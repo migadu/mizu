@@ -450,6 +450,13 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 	}
 
 	sessionCreated = true
+
+	be.Logger.Info("Session created successfully",
+		"server", be.ServerConfig.Name,
+		"remote_addr", remoteAddr,
+		"trace_id", traceID,
+		"initial_tls_state", tlsState != nil)
+
 	return session, nil
 }
 

@@ -946,6 +946,10 @@ func runSMTPServerInstance(ctx context.Context, serverCfg *config.ServerConfig, 
 	server.MaxMessageBytes = int64(serverCfg.MaxMessageSize)
 	server.EnableSMTPUTF8 = true
 
+	// Enable debug logging for go-smtp library to see SMTP protocol details
+	server.Debug = &smtpDebugWriter{logger: logger, serverName: serverCfg.Name}
+	server.ErrorLog = &smtpErrorLogger{logger: logger, serverName: serverCfg.Name}
+
 	// Configure authentication for submission servers
 	// Note: Authentication is handled in the Backend.Auth() method
 	if serverCfg.IsSubmission() {
@@ -1076,4 +1080,34 @@ func getTLSVersion(version string) uint16 {
 		// Default to TLS 1.2 for security - TLS 1.0 and 1.1 are deprecated
 		return tls.VersionTLS12
 	}
+}
+
+// smtpDebugWriter wraps slog.Logger for go-smtp Debug output
+type smtpDebugWriter struct {
+	logger     *slog.Logger
+	serverName string
+}
+
+func (w *smtpDebugWriter) Write(p []byte) (n int, err error) {
+	msg := string(p)
+	// Remove trailing newline if present
+	if len(msg) > 0 && msg[len(msg)-1] == '\n' {
+		msg = msg[:len(msg)-1]
+	}
+	w.logger.Info("SMTP protocol", "server", w.serverName, "message", msg)
+	return len(p), nil
+}
+
+// smtpErrorLogger wraps slog.Logger for go-smtp ErrorLog
+type smtpErrorLogger struct {
+	logger     *slog.Logger
+	serverName string
+}
+
+func (l *smtpErrorLogger) Printf(format string, v ...interface{}) {
+	l.logger.Error("SMTP error", "server", l.serverName, "message", fmt.Sprintf(format, v...))
+}
+
+func (l *smtpErrorLogger) Println(v ...interface{}) {
+	l.logger.Error("SMTP error", "server", l.serverName, "message", fmt.Sprint(v...))
 }
