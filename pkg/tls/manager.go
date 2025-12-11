@@ -148,7 +148,7 @@ func NewManager(cfg Config, logger *slog.Logger) (*Manager, error) {
 			return nil, fmt.Errorf("%w: %s", ErrHostNotAllowed, serverName)
 		}
 
-		logger.Debug("TLS: Certificate request during handshake", "domain", serverName, "has_sni", hello.ServerName != "")
+		logger.Info("TLS: Certificate request during handshake", "domain", serverName, "has_sni", hello.ServerName != "")
 
 		// Create a modified ClientHelloInfo with the resolved server name
 		modifiedHello := *hello
@@ -159,10 +159,13 @@ func NewManager(cfg Config, logger *slog.Logger) (*Manager, error) {
 			// Certificate retrieval failures are often transient (S3 down, ACME rate limits, network issues)
 			// Wrap as ErrCertificateUnavailable so the server logs but doesn't crash
 			// This allows the server to continue serving cached certificates for other domains
-			logger.Error("TLS: Failed to get certificate", "server_name", serverName, "error", err)
+			logger.Error("TLS: Failed to get certificate",
+				"server_name", serverName,
+				"error", err,
+				"error_type", fmt.Sprintf("%T", err))
 			return nil, fmt.Errorf("%w for %s: %v", ErrCertificateUnavailable, serverName, err)
 		}
-		logger.Debug("TLS: Certificate provided", "domain", serverName)
+		logger.Info("TLS: Certificate provided successfully", "domain", serverName)
 		return cert, nil
 	}
 

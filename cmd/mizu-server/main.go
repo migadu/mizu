@@ -967,9 +967,17 @@ func runSMTPServerInstance(ctx context.Context, serverCfg *config.ServerConfig, 
 		}
 
 		server.TLSConfig = serverTLSConfig
+		logger.Info("TLS configured for SMTP server",
+			"server", serverCfg.Name,
+			"mode", serverCfg.TLS.Mode,
+			"required", serverCfg.TLS.Required,
+			"starttls_enabled", serverCfg.UsesSTARTTLS(),
+			"implicit_tls", serverCfg.UsesImplicitTLS())
 	} else {
 		// No TLS (only for testing/internal use)
 		server.TLSConfig = nil
+		logger.Warn("TLS disabled for SMTP server (not recommended for production)",
+			"server", serverCfg.Name)
 	}
 
 	// Create listener

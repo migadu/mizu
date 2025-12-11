@@ -27,19 +27,24 @@ func NewClusterAwareCache(cache autocert.Cache, isLeaderF func() bool, logger *s
 
 // Get retrieves a certificate from the cache (all nodes can read)
 func (c *ClusterAwareCache) Get(ctx context.Context, name string) ([]byte, error) {
-	c.logger.Debug("ClusterCache: Get certificate", "name", name, "is_leader", c.isLeaderF())
+	isLeader := c.isLeaderF()
+	c.logger.Info("ClusterCache: Get certificate request", "name", name, "is_leader", isLeader)
 
 	data, err := c.underlying.Get(ctx, name)
 	if err != nil {
 		if err == autocert.ErrCacheMiss {
-			c.logger.Debug("ClusterCache: Certificate not found", "name", name)
+			c.logger.Info("ClusterCache: Certificate not found (cache miss)", "name", name, "is_leader", isLeader)
 		} else {
-			c.logger.Debug("ClusterCache: Error getting certificate", "name", name, "error", err)
+			c.logger.Error("ClusterCache: Error getting certificate",
+				"name", name,
+				"is_leader", isLeader,
+				"error", err,
+				"error_type", fmt.Sprintf("%T", err))
 		}
 		return nil, err
 	}
 
-	c.logger.Debug("ClusterCache: Certificate retrieved", "name", name)
+	c.logger.Info("ClusterCache: Certificate retrieved successfully", "name", name, "is_leader", isLeader, "bytes", len(data))
 	return data, nil
 }
 

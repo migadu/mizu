@@ -250,10 +250,13 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 		}()
 	}
 
-	// Log client connection immediately
+	// Log client connection immediately with detailed info
 	be.Logger.Info("Client connected",
 		"server", be.ServerConfig.Name,
-		"remote_addr", remoteAddr)
+		"remote_addr", remoteAddr,
+		"tls_enabled", be.ServerConfig.IsTLSEnabled(),
+		"tls_mode", be.ServerConfig.TLS.Mode,
+		"tls_required", be.ServerConfig.TLS.Required)
 
 	ipStr := stats.GetIPFromRemoteAddr(remoteAddr)
 	hasRDNS := true
@@ -619,7 +622,16 @@ func (s *Session) updateTLSState() {
 	state, ok := s.conn.TLSConnectionState()
 	if ok {
 		s.tlsState = &state
+		s.Logger.Debug("TLS state updated",
+			"remote_addr", s.remoteAddr,
+			"tls_version", tlsVersionString(state.Version),
+			"cipher_suite", fmt.Sprintf("0x%04x", state.CipherSuite),
+			"server_name", state.ServerName,
+			"handshake_complete", state.HandshakeComplete)
 	} else {
+		if s.tlsState != nil {
+			s.Logger.Debug("TLS state cleared (was previously set)", "remote_addr", s.remoteAddr)
+		}
 		s.tlsState = nil
 	}
 }
