@@ -250,6 +250,11 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 		}()
 	}
 
+	// Log client connection immediately
+	be.Logger.Info("Client connected",
+		"server", be.ServerConfig.Name,
+		"remote_addr", remoteAddr)
+
 	ipStr := stats.GetIPFromRemoteAddr(remoteAddr)
 	hasRDNS := true
 	var ptrRecord string // Store PTR (reverse DNS) record for use in validation
@@ -272,54 +277,66 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 		}
 
 		// Check DNS blacklists (RBLs) to prevent spam
-		if be.ServerConfig.DNSBL.Enabled && len(be.ServerConfig.DNSBL.Lists) > 0 {
-			timeoutSecs := be.ServerConfig.DNSBL.TimeoutSeconds
-			if timeoutSecs == 0 {
-				timeoutSecs = 3 // Default timeout
+		if be.ServerConfig.DNSBL.Enabled {
+			// Determine which DNSBL lists to use based on IP version
+			var lists []string
+			if ip.To4() != nil {
+				// IPv4 address
+				lists = be.ServerConfig.DNSBL.IPv4Lists
+			} else {
+				// IPv6 address
+				lists = be.ServerConfig.DNSBL.IPv6Lists
 			}
-			checker := blacklist.NewChecker(be.ServerConfig.DNSBL.Lists, time.Duration(timeoutSecs)*time.Second, be.Logger)
-			isListed, reason, err := checker.CheckIP(ip)
-			if err != nil {
-				be.Logger.Error("Blacklist check error", "error", err, "ip", host)
-				// Don't reject on blacklist check errors - fail open for availability
-			} else if isListed {
-				// Determine action based on configuration
-				action := be.ServerConfig.DNSBL.Action
-				if action == "" {
-					action = "reject" // Default to reject
-				}
 
-				// Record blacklist detection in metrics
-				if be.Metrics != nil {
-					be.Metrics.SMTPBlacklistChecks.WithLabelValues(be.ServerConfig.Name, "blocked").Inc()
+			if len(lists) > 0 {
+				timeoutSecs := be.ServerConfig.DNSBL.TimeoutSeconds
+				if timeoutSecs == 0 {
+					timeoutSecs = 3 // Default timeout
 				}
+				checker := blacklist.NewChecker(lists, time.Duration(timeoutSecs)*time.Second, be.Logger)
+				isListed, reason, err := checker.CheckIP(ip)
+				if err != nil {
+					be.Logger.Error("Blacklist check error", "error", err, "ip", host)
+					// Don't reject on blacklist check errors - fail open for availability
+				} else if isListed {
+					// Determine action based on configuration
+					action := be.ServerConfig.DNSBL.Action
+					if action == "" {
+						action = "reject" // Default to reject
+					}
 
-				switch action {
-				case "reject":
-					// Reject the connection
-					be.Logger.Info("Rejecting connection - IP blacklisted",
-						"server", be.ServerConfig.Name,
-						"remote_addr", remoteAddr,
-						"reason", reason)
+					// Record blacklist detection in metrics
 					if be.Metrics != nil {
-						be.Metrics.SMTPMessagesRejected.WithLabelValues(be.ServerConfig.Name, be.ServerConfig.Type, "blacklist").Inc()
+						be.Metrics.SMTPBlacklistChecks.WithLabelValues(be.ServerConfig.Name, "blocked").Inc()
 					}
-					return nil, &smtp.SMTPError{
-						Code:         550,
-						EnhancedCode: smtp.EnhancedCode{5, 7, 1},
-						Message:      fmt.Sprintf("your IP address is blacklisted: %s", reason),
+
+					switch action {
+					case "reject":
+						// Reject the connection
+						be.Logger.Info("Rejecting connection - IP blacklisted",
+							"server", be.ServerConfig.Name,
+							"remote_addr", remoteAddr,
+							"reason", reason)
+						if be.Metrics != nil {
+							be.Metrics.SMTPMessagesRejected.WithLabelValues(be.ServerConfig.Name, be.ServerConfig.Type, "blacklist").Inc()
+						}
+						return nil, &smtp.SMTPError{
+							Code:         550,
+							EnhancedCode: smtp.EnhancedCode{5, 7, 1},
+							Message:      fmt.Sprintf("your IP address is blacklisted: %s", reason),
+						}
+					case "junk":
+						// Mark for junk but allow connection
+						be.Logger.Info("Allowing blacklisted IP but marking as junk", "ip", host, "reason", reason)
+						// Note: The session will be created and marked as junk
+					case "none":
+						// Just log but take no action
+						be.Logger.Info("Blacklisted IP detected but no action configured", "ip", host, "reason", reason)
 					}
-				case "junk":
-					// Mark for junk but allow connection
-					be.Logger.Info("Allowing blacklisted IP but marking as junk", "ip", host, "reason", reason)
-					// Note: The session will be created and marked as junk
-				case "none":
-					// Just log but take no action
-					be.Logger.Info("Blacklisted IP detected but no action configured", "ip", host, "reason", reason)
+				} else if be.Metrics != nil {
+					// Record successful blacklist check
+					be.Metrics.SMTPBlacklistChecks.WithLabelValues(be.ServerConfig.Name, "pass").Inc()
 				}
-			} else if be.Metrics != nil {
-				// Record successful blacklist check
-				be.Metrics.SMTPBlacklistChecks.WithLabelValues(be.ServerConfig.Name, "pass").Inc()
 			}
 		}
 
@@ -353,7 +370,10 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 		if len(names) > 0 {
 			ptrRecord = names[0]
 		}
-		be.Logger.Debug("Reverse DNS lookup", "host", host, "names", names, "ptr", ptrRecord)
+		be.Logger.Info("Reverse DNS resolved",
+			"server", be.ServerConfig.Name,
+			"remote_addr", remoteAddr,
+			"remote_ptr", ptrRecord)
 
 		// Record connection in stats
 		if be.StatsManager != nil {
@@ -427,13 +447,6 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 	}
 
 	sessionCreated = true
-
-	// Log successful connection
-	be.Logger.Info("Client connected",
-		"server", be.ServerConfig.Name,
-		"remote_addr", remoteAddr,
-		"remote_ptr", ptrRecord)
-
 	return session, nil
 }
 

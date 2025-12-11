@@ -82,10 +82,14 @@ dmarc_quarantine_action = "junk"     # Action for DMARC policy=quarantine: "none
 # DNS Blacklist Checking
 [server.dnsbl]
 enabled = true                       # Enable DNS blacklist (RBL) checking
-lists = [                            # DNS blacklist servers to check
-    "zen.spamhaus.org",
-    "bl.spamcop.net",
-    "b.barracudacentral.org"
+ipv4_lists = [                       # DNS blacklist servers for IPv4 addresses
+    "zen.spamhaus.org",              # Comprehensive Spamhaus blocklist
+    "bl.spamcop.net",                # SpamCop spam reports
+    "b.barracudacentral.org"         # Barracuda reputation-based list
+]
+ipv6_lists = [                       # DNS blacklist servers for IPv6 addresses
+    # "ipv6.bl.spamcop.net",         # SpamCop IPv6 spam reports
+    # "dnsbl-3.uceprotect.net"       # UCEProtect IPv6 blocklist
 ]
 timeout_seconds = 3                  # Timeout for blacklist queries
 check_helo_resolves = true           # Check if HELO hostname resolves

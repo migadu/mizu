@@ -58,7 +58,7 @@ func (c *Checker) CheckIP(ip net.IP) (bool, string, error) {
 	// Reverse the IP address for DNSBL lookup.
 	reversedIP := reverseIP(ip)
 	if reversedIP == "" {
-		return false, "", fmt.Errorf("unsupported IP format")
+		return false, "", fmt.Errorf("invalid IP format")
 	}
 
 	// Create a context with timeout for all lookups.
@@ -158,18 +158,32 @@ func CheckHELOResolves(hostname string, timeout time.Duration) (bool, string, er
 	return false, "No addresses found", nil
 }
 
-// reverseIP reverses the octets of an IPv4 address for DNSBL lookups.
+// reverseIP reverses an IP address for DNSBL lookups.
+// For IPv4: reverses octets (1.2.3.4 -> 4.3.2.1)
+// For IPv6: reverses nibbles in expanded format
 func reverseIP(ip net.IP) string {
-	// Ensure we're working with a 4-byte IPv4 address.
+	// Try IPv4 first
 	ipv4 := ip.To4()
-	if ipv4 == nil {
-		return "" // Not an IPv4 address
+	if ipv4 != nil {
+		parts := strings.Split(ipv4.String(), ".")
+		if len(parts) != 4 {
+			return ""
+		}
+		return fmt.Sprintf("%s.%s.%s.%s", parts[3], parts[2], parts[1], parts[0])
 	}
 
-	parts := strings.Split(ipv4.String(), ".")
-	if len(parts) != 4 {
-		return ""
+	// Handle IPv6
+	ipv6 := ip.To16()
+	if ipv6 == nil {
+		return "" // Not a valid IP
 	}
 
-	return fmt.Sprintf("%s.%s.%s.%s", parts[3], parts[2], parts[1], parts[0])
+	// Convert to nibble format (each hex digit separated by dots, reversed)
+	// Example: 2001:db8::1 -> 1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2
+	var nibbles []string
+	for i := len(ipv6) - 1; i >= 0; i-- {
+		nibbles = append(nibbles, fmt.Sprintf("%x", ipv6[i]&0x0f))
+		nibbles = append(nibbles, fmt.Sprintf("%x", ipv6[i]>>4))
+	}
+	return strings.Join(nibbles, ".")
 }

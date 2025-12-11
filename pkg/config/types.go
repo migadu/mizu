@@ -175,7 +175,8 @@ type ServerAuthCacheConfig struct {
 // ServerDNSBLConfig holds DNS blacklist checking configuration
 type ServerDNSBLConfig struct {
 	Enabled           bool     `toml:"enabled"`             // Enable DNS blacklist (RBL) checking
-	Lists             []string `toml:"lists"`               // DNS blacklist servers to check
+	IPv4Lists         []string `toml:"ipv4_lists"`          // DNS blacklist servers for IPv4 addresses
+	IPv6Lists         []string `toml:"ipv6_lists"`          // DNS blacklist servers for IPv6 addresses
 	TimeoutSeconds    int      `toml:"timeout_seconds"`     // Timeout for blacklist queries in seconds (default: 3)
 	CheckHELOResolves bool     `toml:"check_helo_resolves"` // Whether to check if HELO hostname resolves
 	Action            string   `toml:"action"`              // Action when blacklisted: "reject", "junk", "none" (default: "reject")

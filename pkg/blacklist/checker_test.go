@@ -27,9 +27,14 @@ func TestReverseIPAddress(t *testing.T) {
 			expected: "1.0.0.127",
 		},
 		{
-			name:     "IPv6 returns empty",
+			name:     "IPv6 standard",
 			ip:       "2001:0db8::1",
-			expected: "",
+			expected: "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2",
+		},
+		{
+			name:     "IPv6 with hex digits",
+			ip:       "2001:41d0:203:199d::f",
+			expected: "f.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.d.9.9.1.3.0.2.0.0.d.1.4.1.0.0.2",
 		},
 	}
 
@@ -39,9 +44,9 @@ func TestReverseIPAddress(t *testing.T) {
 			if ip == nil {
 				t.Fatalf("failed to parse IP: %s", tt.ip)
 			}
-			result := reverseIPAddress(ip)
+			result := reverseIP(ip)
 			if result != tt.expected {
-				t.Errorf("reverseIPAddress(%s) = %s; want %s", tt.ip, result, tt.expected)
+				t.Errorf("reverseIP(%s) = %s; want %s", tt.ip, result, tt.expected)
 			}
 		})
 	}
@@ -182,24 +187,27 @@ func TestCheckerCheckIP_ValidIP(t *testing.T) {
 	}
 }
 
-func TestCheckerCheckIP_InvalidIP(t *testing.T) {
+func TestCheckerCheckIP_IPv6(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	checker := NewChecker([]string{"zen.spamhaus.org"}, 1*time.Second, logger)
+	// Use a non-existent IPv6 blacklist
+	checker := NewChecker([]string{"invalid-ipv6-blacklist.example"}, 1*time.Second, logger)
 
-	// Test with IPv6 (not supported)
+	// Test with IPv6 (now supported)
 	ip := net.ParseIP("2001:0db8::1")
 	if ip == nil {
 		t.Fatal("failed to parse IP")
 	}
 
-	isListed, reason, err := checker.CheckIP(ip)
+	isListed, _, err := checker.CheckIP(ip)
 
-	if err == nil {
-		t.Error("expected error for IPv6, got nil")
+	// Should not return error (IPv6 is supported)
+	if err != nil {
+		t.Errorf("unexpected error for IPv6: %v", err)
 	}
 
+	// Should not be listed (blacklist doesn't exist)
 	if isListed {
-		t.Errorf("IPv6 should return error, not listed status with reason: %s", reason)
+		t.Error("IPv6 should not be listed on non-existent blacklist")
 	}
 }
 
