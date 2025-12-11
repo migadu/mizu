@@ -512,8 +512,7 @@ sync_interval_seconds = 60           # How often to sync stats to S3
 [cluster]
 enabled = false
 node_name = "mizu-01"                
-bind_addr = "192.18.1.1"             
-bind_port = 7946                     
+addr = "192.18.1.1:7946"                      
 
 # Seed nodes for cluster discovery
 peers = [

@@ -31,10 +31,6 @@ func (c *Config) Validate() error {
 		usedPorts[srv.ListenAddr] = srv.Name
 	}
 
-	if len(c.Servers) == 0 {
-		return errors.New("no servers configured - at least one [[server]] section is required")
-	}
-
 	// Validate per-server delivery configuration
 	for i := range c.Servers {
 		srv := &c.Servers[i]
