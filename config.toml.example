@@ -441,12 +441,20 @@ region = "us-east-1"
 # =============================================================================
 # TLS Certificate Management
 # =============================================================================
+# REQUIRED if any server has [server.tls] enabled.
+# Configures Let's Encrypt automatic certificate provisioning via ACME.
+# When enabled, mizu-server will:
+#   - Start HTTP server on port 80 for ACME HTTP-01 challenges
+#   - Start HTTPS server on port 443 for ACME TLS-ALPN-01 challenges
+#   - Automatically provision certificates for all domains listed below
+#   - Certificates are provisioned on-demand when clients connect (STARTTLS or implicit TLS)
+# =============================================================================
 
 [tls]
-email = "admin@example.com"          # Email for Let's Encrypt notifications
-domains = ["mail.example.com", "submit.example.com"]  # Domains to get certs for
-use_production = true                # Use Let's Encrypt production (false = staging)
-use_local_ca = false                 # Use local CA (for development)
+email = "admin@example.com"          # Email for Let's Encrypt notifications (REQUIRED)
+domains = ["mail.example.com", "submit.example.com"]  # Domains to provision certificates for (REQUIRED)
+use_production = true                # Use Let's Encrypt production (false = staging for testing)
+use_local_ca = false                 # Use local CA (for development only)
 certmagic_verbose = false            # Enable verbose certmagic logging
 enable_autocert = false              # Enable autocert with leader election (requires cluster)
 

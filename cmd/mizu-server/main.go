@@ -112,6 +112,7 @@ func main() {
 
 		// Start ACME challenge servers
 		if tlsMgr != nil {
+			logger.Info("TLS manager initialized successfully - starting ACME challenge servers")
 			// Start HTTPS server on port 443 for TLS-ALPN-01 challenges (primary method)
 			logging.SafeGo(logger, "acme-tls-alpn-server", func() {
 				logger.Info("Starting HTTPS server for ACME TLS-ALPN-01 challenges on :443")
@@ -132,6 +133,10 @@ func main() {
 					logger.Error("HTTP-01 challenge server failed", "error", err)
 				}
 			})
+		} else {
+			logger.Warn("TLS manager is nil - ACME challenge servers will NOT start",
+				"tls_domains", cfg.TLS.Domains,
+				"cluster_enabled", cfg.Cluster.Enabled)
 		}
 	}
 
