@@ -10,8 +10,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hashicorp/memberlist"
 	"log/slog"
+
+	"github.com/hashicorp/memberlist"
 
 	"migadu/mizu/pkg/logging"
 )
@@ -119,8 +120,8 @@ func NewCluster(cfg Config) (*Cluster, error) {
 	// Set delegate for custom gossip messages
 	mlConfig.Delegate = cluster
 
-	// Disable memberlist's built-in logging (we'll use zap)
-	mlConfig.LogOutput = &zapLogWriter{logger: cfg.Logger}
+	// Disable memberlist's built-in logging
+	mlConfig.LogOutput = &logWriter{logger: cfg.Logger}
 
 	// Create broadcast queue for efficient message distribution
 	// Initialize this BEFORE creating memberlist to avoid races
@@ -457,13 +458,17 @@ func (b *broadcast) Finished() {
 	}
 }
 
-// zapLogWriter adapts zap.Logger to io.Writer for memberlist
-type zapLogWriter struct {
+type logWriter struct {
 	logger *slog.Logger
 }
 
-func (w *zapLogWriter) Write(p []byte) (n int, err error) {
-	w.logger.Debug(string(p))
+func (w *logWriter) Write(p []byte) (n int, err error) {
+	// Strip trailing newline from memberlist logs to prevent escaped newlines
+	msg := string(p)
+	if len(msg) > 0 && msg[len(msg)-1] == '\n' {
+		msg = msg[:len(msg)-1]
+	}
+	w.logger.Debug(msg)
 	return len(p), nil
 }
 

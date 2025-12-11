@@ -687,7 +687,7 @@ func (s *Session) Mail(from string, opts *smtp.MailOptions) error {
 
 	// Update and check TLS state (skip in local mode)
 	s.updateTLSState()
-	if !s.globalConfig.Local && s.tlsState == nil {
+	if !s.globalConfig.Local && s.serverConfig.TLS.Required && s.tlsState == nil {
 		s.Logger.Warn("Rejecting MAIL FROM - TLS required", "from", from)
 		return ErrTLSRequiredStartTLS
 	}
@@ -868,7 +868,7 @@ func (s *Session) Rcpt(to string, opts *smtp.RcptOptions) error {
 
 	// Update and check TLS state (skip in local mode)
 	s.updateTLSState()
-	if !s.globalConfig.Local && s.tlsState == nil {
+	if !s.globalConfig.Local && s.serverConfig.TLS.Required && s.tlsState == nil {
 		s.Logger.Warn("Rejecting RCPT TO - TLS required", "to", to)
 		return ErrTLSRequired
 	}
@@ -1005,7 +1005,7 @@ func (s *Session) readMessageData(r io.Reader) (string, error) {
 
 	// Final update and check of TLS state.
 	s.updateTLSState()
-	if !s.globalConfig.Local && s.tlsState == nil {
+	if !s.globalConfig.Local && s.serverConfig.TLS.Required && s.tlsState == nil {
 		s.Logger.Warn("Rejecting DATA - TLS required")
 		return "", ErrTLSRequired
 	}

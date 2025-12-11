@@ -347,7 +347,6 @@ deliveryCfg := serverCfg.Delivery
   - `hashicorp/memberlist` - Distributed cluster coordination
   - `caddyserver/certmagic` - TLS certificate automation
   - `minio/minio-go` - S3 client
-  - `uber-go/zap` - Structured logging
   - `prometheus/client_golang` - Metrics
 
 ## Version Information
