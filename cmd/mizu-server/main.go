@@ -104,11 +104,13 @@ func main() {
 	if cfg.Local {
 		logger.Info("Running in LOCAL mode - TLS disabled, messages will be dumped to terminal")
 	} else {
+		logger.Info("Initializing TLS subsystem", "domains", cfg.TLS.Domains, "email", cfg.TLS.Email)
 		tlsConfig, s3Client, tlsMgr, err = initTLS(cfg, clusterMgr, logger)
 		if err != nil {
 			logger.Error(fmt.Sprintf("Failed to initialize TLS: %v", err))
 			os.Exit(1)
 		}
+		logger.Info("initTLS completed", "tlsMgr_nil", tlsMgr == nil, "tlsConfig_nil", tlsConfig == nil)
 
 		// Start ACME challenge servers
 		if tlsMgr != nil {
