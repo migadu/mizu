@@ -354,7 +354,7 @@ func TestBackend_NewSession_MetricsIncrement(t *testing.T) {
 		Name:       "test-relay",
 		Type:       "relay",
 		ListenAddr: ":25",
-		Domain:     "test.example.com",
+		Hostname:   "test.example.com",
 		Limits: config.ServerLimitsConfig{
 			MaxConnections:      100,
 			MaxConnectionsPerIP: 10,

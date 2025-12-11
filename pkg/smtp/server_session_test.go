@@ -32,7 +32,7 @@ func createTestBackend(t *testing.T) *Backend {
 	serverCfg := &config.ServerConfig{
 		Name:           "test-server",
 		Type:           "relay",
-		Domain:         "test.example.com",
+		Hostname:       "test.example.com",
 		TimeoutSeconds: 30,
 		MaxMessageSize: 1024 * 1024, // 1MB
 		Limits: config.ServerLimitsConfig{

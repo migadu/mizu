@@ -44,6 +44,12 @@ func TestCircuitBreakerIntegration_OpenReturns451(t *testing.T) {
 	httpClient := &http.Client{Timeout: 5 * time.Second}
 
 	cfg := testConfig()
+	// Add a server config since DefaultConfig has empty Servers slice
+	if len(cfg.Servers) == 0 {
+		cfg.Servers = append(cfg.Servers, config.ServerConfig{
+			ListenAddr: ":25",
+		})
+	}
 	cfg.Servers[0].Delivery = config.DeliveryConfig{
 		URL:                failingServer.URL,
 		AuthToken:          "test-token",
@@ -214,6 +220,12 @@ func TestCircuitBreakerIntegration_PermanentFailureReturns550(t *testing.T) {
 	httpClient := &http.Client{Timeout: 5 * time.Second}
 
 	cfg := testConfig()
+	// Add a server config since DefaultConfig has empty Servers slice
+	if len(cfg.Servers) == 0 {
+		cfg.Servers = append(cfg.Servers, config.ServerConfig{
+			ListenAddr: ":25",
+		})
+	}
 	cfg.Servers[0].Delivery = config.DeliveryConfig{
 		URL:                badRequestServer.URL,
 		AuthToken:          "test-token",
@@ -287,6 +299,12 @@ func TestCircuitBreakerIntegration_4xxErrorsDoNotTriggerCircuit(t *testing.T) {
 	httpClient := &http.Client{Timeout: 5 * time.Second}
 
 	cfg := testConfig()
+	// Add a server config since DefaultConfig has empty Servers slice
+	if len(cfg.Servers) == 0 {
+		cfg.Servers = append(cfg.Servers, config.ServerConfig{
+			ListenAddr: ":25",
+		})
+	}
 	cfg.Servers[0].Delivery = config.DeliveryConfig{
 		URL:                notFoundServer.URL,
 		AuthToken:          "test-token",

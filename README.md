@@ -107,9 +107,9 @@ email = "admin@example.com" # For Let's Encrypt
 
 [storage]
 backend = "s3"  # or "filesystem" for single-node
-bucket = "your-s3-bucket-for-certs-and-stats"
-access_key_id = "${S3_ACCESS_KEY_ID}"      # Use env var
-secret_access_key = "${S3_SECRET_ACCESS_KEY}"  # Use env var
+s3_bucket = "your-s3-bucket-for-certs-and-stats"
+s3_access_key = "${S3_ACCESS_KEY}"      # Use env var
+s3_secret_key = "${S3_SECRET_KEY}"  # Use env var
 ```
 
 **Submission Server (Port 587/465 - With Authentication):**
@@ -172,8 +172,8 @@ For enhanced security, critical secrets like API keys and S3 credentials can be 
 - `DELIVERY_AUTH_TOKEN`: Authentication token for the backend delivery endpoint
 - `AUTH_TOKEN`: Authentication token for the authentication endpoint (submission servers)
 - `RECIPIENT_VALIDATION_AUTH_TOKEN`: Authentication token for recipient validation endpoint (if enabled)
-- `S3_ACCESS_KEY_ID`: AWS/S3 access key ID
-- `S3_SECRET_ACCESS_KEY`: AWS/S3 secret access key
+- `S3_ACCESS_KEY`: AWS/S3 access key
+- `S3_SECRET_KEY`: AWS/S3 secret access key
 - `HEALTH_PASSWORD`: Password for the health/API endpoints if basic auth is enabled
 - `CLUSTER_SECRET_KEY`: Secret key for cluster gossip encryption (if cluster mode enabled)
 

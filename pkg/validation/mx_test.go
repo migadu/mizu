@@ -34,7 +34,7 @@ func TestCheckMXRecord(t *testing.T) {
 		},
 		{
 			name:        "Domain with angle brackets",
-			domain:      "<example.com>",
+			domain:      "<gmail.com>",
 			expectValid: true, // Should strip brackets and check
 			expectError: false,
 		},

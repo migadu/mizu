@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"migadu/mizu/pkg/config"
 	"migadu/mizu/pkg/poster"
 	"migadu/mizu/pkg/stats"
 
@@ -34,6 +35,15 @@ func TestMail_NullSenderRejection(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// Create a test session with mock connection
 			cfg := testConfig()
+			// Add a server config since DefaultConfig has empty Servers slice
+			if len(cfg.Servers) == 0 {
+				cfg.Servers = append(cfg.Servers, config.ServerConfig{
+					ListenAddr: ":25",
+					Junk: config.ServerJunkConfig{
+						RejectNullSender: true,
+					},
+				})
+			}
 			statsManager := stats.NewManager(false, 0, "test", false, 0, nil, 0, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
 			cbConfig := poster.CircuitBreakerConfig{
 				Enabled:          true,
@@ -94,6 +104,15 @@ func TestMail_NullSenderPreventsBackscatter(t *testing.T) {
 	// send bounce messages to innocent parties.
 
 	cfg := testConfig()
+	// Add a server config since DefaultConfig has empty Servers slice
+	if len(cfg.Servers) == 0 {
+		cfg.Servers = append(cfg.Servers, config.ServerConfig{
+			ListenAddr: ":25",
+			Junk: config.ServerJunkConfig{
+				RejectNullSender: true,
+			},
+		})
+	}
 	statsManager := stats.NewManager(false, 0, "test", false, 0, nil, 0, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	defer statsManager.Stop()
 	cbConfig := poster.CircuitBreakerConfig{

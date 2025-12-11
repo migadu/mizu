@@ -23,7 +23,7 @@ type Config struct {
 
 // DefaultsConfig provides default values that can be overridden per-server
 type DefaultsConfig struct {
-	Domain                 string `toml:"domain"`                   // Default domain for all servers
+	Hostname               string `toml:"hostname"`                 // Default hostname (FQDN) for all servers
 	MaxMessageSize         int    `toml:"max_message_size"`         // Default max message size in bytes
 	TimeoutSeconds         int    `toml:"timeout_seconds"`          // Default SMTP command timeout
 	ShutdownTimeoutSeconds int    `toml:"shutdown_timeout_seconds"` // Default graceful shutdown timeout
@@ -38,7 +38,7 @@ type ServerConfig struct {
 
 	// === Network ===
 	ListenAddr string `toml:"listen_addr"` // Address to bind (e.g., ":25", ":465", ":587", "127.0.0.1:2525")
-	Domain     string `toml:"domain"`      // Server domain (overrides defaults.domain if set)
+	Hostname   string `toml:"hostname"`    // Server hostname/FQDN (overrides defaults.hostname if set)
 
 	// === Message Processing ===
 	MaxMessageSize          int `toml:"max_message_size"`           // Maximum message size in bytes (overrides default)
@@ -237,8 +237,8 @@ func (s *ServerConfig) UsesImplicitTLS() bool {
 
 // ApplyDefaults fills in missing values from defaults
 func (s *ServerConfig) ApplyDefaults(defaults DefaultsConfig) {
-	if s.Domain == "" {
-		s.Domain = defaults.Domain
+	if s.Hostname == "" {
+		s.Hostname = defaults.Hostname
 	}
 	if s.MaxMessageSize == 0 {
 		s.MaxMessageSize = defaults.MaxMessageSize
@@ -330,14 +330,14 @@ type DistributedLimitsConfig struct {
 
 // StorageConfig holds configuration for object storage (S3 or filesystem)
 type StorageConfig struct {
-	Backend        string `toml:"backend"`          // Storage backend: "s3" or "filesystem" (default: "s3")
-	FilesystemPath string `toml:"filesystem_path"`  // Path for filesystem backend (e.g., "/var/lib/mizu/storage")
-	S3Endpoint     string `toml:"s3_endpoint"`      // S3 endpoint
-	S3Bucket       string `toml:"s3_bucket"`        // S3 bucket name
-	S3Prefix       string `toml:"s3_prefix"`        // S3 key prefix
-	S3AccessKeyID  string `toml:"s3_access_key_id"` // S3 access key
-	S3SecretKey    string `toml:"s3_secret_key"`    // S3 secret key
-	S3Region       string `toml:"s3_region"`        // S3 region
+	Backend        string `toml:"backend"`         // Storage backend: "s3" or "filesystem" (default: "s3")
+	FilesystemPath string `toml:"filesystem_path"` // Path for filesystem backend (e.g., "/var/lib/mizu/storage")
+	S3Endpoint     string `toml:"s3_endpoint"`     // S3 endpoint
+	S3Bucket       string `toml:"s3_bucket"`       // S3 bucket name
+	S3Prefix       string `toml:"s3_prefix"`       // S3 key prefix
+	S3AccessKey    string `toml:"s3_access_key"`   // S3 access key
+	S3SecretKey    string `toml:"s3_secret_key"`   // S3 secret key
+	S3Region       string `toml:"s3_region"`       // S3 region
 }
 
 // RecipientValidationConfig holds configuration for recipient validation during RCPT TO
@@ -425,8 +425,8 @@ type StatsConfig struct {
 func DefaultConfig() Config {
 	return Config{
 		Defaults: DefaultsConfig{
-			Domain:                 "mail.example.com",
-			MaxMessageSize:         10 * 1024 * 1024, // 10MB
+			Hostname:               "mail.example.com",
+			MaxMessageSize:         25 * 1024 * 1024, // 25MB
 			TimeoutSeconds:         10,
 			ShutdownTimeoutSeconds: 60,
 			MaxConnections:         100,

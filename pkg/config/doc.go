@@ -48,8 +48,8 @@
 // Sensitive values can be provided via environment variables:
 //
 //	DELIVERY_AUTH_TOKEN: Authentication token for HTTP backend
-//	S3_ACCESS_KEY_ID: AWS access key ID
-//	S3_SECRET_ACCESS_KEY: AWS secret access key
+//	S3_ACCESS_KEY: AWS access key
+//	S3_SECRET_KEY: AWS secret access key
 //	HEALTH_PASSWORD: Password for health endpoint
 //	CLUSTER_SECRET_KEY: 32-byte base64-encoded encryption key for cluster
 //

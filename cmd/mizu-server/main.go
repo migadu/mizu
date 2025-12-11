@@ -377,7 +377,7 @@ func initStorageBackend(cfg *config.Config, logger *slog.Logger) (storage.Backen
 		// Initialize S3 client for MinIO (S3-compatible)
 		var err error
 		s3Client, err = minio.New(cfg.Storage.S3Endpoint, &minio.Options{
-			Creds:  credentials.NewStaticV4(cfg.Storage.S3AccessKeyID, cfg.Storage.S3SecretKey, ""),
+			Creds:  credentials.NewStaticV4(cfg.Storage.S3AccessKey, cfg.Storage.S3SecretKey, ""),
 			Region: cfg.Storage.S3Region,
 			Secure: true, // Use HTTPS
 		})
@@ -391,7 +391,7 @@ func initStorageBackend(cfg *config.Config, logger *slog.Logger) (storage.Backen
 		logger.Info(fmt.Sprintf("Validating S3 access to bucket '%s'...", cfg.Storage.S3Bucket))
 		exists, err := s3Backend.BucketExists(ctx)
 		if err != nil {
-			return nil, nil, fmt.Errorf("failed to validate S3 credentials/access: %w (check S3_ACCESS_KEY_ID and S3_SECRET_KEY)", err)
+			return nil, nil, fmt.Errorf("failed to validate S3 credentials/access: %w (check S3_ACCESS_KEY and S3_SECRET_KEY)", err)
 		}
 		if !exists {
 			// Bucket doesn't exist - try to create it
@@ -568,7 +568,7 @@ func startHealthServer(cfg *config.Config, logger *slog.Logger, statsManager *st
 	// Check TLS certificates for all enabled servers
 	if !cfg.Local {
 		for _, srv := range cfg.Servers {
-			if srv.Domain != "" && srv.Domain != "mail.yourdomain.com" {
+			if srv.Hostname != "" && srv.Hostname != "mail.yourdomain.com" {
 				_, portStr, err := net.SplitHostPort(srv.ListenAddr)
 				if err != nil {
 					logger.Warn("Could not parse listen address for health check",
@@ -578,7 +578,7 @@ func startHealthServer(cfg *config.Config, logger *slog.Logger, statsManager *st
 				}
 				port, _ := net.LookupPort("tcp", portStr)
 				if port > 0 {
-					checkers = append(checkers, health.NewCheckTLSCertificate(srv.Domain, port, 14*24*time.Hour))
+					checkers = append(checkers, health.NewCheckTLSCertificate(srv.Hostname, port, 14*24*time.Hour))
 				}
 			}
 		}
@@ -940,7 +940,7 @@ func initRecipientValidator(serverCfg *config.ServerConfig, logger *slog.Logger)
 func runSMTPServerInstance(ctx context.Context, serverCfg *config.ServerConfig, be *smtp.Backend, tlsConfig *tls.Config, logger *slog.Logger) {
 	server := gosmtp.NewServer(be)
 	server.Addr = serverCfg.ListenAddr
-	server.Domain = serverCfg.Domain
+	server.Domain = serverCfg.Hostname
 	server.ReadTimeout = time.Duration(serverCfg.TimeoutSeconds) * time.Second
 	server.WriteTimeout = time.Duration(serverCfg.TimeoutSeconds) * time.Second
 	server.MaxMessageBytes = int64(serverCfg.MaxMessageSize)

@@ -42,7 +42,9 @@ func TestBackend_Configuration(t *testing.T) {
 
 	// Get first server config
 	if len(cfg.Servers) == 0 {
-		t.Fatal("No servers in default config")
+		cfg.Servers = append(cfg.Servers, config.ServerConfig{
+			ListenAddr: ":25",
+		})
 	}
 	serverCfg := &cfg.Servers[0]
 

@@ -141,7 +141,7 @@ Key packages:
 
 - TOML-based configuration ([pkg/config/](pkg/config/))
 - `Config` struct in [pkg/config/types.go](pkg/config/types.go) defines all settings
-- Environment variables supported for secrets: `DESTINATION_AUTH_TOKEN`, `DELIVERY_AUTH_TOKEN`, `AUTH_TOKEN`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `HEALTH_PASSWORD`, `CLUSTER_SECRET_KEY`
+- Environment variables supported for secrets: `DESTINATION_AUTH_TOKEN`, `DELIVERY_AUTH_TOKEN`, `AUTH_TOKEN`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `HEALTH_PASSWORD`, `CLUSTER_SECRET_KEY`
 - Default values defined in `DefaultConfig()`
 
 **Message Validation Configuration:**
@@ -201,12 +201,12 @@ Mizu supports two storage backends for TLS certificates and stats synchronizatio
    ```toml
    [storage]
    backend = "s3"
-   endpoint = "s3.amazonaws.com"
-   bucket = "mizu-storage"
-   prefix = "certs/"
-   access_key_id = "..." # Or via S3_ACCESS_KEY_ID env var
-   secret_access_key = "..." # Or via S3_SECRET_ACCESS_KEY env var
-   region = "us-east-1"
+   s3_endpoint = "s3.amazonaws.com"
+   s3_bucket = "mizu-storage"
+   s3_prefix = "certs/"
+   s3_access_key = "..." # Or via S3_ACCESS_KEY env var
+   s3_secret_key = "..." # Or via S3_SECRET_KEY env var
+   s3_region = "us-east-1"
    ```
 
 2. **Filesystem** - For single-node deployments

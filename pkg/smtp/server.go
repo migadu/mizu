@@ -555,10 +555,10 @@ func (s *Session) Helo(hostname string) error {
 
 	// Validate HELO hostname for security (skip in local development mode)
 	if !s.globalConfig.Local {
-		// Reject if HELO claims to be our own domain or a subdomain (spoofing attempt)
+		// Reject if HELO claims to be our own hostname or a subdomain (spoofing attempt)
 		// Case-insensitive check for robustness.
-		if strings.HasSuffix(strings.ToLower(hostname), "."+strings.ToLower(s.serverConfig.Domain)) || strings.EqualFold(hostname, s.serverConfig.Domain) {
-			s.Logger.Warn("Rejecting HELO/EHLO - client using our domain", "remote_addr", s.remoteAddr, "hostname", hostname, "our_domain", s.serverConfig.Domain)
+		if strings.HasSuffix(strings.ToLower(hostname), "."+strings.ToLower(s.serverConfig.Hostname)) || strings.EqualFold(hostname, s.serverConfig.Hostname) {
+			s.Logger.Warn("Rejecting HELO/EHLO - client using our hostname", "remote_addr", s.remoteAddr, "hostname", hostname, "our_hostname", s.serverConfig.Hostname)
 			return &smtp.SMTPError{
 				Code:         550,
 				EnhancedCode: smtp.EnhancedCode{5, 7, 8},
@@ -681,12 +681,14 @@ func (s *Session) Mail(from string, opts *smtp.MailOptions) error {
 	}
 
 	// Handle case where go-smtp library processed EHLO internally
-	heloHostname := s.conn.Hostname()
-	if heloHostname != "" && s.helo == "" {
-		// EHLO was handled by go-smtp internally, update our state
-		s.helo = heloHostname
-		s.commandState = stateHelo
-		s.Logger.Debug("HELO/EHLO set via conn.Hostname", "remote_addr", s.remoteAddr, "hostname", heloHostname)
+	if s.conn != nil {
+		heloHostname := s.conn.Hostname()
+		if heloHostname != "" && s.helo == "" {
+			// EHLO was handled by go-smtp internally, update our state
+			s.helo = heloHostname
+			s.commandState = stateHelo
+			s.Logger.Debug("HELO/EHLO set via conn.Hostname", "remote_addr", s.remoteAddr, "hostname", heloHostname)
+		}
 	}
 
 	// Set timeout for this command
@@ -1228,7 +1230,7 @@ func (s *Session) deliverMessage(rawEmail string) error {
 
 	emailWithHeaders := InjectMizuHeaders(
 		rawEmail,
-		s.serverConfig.Domain,
+		s.serverConfig.Hostname,
 		s.remoteAddr,
 		s.helo,
 		s.traceID,
@@ -1280,7 +1282,7 @@ func (s *Session) deliverMessage(rawEmail string) error {
 		}
 	}
 	if missingHeadersAction == "fix" {
-		emailWithHeaders = fixMissingHeaders(emailWithHeaders, s.serverConfig.Domain)
+		emailWithHeaders = fixMissingHeaders(emailWithHeaders, s.serverConfig.Hostname)
 		s.Logger.Debug("Fixed missing headers if needed")
 	}
 

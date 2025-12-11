@@ -49,7 +49,7 @@ func TestLoadConfig_ConfigFile(t *testing.T) {
 name = "test-relay"
 type = "relay"
 listen_addr = ":2525"
-domain = "mail.test.com"
+hostname = "mail.test.com"
 
 [server.tls]
 enabled = true
@@ -85,8 +85,8 @@ log_format = "json"
 		t.Errorf("Server.ListenAddr = %s; want :2525", srv.ListenAddr)
 	}
 
-	if srv.Domain != "mail.test.com" {
-		t.Errorf("Server.Domain = %s; want mail.test.com", srv.Domain)
+	if srv.Hostname != "mail.test.com" {
+		t.Errorf("Server.Hostname = %s; want mail.test.com", srv.Hostname)
 	}
 
 	if cfg.Storage.Backend != "filesystem" {
@@ -100,13 +100,13 @@ log_format = "json"
 
 func TestLoadEnvVars(t *testing.T) {
 	// Set environment variables
-	os.Setenv("S3_ACCESS_KEY_ID", "test-access-key")
+	os.Setenv("S3_ACCESS_KEY", "test-access-key")
 	os.Setenv("S3_SECRET_KEY", "test-secret-key")
 	os.Setenv("DELIVERY_AUTH_TOKEN", "test-dest-token")
 	os.Setenv("AUTH_TOKEN", "test-auth-token")
 
 	defer func() {
-		os.Unsetenv("S3_ACCESS_KEY_ID")
+		os.Unsetenv("S3_ACCESS_KEY")
 		os.Unsetenv("S3_SECRET_KEY")
 		os.Unsetenv("DELIVERY_AUTH_TOKEN")
 		os.Unsetenv("AUTH_TOKEN")
@@ -138,8 +138,8 @@ func TestLoadEnvVars(t *testing.T) {
 	cfg := &defaultCfg
 	applyEnvironmentVariables(cfg)
 
-	if cfg.Storage.S3AccessKeyID != "test-access-key" {
-		t.Errorf("Storage.S3AccessKeyID = %s; want test-access-key", cfg.Storage.S3AccessKeyID)
+	if cfg.Storage.S3AccessKey != "test-access-key" {
+		t.Errorf("Storage.S3AccessKey = %s; want test-access-key", cfg.Storage.S3AccessKey)
 	}
 
 	if cfg.Storage.S3SecretKey != "test-secret-key" {
@@ -167,7 +167,7 @@ func TestValidateConfig_PortConflict(t *testing.T) {
 			Name:       "server1",
 			Type:       "relay",
 			ListenAddr: ":25",
-			Domain:     "test1.com",
+			Hostname:   "test1.com",
 			TLS: ServerTLSConfig{
 				Enabled: true,
 				Mode:    "starttls",
@@ -177,7 +177,7 @@ func TestValidateConfig_PortConflict(t *testing.T) {
 			Name:       "server2",
 			Type:       "submission",
 			ListenAddr: ":25", // Same port!
-			Domain:     "test2.com",
+			Hostname:   "test2.com",
 			TLS: ServerTLSConfig{
 				Enabled: true,
 				Mode:    "implicit",
@@ -200,7 +200,7 @@ func TestValidateConfig_ValidMultiServer(t *testing.T) {
 			Name:       "relay",
 			Type:       "relay",
 			ListenAddr: ":25",
-			Domain:     "mail.example.com",
+			Hostname:   "mail.example.com",
 			TLS: ServerTLSConfig{
 				Enabled: true,
 				Mode:    "starttls",
@@ -210,7 +210,7 @@ func TestValidateConfig_ValidMultiServer(t *testing.T) {
 			Name:       "submission",
 			Type:       "submission",
 			ListenAddr: ":465",
-			Domain:     "mail.example.com",
+			Hostname:   "mail.example.com",
 			TLS: ServerTLSConfig{
 				Enabled:  true,
 				Mode:     "implicit",
@@ -384,7 +384,7 @@ func TestValidateConfig_ClusterBindAddr(t *testing.T) {
 					Name:       "test-server",
 					Type:       "relay",
 					ListenAddr: ":25",
-					Domain:     "test.example.com",
+					Hostname:   "test.example.com",
 					Delivery: DeliveryConfig{
 						URL:                "https://test.com",
 						AuthToken:          "test-token",

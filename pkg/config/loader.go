@@ -53,8 +53,8 @@ func LoadConfig(args []string) (*Config, error) {
 // applyEnvironmentVariables overrides configuration with environment variables
 func applyEnvironmentVariables(cfg *Config) {
 	// Storage credentials
-	if val := os.Getenv("S3_ACCESS_KEY_ID"); val != "" {
-		cfg.Storage.S3AccessKeyID = val
+	if val := os.Getenv("S3_ACCESS_KEY"); val != "" {
+		cfg.Storage.S3AccessKey = val
 	}
 	if val := os.Getenv("S3_SECRET_KEY"); val != "" {
 		cfg.Storage.S3SecretKey = val

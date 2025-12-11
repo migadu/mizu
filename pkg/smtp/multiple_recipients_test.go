@@ -39,6 +39,12 @@ func TestMultipleRecipients_DeliveryToBackend(t *testing.T) {
 
 	// Configure SMTP server
 	cfg := testConfig()
+	// Add a server config since DefaultConfig has empty Servers slice
+	if len(cfg.Servers) == 0 {
+		cfg.Servers = append(cfg.Servers, config.ServerConfig{
+			ListenAddr: ":25",
+		})
+	}
 	cfg.Servers[0].Delivery = config.DeliveryConfig{
 		URL:                backendServer.URL,
 		AuthToken:          "test-token",
@@ -103,6 +109,12 @@ func TestMultipleRecipients_SingleRecipientStillWorks(t *testing.T) {
 	defer backendServer.Close()
 
 	cfg := testConfig()
+	// Add a server config since DefaultConfig has empty Servers slice
+	if len(cfg.Servers) == 0 {
+		cfg.Servers = append(cfg.Servers, config.ServerConfig{
+			ListenAddr: ":25",
+		})
+	}
 	cfg.Servers[0].Delivery = config.DeliveryConfig{
 		URL:                backendServer.URL,
 		AuthToken:          "test-token",
@@ -155,6 +167,12 @@ func TestMultipleRecipients_BackendFailureRejectsAll(t *testing.T) {
 	defer backendServer.Close()
 
 	cfg := testConfig()
+	// Add a server config since DefaultConfig has empty Servers slice
+	if len(cfg.Servers) == 0 {
+		cfg.Servers = append(cfg.Servers, config.ServerConfig{
+			ListenAddr: ":25",
+		})
+	}
 	cfg.Servers[0].Delivery = config.DeliveryConfig{
 		URL:                backendServer.URL,
 		AuthToken:          "test-token",
