@@ -215,6 +215,7 @@ func (a *HTTPAuthenticator) buildURL(email, ip string) string {
 }
 
 // CanSendAs checks if authenticated user can send as a specific FROM address
+// Supports wildcards in allowed_from patterns (e.g., "*@example.com")
 func (a *HTTPAuthenticator) CanSendAs(authenticatedUser, fromAddress string) bool {
 	// Get cached credentials entry to check allowed FROM addresses
 	entry := a.getCredCached(authenticatedUser)
@@ -239,10 +240,10 @@ func (a *HTTPAuthenticator) CanSendAs(authenticatedUser, fromAddress string) boo
 		return false
 	}
 
-	// Check if from address is in allowed list
+	// Check if from address matches any allowed pattern (exact or wildcard)
 	for _, allowed := range entry.allowedFromAddresses {
 		allowedEmail := extractEmail(allowed)
-		if allowedEmail == fromAddr {
+		if matchEmailPattern(allowedEmail, fromAddr) {
 			return true
 		}
 	}
@@ -251,6 +252,28 @@ func (a *HTTPAuthenticator) CanSendAs(authenticatedUser, fromAddress string) boo
 		"authenticated", authUser,
 		"from", fromAddr,
 		"allowed", entry.allowedFromAddresses)
+	return false
+}
+
+// matchEmailPattern checks if an email matches a pattern (supports wildcards)
+// Pattern examples: "user@example.com" (exact), "*@example.com" (domain wildcard)
+func matchEmailPattern(pattern, email string) bool {
+	pattern = strings.ToLower(strings.TrimSpace(pattern))
+	email = strings.ToLower(strings.TrimSpace(email))
+
+	// Exact match
+	if pattern == email {
+		return true
+	}
+
+	// Wildcard matching: *@domain.com
+	if strings.HasPrefix(pattern, "*@") {
+		domain := pattern[2:] // Remove "*@"
+		if strings.HasSuffix(email, "@"+domain) {
+			return true
+		}
+	}
+
 	return false
 }
 

@@ -245,3 +245,128 @@ func TestExtractEmail(t *testing.T) {
 		}
 	}
 }
+
+func TestMatchEmailPattern(t *testing.T) {
+	tests := []struct {
+		pattern  string
+		email    string
+		expected bool
+		desc     string
+	}{
+		// Exact matches
+		{"user@example.com", "user@example.com", true, "exact match"},
+		{"user@example.com", "User@Example.COM", true, "case insensitive exact match"},
+		{"user@example.com", "other@example.com", false, "different user"},
+		{"user@example.com", "user@other.com", false, "different domain"},
+
+		// Wildcard matches - domain level
+		{"*@example.com", "user@example.com", true, "wildcard matches user"},
+		{"*@example.com", "anyone@example.com", true, "wildcard matches any user"},
+		{"*@example.com", "User@Example.COM", true, "wildcard case insensitive"},
+		{"*@example.com", "user@other.com", false, "wildcard different domain"},
+		{"*@example.com", "user@sub.example.com", false, "wildcard does not match subdomain"},
+
+		// Subdomain wildcards
+		{"*@sub.example.com", "user@sub.example.com", true, "wildcard matches subdomain"},
+		{"*@sub.example.com", "user@example.com", false, "wildcard subdomain not parent domain"},
+		{"*@humans.gomailify.com", "h@humans.gomailify.com", true, "wildcard matches subdomain user"},
+		{"*@h.gomailify.com", "anything@h.gomailify.com", true, "wildcard matches subdomain user"},
+
+		// Edge cases
+		{"  *@example.com  ", "  user@example.com  ", true, "whitespace handling"},
+		{"*@", "user@example.com", false, "invalid pattern - no domain"},
+		{"@example.com", "user@example.com", false, "invalid pattern - no local part"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.desc, func(t *testing.T) {
+			result := matchEmailPattern(tt.pattern, tt.email)
+			if result != tt.expected {
+				t.Errorf("matchEmailPattern(%q, %q) = %v, want %v",
+					tt.pattern, tt.email, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestCanSendAs_Wildcards(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	bcryptHash, _ := bcrypt.GenerateFromPassword([]byte("testpass"), bcrypt.DefaultCost)
+
+	tests := []struct {
+		name        string
+		allowedFrom []string
+		testAddress string
+		shouldAllow bool
+	}{
+		{
+			name:        "exact match",
+			allowedFrom: []string{"humans@gomailify.com"},
+			testAddress: "humans@gomailify.com",
+			shouldAllow: true,
+		},
+		{
+			name:        "wildcard subdomain match",
+			allowedFrom: []string{"*@humans.gomailify.com"},
+			testAddress: "anything@humans.gomailify.com",
+			shouldAllow: true,
+		},
+		{
+			name:        "wildcard subdomain no match parent",
+			allowedFrom: []string{"*@humans.gomailify.com"},
+			testAddress: "user@gomailify.com",
+			shouldAllow: false,
+		},
+		{
+			name:        "multiple patterns with wildcard",
+			allowedFrom: []string{"humans@gomailify.com", "*@humans.gomailify.com", "h@gomailify.com", "*@h.gomailify.com"},
+			testAddress: "test@humans.gomailify.com",
+			shouldAllow: true,
+		},
+		{
+			name:        "multiple patterns exact match",
+			allowedFrom: []string{"humans@gomailify.com", "*@humans.gomailify.com", "h@gomailify.com", "*@h.gomailify.com"},
+			testAddress: "h@gomailify.com",
+			shouldAllow: true,
+		},
+		{
+			name:        "multiple patterns wildcard second domain",
+			allowedFrom: []string{"humans@gomailify.com", "*@humans.gomailify.com", "h@gomailify.com", "*@h.gomailify.com"},
+			testAddress: "anyone@h.gomailify.com",
+			shouldAllow: true,
+		},
+		{
+			name:        "multiple patterns no match",
+			allowedFrom: []string{"humans@gomailify.com", "*@humans.gomailify.com", "h@gomailify.com", "*@h.gomailify.com"},
+			testAddress: "other@example.com",
+			shouldAllow: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+				json.NewEncoder(w).Encode(AuthResponse{
+					PasswordHashes: []string{string(bcryptHash)},
+					AllowedFrom:    tt.allowedFrom,
+				})
+			}))
+			defer server.Close()
+
+			auth := NewHTTPAuthenticator(server.URL, "test-auth-token", logger, nil)
+
+			// Authenticate first to populate cache
+			authenticated, err := auth.Authenticate("testuser@example.com", "testpass")
+			if err != nil || !authenticated {
+				t.Fatalf("authentication failed: %v", err)
+			}
+
+			// Test CanSendAs
+			result := auth.CanSendAs("testuser@example.com", tt.testAddress)
+			if result != tt.shouldAllow {
+				t.Errorf("CanSendAs(%q) = %v, want %v", tt.testAddress, result, tt.shouldAllow)
+			}
+		})
+	}
+}
