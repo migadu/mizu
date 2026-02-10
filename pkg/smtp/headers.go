@@ -129,7 +129,7 @@ func buildAuthenticationSummary(spfResult *validation.SPFResult, dmarcResult *va
 	}
 
 	// ARC result
-	if arcResult != nil {
+	if arcResult != nil && arcResult.Instance > 0 {
 		if arcResult.Pass {
 			parts = append(parts, "arc=pass")
 		} else {
