@@ -1,17 +1,29 @@
 package main
 
 import (
+	"context"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"io"
 	"migadu/mizu/pkg/config"
+	"migadu/mizu/pkg/storage"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"text/tabwriter"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
 // Version information, injected at build time
@@ -72,6 +84,8 @@ func main() {
 		cmdStats()
 	case "certs":
 		cmdCerts()
+	case "tls":
+		cmdTLS()
 	case "renew-cert":
 		cmdRenewCert()
 	case "flush-cache":
@@ -95,7 +109,8 @@ Commands:
   health             Show overall health status and component details
   blocked-ips        Show blocked IP addresses and their reputation
   stats              Show message statistics (accepted/rejected/junk)
-  certs              Show TLS certificate status and expiry
+  certs              Show TLS certificate status and expiry (from health endpoint)
+  tls                Manage TLS certificates (list, delete, clean, sync)
   renew-cert         Force certificate renewal (requires server support)
   flush-cache        Flush recipient and IP block caches
   version            Show version information
@@ -116,6 +131,10 @@ Examples:
   mizu-admin -config /etc/mizu/config.toml health
   mizu-admin -server http://smtp.example.com:8080 stats
   mizu-admin certs
+  mizu-admin tls list
+  mizu-admin tls delete example.com
+  mizu-admin tls clean
+  mizu-admin tls sync
   mizu-admin flush-cache
 
 `)
@@ -500,6 +519,430 @@ func cmdFlushCache() {
 	}
 }
 
+func cmdTLS() {
+	if flag.NArg() < 2 {
+		printTLSUsage()
+		os.Exit(1)
+	}
+
+	subcommand := flag.Arg(1)
+	ctx := context.Background()
+
+	switch subcommand {
+	case "list", "ls":
+		handleTLSList(ctx)
+	case "delete", "del", "rm":
+		handleTLSDelete(ctx)
+	case "clean":
+		handleTLSClean(ctx)
+	case "cache", "sync":
+		handleTLSCache(ctx)
+	case "help", "--help", "-h":
+		printTLSUsage()
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown tls subcommand: %s\n\n", subcommand)
+		printTLSUsage()
+		os.Exit(1)
+	}
+}
+
+func printTLSUsage() {
+	fmt.Fprintf(os.Stderr, `TLS Certificate Management
+
+Usage:
+  mizu-admin tls <subcommand> [arguments]
+
+Subcommands:
+  list, ls           List all certificates in storage
+  delete, del, rm    Delete certificate for a domain
+  clean              Clean up expired and invalid certificates
+  cache, sync        Sync certificates from storage to local cache
+  help               Show this help message
+
+Examples:
+  mizu-admin tls list
+  mizu-admin tls delete example.com
+  mizu-admin tls clean
+  mizu-admin tls sync
+
+Notes:
+  - Commands require a valid config.toml with storage backend configuration
+  - Use -config flag to specify a different config file
+  - Deleted certificates will be automatically re-requested by the server
+
+`)
+}
+
+func handleTLSList(ctx context.Context) {
+	// Load config to get storage backend settings
+	cfg, err := config.LoadFromFile(configFile)
+	if err != nil {
+		fatal("Failed to load config: %v", err)
+	}
+
+	// Initialize storage backend
+	backend, err := initStorageBackend(ctx, cfg)
+	if err != nil {
+		fatal("Failed to initialize storage backend: %v", err)
+	}
+
+	fmt.Println("Listing certificates in storage...")
+	fmt.Println()
+
+	// List objects with autocert prefix (certs/ + autocert/)
+	// The server stores certs at: S3Prefix + "certs/" + "autocert/"
+	prefix := cfg.Storage.S3Prefix + "certs/autocert/"
+	objects, err := backend.ListObjects(ctx, prefix, true)
+	if err != nil {
+		fatal("Failed to list certificates: %v", err)
+	}
+
+	// Filter for certificate files
+	var certs []CertificateInfo
+	for _, obj := range objects {
+		// Skip non-certificate files (acme account keys, etc.)
+		if !strings.HasSuffix(obj.Key, hashDomain("")) && !isCertificateKey(obj.Key, cfg) {
+			continue
+		}
+
+		certInfo := CertificateInfo{
+			S3Key:        obj.Key,
+			Size:         obj.Size,
+			LastModified: obj.LastModified,
+		}
+
+		// Try to determine domain from cert key
+		certInfo.Domain = tryDecodeDomain(obj.Key, cfg)
+
+		// Download and parse certificate for more details
+		reader, err := backend.GetObject(ctx, obj.Key)
+		if err == nil {
+			certData, _ := io.ReadAll(reader)
+			reader.Close()
+			parseCertificateData(certData, &certInfo)
+		}
+
+		certs = append(certs, certInfo)
+	}
+
+	if len(certs) == 0 {
+		fmt.Println("No certificates found in storage")
+		return
+	}
+
+	fmt.Printf("Found %d certificate(s)\n\n", len(certs))
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+	fmt.Fprintln(w, "DOMAIN\tTYPE\tSTATUS\tEXPIRY\tSIZE\tLAST MODIFIED")
+	fmt.Fprintln(w, "──────\t────\t──────\t──────\t────\t─────────────")
+
+	for _, cert := range certs {
+		status := "Valid"
+		expiryStr := "-"
+		if !cert.Expiry.IsZero() {
+			daysUntilExpiry := int(time.Until(cert.Expiry).Hours() / 24)
+			if daysUntilExpiry < 0 {
+				expiryStr = "EXPIRED"
+				status = "Expired"
+			} else if daysUntilExpiry < 7 {
+				expiryStr = fmt.Sprintf("%dd ⚠", daysUntilExpiry)
+				status = "Expiring"
+			} else if daysUntilExpiry < 30 {
+				expiryStr = fmt.Sprintf("%dd", daysUntilExpiry)
+				status = "Expiring"
+			} else {
+				expiryStr = fmt.Sprintf("%dd", daysUntilExpiry)
+			}
+		}
+
+		if cert.CertType == "Invalid" || cert.CertType == "Parse Error" {
+			status = "Invalid"
+		}
+
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d bytes\t%s\n",
+			cert.Domain,
+			cert.CertType,
+			status,
+			expiryStr,
+			cert.Size,
+			cert.LastModified.Format("2006-01-02 15:04"),
+		)
+	}
+	w.Flush()
+}
+
+func handleTLSDelete(ctx context.Context) {
+	if flag.NArg() < 3 {
+		fmt.Fprintln(os.Stderr, "Error: delete requires a domain argument")
+		fmt.Fprintln(os.Stderr, "Usage: mizu-admin tls delete <domain>")
+		fmt.Fprintln(os.Stderr, "Example: mizu-admin tls delete example.com")
+		os.Exit(1)
+	}
+
+	domain := flag.Arg(2)
+
+	// Load config to get storage backend settings
+	cfg, err := config.LoadFromFile(configFile)
+	if err != nil {
+		fatal("Failed to load config: %v", err)
+	}
+
+	// Initialize storage backend
+	backend, err := initStorageBackend(ctx, cfg)
+	if err != nil {
+		fatal("Failed to initialize storage backend: %v", err)
+	}
+
+	fmt.Printf("Deleting certificate for domain: %s\n", domain)
+	fmt.Println("Warning: This will remove the certificate from storage.")
+	fmt.Println("The server will automatically request a new certificate on next use.")
+	fmt.Println()
+
+	// Compute S3 keys for both ECDSA and RSA variants
+	// The server stores certs at: S3Prefix + "certs/" + "autocert/"
+	prefix := cfg.Storage.S3Prefix + "certs/autocert/"
+	ecdsaKey := prefix + hashDomain(domain)
+	rsaKey := prefix + hashDomain(domain+"+rsa")
+
+	deleted := 0
+	notFound := 0
+	var errors []string
+
+	// Delete both variants
+	for _, key := range []string{ecdsaKey, rsaKey} {
+		keyType := "ECDSA"
+		if strings.Contains(key, "+rsa") {
+			keyType = "RSA"
+		}
+
+		err := backend.RemoveObject(ctx, key)
+		if err != nil {
+			if os.IsNotExist(err) {
+				fmt.Printf("  %s certificate not found (may not exist)\n", keyType)
+				notFound++
+			} else {
+				errMsg := fmt.Sprintf("%s certificate: %v", keyType, err)
+				errors = append(errors, errMsg)
+				fmt.Printf("✗ Failed to delete %s\n", errMsg)
+			}
+		} else {
+			fmt.Printf("✓ Deleted %s certificate\n", keyType)
+			deleted++
+		}
+	}
+
+	fmt.Println()
+
+	if deleted > 0 {
+		fmt.Printf("Successfully deleted %d certificate(s) for '%s'\n", deleted, domain)
+	}
+	if notFound == 2 {
+		fmt.Printf("No certificates found for '%s' (may have been already deleted)\n", domain)
+	}
+	if len(errors) > 0 {
+		fmt.Println("Errors occurred during deletion:")
+		for _, e := range errors {
+			fmt.Printf("  - %s\n", e)
+		}
+		os.Exit(1)
+	}
+	if deleted == 0 && notFound == 0 {
+		fmt.Println("✗ No certificates deleted")
+		os.Exit(1)
+	}
+}
+
+func handleTLSClean(ctx context.Context) {
+	// Load config to get storage backend settings
+	cfg, err := config.LoadFromFile(configFile)
+	if err != nil {
+		fatal("Failed to load config: %v", err)
+	}
+
+	// Initialize storage backend
+	backend, err := initStorageBackend(ctx, cfg)
+	if err != nil {
+		fatal("Failed to initialize storage backend: %v", err)
+	}
+
+	fmt.Println("Cleaning up expired and invalid certificates...")
+	fmt.Println()
+
+	// List objects with autocert prefix
+	prefix := cfg.Storage.S3Prefix + "certs/autocert/"
+	objects, err := backend.ListObjects(ctx, prefix, true)
+	if err != nil {
+		fatal("Failed to list certificates: %v", err)
+	}
+
+	// Find certificates to clean
+	var toDelete []struct {
+		key    string
+		domain string
+		reason string
+	}
+
+	for _, obj := range objects {
+		// Skip non-certificate files
+		if !isCertificateKey(obj.Key, cfg) {
+			continue
+		}
+
+		// Download and parse certificate
+		reader, err := backend.GetObject(ctx, obj.Key)
+		if err != nil {
+			fmt.Printf("Warning: Failed to read %s: %v\n", obj.Key, err)
+			continue
+		}
+
+		certData, _ := io.ReadAll(reader)
+		reader.Close()
+
+		certInfo := CertificateInfo{
+			S3Key:  obj.Key,
+			Domain: tryDecodeDomain(obj.Key, cfg),
+		}
+		parseCertificateData(certData, &certInfo)
+
+		// Check if expired
+		if !certInfo.Expiry.IsZero() && time.Now().After(certInfo.Expiry) {
+			toDelete = append(toDelete, struct {
+				key    string
+				domain string
+				reason string
+			}{obj.Key, certInfo.Domain, "expired"})
+		}
+
+		// Check if invalid
+		if certInfo.CertType == "Invalid" || certInfo.CertType == "Parse Error" {
+			toDelete = append(toDelete, struct {
+				key    string
+				domain string
+				reason string
+			}{obj.Key, certInfo.Domain, "invalid"})
+		}
+	}
+
+	if len(toDelete) == 0 {
+		fmt.Println("No expired or invalid certificates found")
+		return
+	}
+
+	fmt.Printf("Found %d certificate(s) to clean:\n\n", len(toDelete))
+	for _, item := range toDelete {
+		fmt.Printf("  - %s (%s)\n", item.domain, item.reason)
+	}
+	fmt.Println()
+
+	deleted := 0
+	failed := 0
+
+	for _, item := range toDelete {
+		err := backend.RemoveObject(ctx, item.key)
+		if err != nil {
+			fmt.Printf("✗ Failed to delete %s: %v\n", item.domain, err)
+			failed++
+		} else {
+			fmt.Printf("✓ Deleted %s (%s)\n", item.domain, item.reason)
+			deleted++
+		}
+	}
+
+	fmt.Println()
+	fmt.Printf("Cleaned up %d certificate(s)", deleted)
+	if failed > 0 {
+		fmt.Printf(" (%d failed)", failed)
+	}
+	fmt.Println()
+}
+
+func handleTLSCache(ctx context.Context) {
+	// Load config to get storage backend settings
+	cfg, err := config.LoadFromFile(configFile)
+	if err != nil {
+		fatal("Failed to load config: %v", err)
+	}
+
+	// Check if fallback cache is configured
+	if cfg.TLS.LetsEncrypt.FallbackCacheDir == "" {
+		fmt.Println("Fallback cache directory not configured in config.toml")
+		fmt.Println("Set tls.letsencrypt.fallback_cache_dir to enable local certificate caching")
+		os.Exit(1)
+	}
+
+	// Initialize storage backend
+	backend, err := initStorageBackend(ctx, cfg)
+	if err != nil {
+		fatal("Failed to initialize storage backend: %v", err)
+	}
+
+	fmt.Printf("Syncing certificates from storage to local cache: %s\n", cfg.TLS.LetsEncrypt.FallbackCacheDir)
+	fmt.Println()
+
+	// Ensure cache directory exists
+	if err := os.MkdirAll(cfg.TLS.LetsEncrypt.FallbackCacheDir, 0700); err != nil {
+		fatal("Failed to create cache directory: %v", err)
+	}
+
+	// List objects with autocert prefix
+	prefix := cfg.Storage.S3Prefix + "certs/autocert/"
+	objects, err := backend.ListObjects(ctx, prefix, true)
+	if err != nil {
+		fatal("Failed to list certificates: %v", err)
+	}
+
+	synced := 0
+	skipped := 0
+	failed := 0
+
+	for _, obj := range objects {
+		// Extract filename from key
+		parts := strings.Split(obj.Key, "/")
+		filename := parts[len(parts)-1]
+		localPath := filepath.Join(cfg.TLS.LetsEncrypt.FallbackCacheDir, filename)
+
+		// Check if local file exists and is newer
+		if stat, err := os.Stat(localPath); err == nil {
+			if stat.ModTime().After(obj.LastModified) || stat.ModTime().Equal(obj.LastModified) {
+				skipped++
+				continue
+			}
+		}
+
+		// Download from storage
+		reader, err := backend.GetObject(ctx, obj.Key)
+		if err != nil {
+			fmt.Printf("✗ Failed to download %s: %v\n", filename, err)
+			failed++
+			continue
+		}
+
+		// Write to local cache
+		data, err := io.ReadAll(reader)
+		reader.Close()
+		if err != nil {
+			fmt.Printf("✗ Failed to read %s: %v\n", filename, err)
+			failed++
+			continue
+		}
+
+		if err := os.WriteFile(localPath, data, 0600); err != nil {
+			fmt.Printf("✗ Failed to write %s: %v\n", filename, err)
+			failed++
+			continue
+		}
+
+		// Set modification time to match storage
+		os.Chtimes(localPath, obj.LastModified, obj.LastModified)
+
+		fmt.Printf("✓ Synced %s\n", filename)
+		synced++
+	}
+
+	fmt.Println()
+	fmt.Printf("Sync complete: %d synced, %d skipped, %d failed\n", synced, skipped, failed)
+}
+
 // HTTP helper functions
 
 func httpGet(path string) ([]byte, error) {
@@ -572,47 +1015,183 @@ func fatal(format string, args ...any) {
 	os.Exit(1)
 }
 
-// Helper functions for extracting values from JSON maps
-func getString(m map[string]any, key string) string {
-	if v, ok := m[key].(string); ok {
-		return v
-	}
-	return ""
+// Certificate management helper functions and types
+
+type CertificateInfo struct {
+	S3Key        string
+	Domain       string
+	CertType     string // "ECDSA", "RSA", or "Unknown"
+	Size         int64
+	LastModified time.Time
+	Expiry       time.Time
+	NotBefore    time.Time
+	Subject      string
+	Issuer       string
 }
 
-func getInt(m map[string]any, key string) int {
-	if v, ok := m[key].(float64); ok {
-		return int(v)
+func initStorageBackend(ctx context.Context, cfg *config.Config) (storage.Backend, error) {
+	switch cfg.Storage.Backend {
+	case "s3":
+		// Initialize S3 backend using AWS SDK v2
+		awsCfg, err := awsconfig.LoadDefaultConfig(ctx,
+			awsconfig.WithRegion(cfg.Storage.S3Region),
+			awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
+				cfg.Storage.S3AccessKey,
+				cfg.Storage.S3SecretKey,
+				"",
+			)),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load AWS config: %w", err)
+		}
+
+		s3Client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
+			// Custom endpoint resolver for non-AWS S3 services
+			if cfg.Storage.S3Endpoint != "" {
+				o.BaseEndpoint = aws.String(cfg.Storage.S3Endpoint)
+				o.UsePathStyle = true
+			}
+		})
+
+		return storage.NewS3Backend(s3Client, cfg.Storage.S3Bucket, nil), nil
+
+	case "filesystem":
+		backend, err := storage.NewFilesystemBackend(cfg.Storage.FilesystemPath, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to init filesystem backend: %w", err)
+		}
+		return backend, nil
+
+	default:
+		return nil, fmt.Errorf("unsupported storage backend: %s", cfg.Storage.Backend)
 	}
-	return 0
 }
 
-func getBool(m map[string]any, key string) bool {
-	if v, ok := m[key].(bool); ok {
-		return v
+func hashDomain(domain string) string {
+	h := sha256.Sum256([]byte(domain))
+	return hex.EncodeToString(h[:])
+}
+
+func isCertificateKey(key string, cfg *config.Config) bool {
+	// Check if key matches any configured domain hash
+	if cfg.TLS.LetsEncrypt.Domains != nil {
+		for _, domain := range cfg.TLS.LetsEncrypt.Domains {
+			if strings.HasSuffix(key, hashDomain(domain)) {
+				return true
+			}
+			if strings.HasSuffix(key, hashDomain(domain+"+rsa")) {
+				return true
+			}
+		}
 	}
+
+	// If no domains configured, try basic pattern matching
+	// autocert stores files with SHA256 hash names (64 hex chars)
+	filename := filepath.Base(key)
+	if len(filename) == 64 {
+		// Check if it's a valid hex string
+		if _, err := hex.DecodeString(filename); err == nil {
+			return true
+		}
+	}
+
 	return false
 }
 
-func getStringSlice(m map[string]any, key string) []string {
-	if v, ok := m[key].([]any); ok {
-		result := make([]string, 0, len(v))
-		for _, item := range v {
-			if s, ok := item.(string); ok {
-				result = append(result, s)
+func tryDecodeDomain(s3Key string, cfg *config.Config) string {
+	// Extract hash from key
+	parts := strings.Split(s3Key, "/cert-")
+	if len(parts) != 2 {
+		return "unknown"
+	}
+
+	hash := parts[1]
+
+	// Try configured domains
+	if cfg.TLS.LetsEncrypt.Domains != nil {
+		for _, domain := range cfg.TLS.LetsEncrypt.Domains {
+			if hashDomain(domain) == hash {
+				return domain
+			}
+			if hashDomain(domain+"+rsa") == hash {
+				return domain + " (RSA)"
 			}
 		}
-		return result
 	}
-	return []string{}
+
+	// Show truncated hash if domain not found
+	if len(hash) > 16 {
+		return hash[:16] + "..."
+	}
+	return hash
 }
 
-func getTime(m map[string]any, key string) string {
-	if v, ok := m[key].(string); ok {
-		if t, err := time.Parse(time.RFC3339, v); err == nil {
-			return t.Format("2006-01-02 15:04:05")
+func parseCertificateData(data []byte, info *CertificateInfo) {
+	// autocert stores: private key PEM + certificate PEM
+	// Skip the private key and parse the certificate
+	var certPEM []byte
+	remaining := data
+
+	for {
+		block, rest := pem.Decode(remaining)
+		if block == nil {
+			break
 		}
-		return v
+
+		if block.Type == "CERTIFICATE" {
+			certPEM = pem.EncodeToMemory(block)
+			break
+		}
+
+		remaining = rest
 	}
-	return ""
+
+	if certPEM == nil {
+		info.CertType = "Invalid"
+		return
+	}
+
+	// Parse certificate
+	block, _ := pem.Decode(certPEM)
+	if block == nil {
+		info.CertType = "Invalid"
+		return
+	}
+
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		info.CertType = "Parse Error"
+		return
+	}
+
+	// Extract information
+	info.Expiry = cert.NotAfter
+	info.NotBefore = cert.NotBefore
+	info.Subject = cert.Subject.String()
+	info.Issuer = cert.Issuer.String()
+
+	// Extract domain from certificate if not already set
+	if strings.Contains(info.Domain, "...") || info.Domain == "unknown" {
+		if len(cert.DNSNames) > 0 {
+			info.Domain = cert.DNSNames[0]
+			if cert.PublicKeyAlgorithm == x509.RSA {
+				info.Domain += " (RSA)"
+			}
+		} else if cert.Subject.CommonName != "" {
+			info.Domain = cert.Subject.CommonName
+			if cert.PublicKeyAlgorithm == x509.RSA {
+				info.Domain += " (RSA)"
+			}
+		}
+	}
+
+	// Determine cert type from public key algorithm
+	switch cert.PublicKeyAlgorithm {
+	case x509.ECDSA:
+		info.CertType = "ECDSA"
+	case x509.RSA:
+		info.CertType = "RSA"
+	default:
+		info.CertType = cert.PublicKeyAlgorithm.String()
+	}
 }
