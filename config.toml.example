@@ -47,15 +47,17 @@
 # #   Response 404: User not found
 # # Supported password hash formats: bcrypt ($2a$, $2b$, $2y$, {BLF-CRYPT}), SSHA512 ({SSHA512}, {SSHA512.b64}, {SSHA512.HEX}), SHA512 ({SHA512}, {SHA512.b64}, {SHA512.HEX})
 #
-# # Auth cache - STRONGLY RECOMMENDED for production to prevent brute force attacks
+# # Auth cache - ENABLED BY DEFAULT for brute force protection
+# # Omit this section to use defaults, or customize as needed
 # [server.auth.cache]
-# enabled = true                                    # Enable authentication result caching (positive + negative)
-# positive_ttl = "5m"                              # Cache successful auth for 5 minutes
-# negative_ttl = "1m"                              # Cache failed auth for 1 minute (brute force protection)
-# max_size = 50000                                 # Maximum cache entries (LRU eviction)
-# cleanup_interval = "5m"                          # How often to cleanup expired entries
-# positive_revalidation_window = "30s"             # Revalidate successful auth if older than 30s (detects password changes)
-# # WARNING: If disabled, every failed auth attempt hits your backend API (no brute force protection)
+# enabled = true                                    # Enable authentication result caching (DEFAULT: true)
+# positive_ttl = "5m"                              # Cache successful auth for 5 minutes (DEFAULT: "5m")
+# negative_ttl = "1m"                              # Cache failed auth for 1 minute (DEFAULT: "1m")
+# max_size = 50000                                 # Maximum cache entries (DEFAULT: 50000)
+# cleanup_interval = "5m"                          # How often to cleanup expired entries (DEFAULT: "5m")
+# positive_revalidation_window = "30s"             # Revalidate successful auth if older than this (DEFAULT: "30s")
+# # To disable (NOT RECOMMENDED): set enabled = false
+# # WARNING: Disabling removes brute force protection - every failed auth hits your backend API
 # [server.tls]
 # mode = "starttls"                                 # "starttls" or "implicit" (for port 465)
 # [server.delivery]

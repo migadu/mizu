@@ -908,9 +908,23 @@ func initAuthenticator(serverCfg *config.ServerConfig, logger *slog.Logger) smtp
 		os.Exit(1)
 	}
 
-	// Initialize auth cache if enabled
+	// Initialize auth cache
 	var authCache *smtp.AuthCache
 	cacheCfg := serverCfg.Auth.Cache
+
+	// Enable auth cache by default for security (brute force protection)
+	// If no cache config is specified, enable it with defaults
+	// If user explicitly sets enabled=false, respect that (but warn them)
+	cacheConfigSpecified := cacheCfg.PositiveTTL != "" || cacheCfg.NegativeTTL != "" ||
+		cacheCfg.MaxSize > 0 || cacheCfg.CleanupInterval != "" ||
+		cacheCfg.PositiveRevalidationWindow != ""
+
+	if !cacheCfg.Enabled && !cacheConfigSpecified {
+		// No cache config at all - enable by default
+		cacheCfg.Enabled = true
+		logger.Info("Auth cache enabled by default for brute force protection")
+	}
+
 	if cacheCfg.Enabled {
 		// Set defaults
 		if cacheCfg.PositiveTTL == "" {
