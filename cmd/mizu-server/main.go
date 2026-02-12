@@ -965,6 +965,11 @@ func initAuthenticator(serverCfg *config.ServerConfig, logger *slog.Logger) smtp
 			"negative_ttl", cacheCfg.NegativeTTL,
 			"max_size", cacheCfg.MaxSize,
 			"revalidation_window", cacheCfg.PositiveRevalidationWindow)
+	} else {
+		logger.Warn("Auth cache is DISABLED - no brute force protection",
+			"warning", "Every failed authentication attempt will hit the backend API",
+			"recommendation", "Enable auth cache for production deployments to prevent password guessing attacks",
+			"config", "Set [server.auth.cache] enabled = true")
 	}
 
 	logger.Info("Using HTTP authenticator", "url", serverCfg.Auth.URL, "cache_enabled", cacheCfg.Enabled)

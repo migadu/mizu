@@ -46,6 +46,16 @@
 # #   Response 200: {"password_hashes": ["$2a$10$...", "{SSHA512}..."], "allowed_from": ["user@example.com"]}
 # #   Response 404: User not found
 # # Supported password hash formats: bcrypt ($2a$, $2b$, $2y$, {BLF-CRYPT}), SSHA512 ({SSHA512}, {SSHA512.b64}, {SSHA512.HEX}), SHA512 ({SHA512}, {SHA512.b64}, {SHA512.HEX})
+#
+# # Auth cache - STRONGLY RECOMMENDED for production to prevent brute force attacks
+# [server.auth.cache]
+# enabled = true                                    # Enable authentication result caching (positive + negative)
+# positive_ttl = "5m"                              # Cache successful auth for 5 minutes
+# negative_ttl = "1m"                              # Cache failed auth for 1 minute (brute force protection)
+# max_size = 50000                                 # Maximum cache entries (LRU eviction)
+# cleanup_interval = "5m"                          # How often to cleanup expired entries
+# positive_revalidation_window = "30s"             # Revalidate successful auth if older than 30s (detects password changes)
+# # WARNING: If disabled, every failed auth attempt hits your backend API (no brute force protection)
 # [server.tls]
 # mode = "starttls"                                 # "starttls" or "implicit" (for port 465)
 # [server.delivery]

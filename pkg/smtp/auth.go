@@ -22,6 +22,8 @@ type HTTPAuthenticator struct {
 	logger      *slog.Logger
 
 	// Auth result cache (password-aware, separate positive/negative TTL)
+	// When enabled, handles both positive and negative caching
+	// When disabled (nil), credentials cache is used without brute force protection
 	authCache *AuthCache
 
 	// Credentials cache (stores password hashes and allowed_from for successful auth)
@@ -93,20 +95,49 @@ func (a *HTTPAuthenticator) AuthenticateWithIP(username, password, remoteIP stri
 		}
 		// Cache miss or needs revalidation - continue to backend check
 	} else {
-		// Auth cache disabled - check credentials cache
+		// Auth cache disabled - only use credentials cache (no brute force protection)
+		// Check credentials cache
 		if entry := a.getCredCached(username); entry != nil {
 			a.logger.Debug("credentials cache hit", "username", username)
 			// Verify password against cached hashes (try all until one matches)
 			if a.verifyAgainstHashes(entry.passwordHashes, password) {
 				return true, nil
 			}
-			// Password doesn't match any cached hash - could be password change
-			a.logger.Warn("cached password verification failed", "username", username)
+
+			// Password doesn't match cached hash - might be password change
+			// Refetch from backend to verify
+			a.logger.Warn("cached password verification failed, refetching credentials", "username", username)
 			a.clearCredCacheEntry(username)
+
+			// Fetch fresh credentials from backend
+			creds, err := a.fetchCredentials(username, remoteIP)
+			if err != nil {
+				// Backend error - return error without caching
+				return false, err
+			}
+
+			// No password hashes means user not found
+			if len(creds.PasswordHashes) == 0 {
+				a.logger.Warn("user not found", "username", username)
+				return false, nil
+			}
+
+			// Verify password against fresh credentials
+			if a.verifyAgainstHashes(creds.PasswordHashes, password) {
+				// Success with fresh credentials (password was changed)
+				a.cacheCredentials(username, creds.PasswordHashes, creds.AllowedFrom)
+				a.logger.Info("authentication successful with fresh credentials", "username", username)
+				return true, nil
+			}
+
+			// Password still doesn't match - cache fresh credentials
+			a.cacheCredentials(username, creds.PasswordHashes, creds.AllowedFrom)
+			a.logger.Warn("password verification failed after refetch", "username", username)
+			return false, nil
 		}
 	}
 
-	// Fetch credentials from backend
+	// Fetch credentials from backend (cache miss)
 	creds, err := a.fetchCredentials(username, remoteIP)
 	if err != nil {
 		// Cache negative result if auth cache enabled
@@ -131,6 +162,8 @@ func (a *HTTPAuthenticator) AuthenticateWithIP(username, password, remoteIP stri
 		if a.authCache != nil {
 			a.authCache.SetFailure(username, password, AuthInvalidPassword)
 		}
+		// Cache credentials anyway so future attempts can use them
+		a.cacheCredentials(username, creds.PasswordHashes, creds.AllowedFrom)
 		return false, nil
 	}
 
@@ -223,6 +256,7 @@ func (a *HTTPAuthenticator) buildURL(email, ip string) string {
 
 // CanSendAs checks if authenticated user can send as a specific FROM address
 // Supports wildcards in allowed_from patterns (e.g., "*@example.com")
+// If the FROM address is not in the cached allowed list, refetches from backend to detect changes
 func (a *HTTPAuthenticator) CanSendAs(authenticatedUser, fromAddress string) bool {
 	// Get cached credentials entry to check allowed FROM addresses
 	entry := a.getCredCached(authenticatedUser)
@@ -236,29 +270,63 @@ func (a *HTTPAuthenticator) CanSendAs(authenticatedUser, fromAddress string) boo
 	authUser := strings.ToLower(strings.TrimSpace(authenticatedUser))
 	fromAddr := extractEmail(fromAddress)
 
-	// If no specific allowed addresses configured, default to username match
-	if len(entry.allowedFromAddresses) == 0 {
-		if authUser == fromAddr {
-			return true
-		}
-		a.logger.Warn("FROM address mismatch (no allowed_from list)",
-			"authenticated", authUser,
-			"from", fromAddr)
+	// Check against cached allowed_from list
+	if a.checkAllowedFrom(entry.allowedFromAddresses, authUser, fromAddr) {
+		return true
+	}
+
+	// FROM address not in cached list - refetch credentials to check for updates
+	// (admin might have added/removed aliases)
+	a.logger.Debug("FROM address not in cached allowed_from, refetching credentials",
+		"user", authenticatedUser,
+		"from", fromAddr,
+		"cached_allowed", entry.allowedFromAddresses)
+
+	a.clearCredCacheEntry(authenticatedUser)
+	creds, err := a.fetchCredentials(authenticatedUser, "")
+	if err != nil {
+		a.logger.Error("failed to refetch credentials for CanSendAs check", "user", authenticatedUser, "error", err)
 		return false
 	}
 
+	if len(creds.PasswordHashes) == 0 {
+		a.logger.Warn("user not found during CanSendAs refetch", "user", authenticatedUser)
+		return false
+	}
+
+	// Cache fresh credentials
+	a.cacheCredentials(authenticatedUser, creds.PasswordHashes, creds.AllowedFrom)
+
+	// Check again with fresh allowed_from list
+	if a.checkAllowedFrom(creds.AllowedFrom, authUser, fromAddr) {
+		a.logger.Info("FROM address allowed after refetch (allowed_from was updated)",
+			"user", authenticatedUser,
+			"from", fromAddr)
+		return true
+	}
+
+	a.logger.Warn("FROM address not in allowed list (verified with fresh data)",
+		"authenticated", authUser,
+		"from", fromAddr,
+		"allowed", creds.AllowedFrom)
+	return false
+}
+
+// checkAllowedFrom checks if fromAddr matches the allowed_from list
+func (a *HTTPAuthenticator) checkAllowedFrom(allowedFromAddresses []string, authUser, fromAddr string) bool {
+	// If no specific allowed addresses configured, default to username match
+	if len(allowedFromAddresses) == 0 {
+		return authUser == fromAddr
+	}
+
 	// Check if from address matches any allowed pattern (exact or wildcard)
-	for _, allowed := range entry.allowedFromAddresses {
+	for _, allowed := range allowedFromAddresses {
 		allowedEmail := extractEmail(allowed)
 		if matchEmailPattern(allowedEmail, fromAddr) {
 			return true
 		}
 	}
 
-	a.logger.Warn("FROM address not in allowed list",
-		"authenticated", authUser,
-		"from", fromAddr,
-		"allowed", entry.allowedFromAddresses)
 	return false
 }
 

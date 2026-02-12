@@ -225,6 +225,33 @@ func TestHTTPAuthenticator_Authenticate(t *testing.T) {
 	})
 }
 
+func TestHTTPAuthenticator_BackendErrorReturnsTemporaryFailure(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+
+	// Server returns 500 error
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	auth := NewHTTPAuthenticator(server.URL, "test-auth-token", logger, nil)
+
+	// Authentication should return error (not false)
+	authenticated, err := auth.Authenticate("testuser@example.com", "testpass")
+	if err == nil {
+		t.Error("expected error when backend returns 500")
+	}
+	if authenticated {
+		t.Error("should not authenticate when backend errors")
+	}
+
+	// The error should be returned (not just false), allowing the SMTP layer
+	// to convert it to a 454 temporary failure instead of 535 permanent failure
+	if err == nil {
+		t.Fatal("backend error should return err, not just false")
+	}
+}
+
 func TestExtractEmail(t *testing.T) {
 	tests := []struct {
 		input    string
@@ -286,6 +313,207 @@ func TestMatchEmailPattern(t *testing.T) {
 					tt.pattern, tt.email, result, tt.expected)
 			}
 		})
+	}
+}
+
+func TestHTTPAuthenticator_PasswordChange(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+
+	// Initial password
+	oldPasswordHash, _ := bcrypt.GenerateFromPassword([]byte("oldpass"), bcrypt.DefaultCost)
+	// New password after change
+	newPasswordHash, _ := bcrypt.GenerateFromPassword([]byte("newpass"), bcrypt.DefaultCost)
+
+	passwordChanged := false
+	callCount := 0
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		w.WriteHeader(http.StatusOK)
+
+		var hash []byte
+		if passwordChanged {
+			hash = newPasswordHash
+		} else {
+			hash = oldPasswordHash
+		}
+
+		json.NewEncoder(w).Encode(AuthResponse{
+			PasswordHashes: []string{string(hash)},
+			AllowedFrom:    []string{"testuser@example.com"},
+		})
+	}))
+	defer server.Close()
+
+	auth := NewHTTPAuthenticator(server.URL, "test-auth-token", logger, nil)
+	auth.credCacheTTL = 5 * time.Second
+
+	// First authentication with old password - should succeed and cache
+	authenticated, err := auth.Authenticate("testuser@example.com", "oldpass")
+	if err != nil || !authenticated {
+		t.Fatal("first authentication with old password should succeed")
+	}
+	if callCount != 1 {
+		t.Errorf("expected 1 backend call, got %d", callCount)
+	}
+
+	// Second authentication with old password - should use cache (no backend call)
+	authenticated, err = auth.Authenticate("testuser@example.com", "oldpass")
+	if err != nil || !authenticated {
+		t.Fatal("second authentication with old password should succeed from cache")
+	}
+	if callCount != 1 {
+		t.Errorf("expected still 1 backend call (cached), got %d", callCount)
+	}
+
+	// Simulate password change on backend
+	passwordChanged = true
+
+	// Try new password - should fail on cache (has old password cached),
+	// trigger refetch, verify against new password, succeed
+	authenticated, err = auth.Authenticate("testuser@example.com", "newpass")
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if !authenticated {
+		t.Error("new password should succeed after refetch")
+	}
+	if callCount != 2 {
+		t.Errorf("expected 2 backend calls (cache miss triggered refetch), got %d", callCount)
+	}
+
+	// Try old password - should refetch (credentials mismatch), fail
+	authenticated, err = auth.Authenticate("testuser@example.com", "oldpass")
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if authenticated {
+		t.Error("old password should fail")
+	}
+	if callCount != 3 {
+		t.Errorf("expected 3 backend calls (refetch to verify old password is wrong), got %d", callCount)
+	}
+
+	// Try old password again - without auth cache, will refetch again (no brute force protection)
+	authenticated, err = auth.Authenticate("testuser@example.com", "oldpass")
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if authenticated {
+		t.Error("old password should still fail")
+	}
+	if callCount != 4 {
+		t.Errorf("expected 4 backend calls (no negative caching without auth cache), got %d", callCount)
+	}
+
+	// Try new password again - should use cached credentials (no backend call)
+	authenticated, err = auth.Authenticate("testuser@example.com", "newpass")
+	if err != nil || !authenticated {
+		t.Error("new password should succeed from cache")
+	}
+	if callCount != 4 {
+		t.Errorf("expected still 4 backend calls (using cached creds), got %d", callCount)
+	}
+}
+
+func TestCanSendAs_AllowedFromChanges(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	bcryptHash, _ := bcrypt.GenerateFromPassword([]byte("testpass"), bcrypt.DefaultCost)
+
+	// Track allowed addresses - will change during test
+	allowedAddresses := []string{"user@example.com", "alias@example.com"}
+	callCount := 0
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(AuthResponse{
+			PasswordHashes: []string{string(bcryptHash)},
+			AllowedFrom:    allowedAddresses,
+		})
+	}))
+	defer server.Close()
+
+	auth := NewHTTPAuthenticator(server.URL, "test-auth-token", logger, nil)
+
+	// Authenticate user
+	authenticated, err := auth.Authenticate("user@example.com", "testpass")
+	if err != nil || !authenticated {
+		t.Fatalf("authentication failed: %v", err)
+	}
+	if callCount != 1 {
+		t.Fatalf("expected 1 backend call, got %d", callCount)
+	}
+
+	// User should be able to send from both addresses
+	if !auth.CanSendAs("user@example.com", "user@example.com") {
+		t.Error("user should be able to send from user@example.com")
+	}
+	if callCount != 1 {
+		t.Errorf("expected still 1 backend call (cached), got %d", callCount)
+	}
+
+	if !auth.CanSendAs("user@example.com", "alias@example.com") {
+		t.Error("user should be able to send from alias@example.com")
+	}
+	if callCount != 1 {
+		t.Errorf("expected still 1 backend call (cached), got %d", callCount)
+	}
+
+	// Admin removes alias from allowed_from on backend
+	allowedAddresses = []string{"user@example.com"}
+
+	// User tries to send from alias - STILL ALLOWED because cached allowed_from has it
+	// This is expected behavior: cache is valid for up to 5 minutes (credCacheTTL)
+	// To detect removal immediately, user needs to re-authenticate or cache needs to expire
+	if !auth.CanSendAs("user@example.com", "alias@example.com") {
+		t.Error("alias should still be in cache (not yet expired)")
+	}
+	if callCount != 1 {
+		t.Errorf("expected still 1 backend call (using cached allowed_from), got %d", callCount)
+	}
+
+	// User tries an address not in cache - triggers refetch, gets fresh allowed_from
+	if auth.CanSendAs("user@example.com", "notincache@example.com") {
+		t.Error("address not in list should be denied")
+	}
+	if callCount != 2 {
+		t.Errorf("expected 2 backend calls (refetch on unknown address), got %d", callCount)
+	}
+
+	// Now cache has fresh data (without alias) - verify alias is denied
+	if auth.CanSendAs("user@example.com", "alias@example.com") {
+		t.Error("alias should now be denied (fresh cache without it)")
+	}
+	if callCount != 3 {
+		t.Errorf("expected 3 backend calls (refetch again since alias not in fresh cache), got %d", callCount)
+	}
+
+	// User can still send from primary address
+	if !auth.CanSendAs("user@example.com", "user@example.com") {
+		t.Error("user should still be able to send from user@example.com")
+	}
+	if callCount != 3 {
+		t.Errorf("expected still 3 backend calls (cached), got %d", callCount)
+	}
+
+	// Admin adds new alias
+	allowedAddresses = []string{"user@example.com", "newalias@example.com"}
+
+	// User tries new alias - should be denied from cache, then refetch and allow
+	if !auth.CanSendAs("user@example.com", "newalias@example.com") {
+		t.Error("user should be able to send from newalias@example.com after it was added")
+	}
+	if callCount != 4 {
+		t.Errorf("expected 4 backend calls (refetch on CanSendAs failure), got %d", callCount)
+	}
+
+	// Verify new alias works from cache now
+	if !auth.CanSendAs("user@example.com", "newalias@example.com") {
+		t.Error("new alias should work from cache")
+	}
+	if callCount != 4 {
+		t.Errorf("expected still 4 backend calls (cached), got %d", callCount)
 	}
 }
 

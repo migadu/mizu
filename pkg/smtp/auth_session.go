@@ -127,7 +127,13 @@ func (s *Session) Auth(mech string) (sasl.Server, error) {
 
 		if err != nil {
 			s.Logger.Error("Authentication error", "username", user, "error", err)
-			return fmt.Errorf("authentication service error")
+			// Return a temporary failure error that SASL can understand
+			// The SASL library will convert this to appropriate SMTP response
+			return &smtp.SMTPError{
+				Code:         454,
+				EnhancedCode: smtp.EnhancedCode{4, 7, 0},
+				Message:      "temporary authentication failure: please try again later",
+			}
 		}
 
 		if !authenticated {
