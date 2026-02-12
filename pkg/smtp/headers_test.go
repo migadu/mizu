@@ -207,7 +207,8 @@ func TestBuildAuthenticationSummary(t *testing.T) {
 				DKIMAligned: true,
 			},
 			arc: &validation.ARCResult{
-				Pass: true,
+				Pass:     true,
+				Instance: 1, // Must have Instance > 0 for ARC to be evaluated
 			},
 			expectedStr: "spf=pass dkim=pass dmarc=pass arc=pass",
 		},
@@ -221,7 +222,8 @@ func TestBuildAuthenticationSummary(t *testing.T) {
 				DKIMAligned: false,
 			},
 			arc: &validation.ARCResult{
-				Pass: false,
+				Pass:     false,
+				Instance: 1, // Must have Instance > 0 for ARC to be evaluated
 			},
 			expectedStr: "spf=fail dkim=fail dmarc=fail arc=fail",
 		},
@@ -256,6 +258,16 @@ func TestBuildAuthenticationSummary(t *testing.T) {
 	}
 }
 
+// Helper function to check if a slice contains a string
+func contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
+		}
+	}
+	return false
+}
+
 func TestFixMissingHeaders_BothMissing(t *testing.T) {
 	// Email missing both Date and Message-ID
 	email := "From: sender@example.com\r\n" +
@@ -264,7 +276,18 @@ func TestFixMissingHeaders_BothMissing(t *testing.T) {
 		"\r\n" +
 		"Body content\r\n"
 
-	fixed := fixMissingHeaders(email, "mail.example.com")
+	fixed, added := fixMissingHeaders(email, "mail.example.com")
+
+	// Should report both headers were added
+	if len(added) != 2 {
+		t.Errorf("Expected 2 headers added, got %d: %v", len(added), added)
+	}
+	if !contains(added, "Date") {
+		t.Error("Expected 'Date' in added headers list")
+	}
+	if !contains(added, "Message-ID") {
+		t.Error("Expected 'Message-ID' in added headers list")
+	}
 
 	// Should add Date header
 	if !strings.Contains(fixed, "Date:") {
@@ -295,7 +318,12 @@ func TestFixMissingHeaders_OnlyDateMissing(t *testing.T) {
 		"\r\n" +
 		"Body\r\n"
 
-	fixed := fixMissingHeaders(email, "mail.example.com")
+	fixed, added := fixMissingHeaders(email, "mail.example.com")
+
+	// Should report only Date was added
+	if len(added) != 1 || added[0] != "Date" {
+		t.Errorf("Expected [Date], got %v", added)
+	}
 
 	// Should add Date
 	if !strings.Contains(fixed, "Date:") {
@@ -322,7 +350,12 @@ func TestFixMissingHeaders_OnlyMessageIDMissing(t *testing.T) {
 		"\r\n" +
 		"Body\r\n"
 
-	fixed := fixMissingHeaders(email, "mail.example.com")
+	fixed, added := fixMissingHeaders(email, "mail.example.com")
+
+	// Should report only Message-ID was added
+	if len(added) != 1 || added[0] != "Message-ID" {
+		t.Errorf("Expected [Message-ID], got %v", added)
+	}
 
 	// Should add Message-ID
 	if !strings.Contains(fixed, "Message-ID:") {
@@ -350,7 +383,12 @@ func TestFixMissingHeaders_NothingMissing(t *testing.T) {
 		"\r\n" +
 		"Body\r\n"
 
-	fixed := fixMissingHeaders(email, "mail.example.com")
+	fixed, added := fixMissingHeaders(email, "mail.example.com")
+
+	// Should report nothing was added
+	if len(added) != 0 {
+		t.Errorf("Expected no headers added, got %v", added)
+	}
 
 	// Should be unchanged
 	if fixed != email {
@@ -367,7 +405,12 @@ func TestFixMissingHeaders_CaseInsensitive(t *testing.T) {
 		"\r\n" +
 		"Body\r\n"
 
-	fixed := fixMissingHeaders(email, "mail.example.com")
+	fixed, added := fixMissingHeaders(email, "mail.example.com")
+
+	// Should detect lowercase headers and not add duplicates
+	if len(added) != 0 {
+		t.Errorf("Expected no headers added (case-insensitive detection), got %v", added)
+	}
 
 	// Should be unchanged (lowercase headers should be detected)
 	if fixed != email {

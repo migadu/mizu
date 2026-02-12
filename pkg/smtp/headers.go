@@ -195,7 +195,8 @@ func modifySubject(rawEmail, pattern string) string {
 
 // fixMissingHeaders adds missing Message-ID and Date headers if they don't exist
 // This is typically used for relay servers that accept mail from other systems
-func fixMissingHeaders(rawEmail, domain string) string {
+// Returns the modified email and a list of headers that were added
+func fixMissingHeaders(rawEmail, domain string) (string, []string) {
 	lines := strings.Split(rawEmail, "\r\n")
 	hasMessageID := false
 	hasDate := false
@@ -222,16 +223,18 @@ func fixMissingHeaders(rawEmail, domain string) string {
 
 	// If both headers exist, return unchanged
 	if hasMessageID && hasDate {
-		return rawEmail
+		return rawEmail, nil
 	}
 
 	// Build list of headers to add
 	var headersToAdd []string
+	var addedHeaders []string // Track what we added for logging
 
 	if !hasDate {
 		// RFC 5322 date format: "Mon, 02 Jan 2006 15:04:05 -0700"
 		timestamp := time.Now().Format(time.RFC1123Z)
 		headersToAdd = append(headersToAdd, "Date: "+timestamp)
+		addedHeaders = append(addedHeaders, "Date")
 	}
 
 	if !hasMessageID {
@@ -239,6 +242,7 @@ func fixMissingHeaders(rawEmail, domain string) string {
 		// Format: <uniqueID.timestamp@domain>
 		messageID := generateMessageID(domain)
 		headersToAdd = append(headersToAdd, "Message-ID: "+messageID)
+		addedHeaders = append(addedHeaders, "Message-ID")
 	}
 
 	// Insert headers before the empty line (or at the end if no empty line found)
@@ -255,7 +259,7 @@ func fixMissingHeaders(rawEmail, domain string) string {
 		result = append(result, lines[headerEndIndex:]...)
 	}
 
-	return strings.Join(result, "\r\n")
+	return strings.Join(result, "\r\n"), addedHeaders
 }
 
 // generateMessageID creates a unique Message-ID header value
