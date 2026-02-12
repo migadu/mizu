@@ -33,8 +33,6 @@ const (
 	eventHamDelivery
 )
 
-const eventChanBufferSize = 1000
-
 // Manager handles IP and domain reputation tracking
 type Manager struct {
 	enabled           bool
@@ -85,9 +83,14 @@ type event struct {
 }
 
 // NewManager creates a new stats manager
-func NewManager(enabled bool, retentionDuration time.Duration, hostname string, syncEnabled bool, syncInterval time.Duration, syncServers []string, maxIPEntries, maxDomainEntries int, logger *slog.Logger) *Manager {
+func NewManager(enabled bool, retentionDuration time.Duration, hostname string, syncEnabled bool, syncInterval time.Duration, syncServers []string, maxIPEntries, maxDomainEntries, bufferSize int, logger *slog.Logger) *Manager {
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+
+	// Default buffer size if not specified
+	if bufferSize <= 0 {
+		bufferSize = 100000
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -108,7 +111,7 @@ func NewManager(enabled bool, retentionDuration time.Duration, hostname string, 
 		lastSyncAttempt:   make(map[string]time.Time),
 		ctx:               ctx,
 		cancel:            cancel,
-		eventChan:         make(chan event, eventChanBufferSize),
+		eventChan:         make(chan event, bufferSize),
 	}
 }
 

@@ -52,7 +52,7 @@ func TestMultipleRecipients_DeliveryToBackend(t *testing.T) {
 		HTTPTimeoutSeconds: 5,
 	}
 
-	statsManager := stats.NewManager(false, 0, "test", false, 0, nil, 0, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	statsManager := stats.NewManager(false, 0, "test", false, 0, nil, 0, 0, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	defer statsManager.Stop()
 
 	httpClient := &http.Client{}
@@ -122,7 +122,7 @@ func TestMultipleRecipients_SingleRecipientStillWorks(t *testing.T) {
 		HTTPTimeoutSeconds: 5,
 	}
 
-	statsManager := stats.NewManager(false, 0, "test", false, 0, nil, 0, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	statsManager := stats.NewManager(false, 0, "test", false, 0, nil, 0, 0, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	defer statsManager.Stop()
 
 	httpClient := &http.Client{}
@@ -180,7 +180,7 @@ func TestMultipleRecipients_BackendFailureRejectsAll(t *testing.T) {
 		HTTPTimeoutSeconds: 5,
 	}
 
-	statsManager := stats.NewManager(false, 0, "test", false, 0, nil, 0, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	statsManager := stats.NewManager(false, 0, "test", false, 0, nil, 0, 0, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	defer statsManager.Stop()
 
 	httpClient := &http.Client{}

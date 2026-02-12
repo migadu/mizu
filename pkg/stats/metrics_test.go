@@ -12,7 +12,7 @@ import (
 // TestEventMetrics_ProcessedCounter verifies that processed events are counted
 func TestEventMetrics_ProcessedCounter(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	manager := NewManager(true, 24*time.Hour, "test-host", false, 0, nil, 0, 0, logger)
+	manager := NewManager(true, 24*time.Hour, "test-host", false, 0, nil, 0, 0, 0, logger)
 	manager.Start()
 	defer manager.Stop()
 
@@ -42,13 +42,14 @@ func TestEventMetrics_ProcessedCounter(t *testing.T) {
 // TestEventMetrics_DroppedCounter verifies that dropped events are counted
 func TestEventMetrics_DroppedCounter(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	manager := NewManager(true, 24*time.Hour, "test-host", false, 0, nil, 0, 0, logger)
+	manager := NewManager(true, 24*time.Hour, "test-host", false, 0, nil, 0, 0, 100, logger)
 
 	// Don't start the processing loop - this will cause channel to fill
 	// manager.Start() // Intentionally not started
 
-	// Fill the channel completely (1000 buffer)
-	for i := 0; i < eventChanBufferSize; i++ {
+	// Fill the channel completely (100 buffer for test)
+	bufferSize := cap(manager.eventChan)
+	for i := 0; i < bufferSize; i++ {
 		manager.RecordConnection("192.168.1.100", true)
 	}
 
@@ -70,7 +71,7 @@ func TestEventMetrics_DroppedCounter(t *testing.T) {
 // TestEventMetrics_HealthCheck verifies health check reports metrics
 func TestEventMetrics_HealthCheck(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	manager := NewManager(true, 24*time.Hour, "test-host", false, 0, nil, 0, 0, logger)
+	manager := NewManager(true, 24*time.Hour, "test-host", false, 0, nil, 0, 0, 0, logger)
 	manager.Start()
 	defer manager.Stop()
 
@@ -119,13 +120,14 @@ func TestEventMetrics_HealthCheck(t *testing.T) {
 // TestEventMetrics_HealthCheck_Degraded verifies degraded status when channel is full
 func TestEventMetrics_HealthCheck_Degraded(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	manager := NewManager(true, 24*time.Hour, "test-host", false, 0, nil, 0, 0, logger)
+	manager := NewManager(true, 24*time.Hour, "test-host", false, 0, nil, 0, 0, 1000, logger)
 
 	// Don't start processing - let channel fill up
 	// manager.Start()
 
 	// Fill channel to >80%
-	for i := 0; i < int(float64(eventChanBufferSize)*0.85); i++ {
+	bufferSize := cap(manager.eventChan)
+	for i := 0; i < int(float64(bufferSize)*0.85); i++ {
 		manager.RecordConnection("192.168.1.100", true)
 	}
 
@@ -150,13 +152,14 @@ func TestEventMetrics_HealthCheck_Degraded(t *testing.T) {
 // TestEventMetrics_HealthCheck_Unhealthy verifies unhealthy status when drop rate is high
 func TestEventMetrics_HealthCheck_Unhealthy(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	manager := NewManager(true, 24*time.Hour, "test-host", false, 0, nil, 0, 0, logger)
+	manager := NewManager(true, 24*time.Hour, "test-host", false, 0, nil, 0, 0, 1000, logger)
 
 	// Don't start processing - this will cause all events to either fill buffer or drop
 	// manager.Start()
 
 	// Fill channel completely
-	for i := 0; i < eventChanBufferSize; i++ {
+	bufferSize := cap(manager.eventChan)
+	for i := 0; i < bufferSize; i++ {
 		manager.RecordConnection("192.168.1.100", true)
 	}
 
@@ -194,12 +197,13 @@ func TestEventMetrics_HealthCheck_Unhealthy(t *testing.T) {
 // TestEventMetrics_ChannelUtilization verifies channel utilization calculation
 func TestEventMetrics_ChannelUtilization(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	manager := NewManager(true, 24*time.Hour, "test-host", false, 0, nil, 0, 0, logger)
+	manager := NewManager(true, 24*time.Hour, "test-host", false, 0, nil, 0, 0, 1000, logger)
 
 	// Don't start processing
 
 	// Fill half the channel
-	halfFull := eventChanBufferSize / 2
+	bufferSize := cap(manager.eventChan)
+	halfFull := bufferSize / 2
 	for i := 0; i < halfFull; i++ {
 		manager.RecordConnection("192.168.1.100", true)
 	}
@@ -225,7 +229,7 @@ func TestEventMetrics_ChannelUtilization(t *testing.T) {
 	}
 
 	chanCap := details["channel_capacity"].(int)
-	if chanCap != eventChanBufferSize {
-		t.Errorf("Expected channel capacity %d, got %d", eventChanBufferSize, chanCap)
+	if chanCap != bufferSize {
+		t.Errorf("Expected channel capacity %d, got %d", bufferSize, chanCap)
 	}
 }

@@ -14,7 +14,7 @@ func TestLRUEviction_IPs(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	// Create manager with limit of 10 IPs
-	m := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 10, 0, logger)
+	m := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 10, 0, 0, logger)
 	m.Start()
 	defer m.Stop()
 
@@ -63,7 +63,7 @@ func TestLRUEviction_Domains(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	// Create manager with limit of 5 domains
-	m := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 0, 5, logger)
+	m := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 0, 5, 0, logger)
 	m.Start()
 	defer m.Stop()
 
@@ -114,7 +114,7 @@ func TestLRUEviction_NoLimit(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	// Create manager with no limits (0 = unlimited)
-	m := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 0, 0, logger)
+	m := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 0, 0, 0, logger)
 	m.Start()
 	defer m.Stop()
 
@@ -145,7 +145,7 @@ func TestLRUEviction_UpdatesLastSeen(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	// Create manager with limit of 3 IPs
-	m := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 3, 0, logger)
+	m := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 3, 0, 0, logger)
 	m.Start()
 	defer m.Stop()
 
@@ -185,7 +185,7 @@ func TestLRUEviction_UpdatesLastSeen(t *testing.T) {
 
 func TestEvictLRUIPs_EmptyMap(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	m := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 10, 0, logger)
+	m := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 10, 0, 0, logger)
 
 	m.ipMu.Lock()
 	evicted := m.evictLRUIPs(5)
@@ -198,7 +198,7 @@ func TestEvictLRUIPs_EmptyMap(t *testing.T) {
 
 func TestEvictLRUDomains_NegativeCount(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	m := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 0, 10, logger)
+	m := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 0, 10, 0, logger)
 	m.Start()
 	defer m.Stop()
 
@@ -227,7 +227,7 @@ func TestLRUEviction_MixedActivity(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	// Create manager with limit of 5 IPs
-	m := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 5, 0, logger)
+	m := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 5, 0, 0, logger)
 	m.Start()
 	defer m.Stop()
 
@@ -272,7 +272,7 @@ func TestLRUEviction_ConcurrentUpdates(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	// Create manager with limit of 10 IPs
-	m := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 10, 0, logger)
+	m := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 10, 0, 0, logger)
 	m.Start()
 	defer m.Stop()
 
@@ -306,7 +306,7 @@ func TestLRUEviction_BothLimits(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	// Create manager with limits for both IPs and domains
-	m := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 5, 5, logger)
+	m := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 5, 5, 0, logger)
 	m.Start()
 	defer m.Stop()
 
@@ -348,7 +348,7 @@ func TestLRUEviction_ExactLimit(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	// Create manager with limit of 10 IPs
-	m := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 10, 0, logger)
+	m := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 10, 0, 0, logger)
 	m.Start()
 	defer m.Stop()
 
@@ -379,7 +379,7 @@ func TestLRUEviction_WithExpiredEntries(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	// Create manager with short retention (500ms) and limit of 5
-	m := NewManager(true, 500*time.Millisecond, "test", false, 1*time.Minute, nil, 5, 0, logger)
+	m := NewManager(true, 500*time.Millisecond, "test", false, 1*time.Minute, nil, 5, 0, 0, logger)
 	m.Start()
 	defer m.Stop()
 
@@ -423,7 +423,7 @@ func TestLRUEviction_LargeScale(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	// Create manager with limit of 100 IPs
-	m := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 100, 100, logger)
+	m := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 100, 100, 0, logger)
 	m.Start()
 	defer m.Stop()
 
@@ -463,7 +463,7 @@ func TestLRUEviction_ReputationPreserved(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	// Create manager with limit of 3 IPs
-	m := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 3, 0, logger)
+	m := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 3, 0, 0, logger)
 	m.Start()
 	defer m.Stop()
 

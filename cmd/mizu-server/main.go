@@ -37,6 +37,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	gosmtp "github.com/emersion/go-smtp"
+	"github.com/mileusna/spf"
 )
 
 // Version information, injected at build time
@@ -167,6 +168,8 @@ func main() {
 	dnsResolver, dnsCache := smtp.NewDNSResolver(cfg.DNS.Resolvers, dnsTimeout, dnsCacheTTL)
 	if len(cfg.DNS.Resolvers) > 0 {
 		logger.Info("Using custom DNS resolvers: " + strings.Join(cfg.DNS.Resolvers, ", "))
+		// Configure SPF library to use the same DNS server (it uses a global variable)
+		spf.DNSServer = cfg.DNS.Resolvers[0] // Use the first configured resolver
 	} else {
 		logger.Info("Using system default DNS resolver")
 	}
@@ -319,7 +322,7 @@ func handleCLIArgs() {
 func initStatsManager(cfg *config.Config, logger *slog.Logger) *stats.Manager {
 	if !cfg.Stats.Enabled {
 		logger.Info("Stats tracking disabled")
-		return stats.NewManager(false, 0, "", false, 0, nil, 0, 0, logger)
+		return stats.NewManager(false, 0, "", false, 0, nil, 0, 0, 0, logger)
 	}
 
 	// Stats sync still uses HTTP (not migrated to memberlist yet)
@@ -349,9 +352,9 @@ func initStatsManager(cfg *config.Config, logger *slog.Logger) *stats.Manager {
 
 	statsManager := stats.NewManager(true, time.Duration(cfg.Stats.RetentionSeconds)*time.Second, hostname,
 		cfg.Stats.SyncEnabled, time.Duration(cfg.Stats.SyncIntervalSeconds)*time.Second, syncServers,
-		cfg.Stats.MaxIPEntries, cfg.Stats.MaxDomainEntries, logger)
-	logger.Info(fmt.Sprintf("Stats tracking enabled with %v retention, max entries: IPs=%d, Domains=%d",
-		time.Duration(cfg.Stats.RetentionSeconds)*time.Second, cfg.Stats.MaxIPEntries, cfg.Stats.MaxDomainEntries))
+		cfg.Stats.MaxIPEntries, cfg.Stats.MaxDomainEntries, cfg.Stats.BufferSize, logger)
+	logger.Info(fmt.Sprintf("Stats tracking enabled with %v retention, max entries: IPs=%d, Domains=%d, Buffer=%d",
+		time.Duration(cfg.Stats.RetentionSeconds)*time.Second, cfg.Stats.MaxIPEntries, cfg.Stats.MaxDomainEntries, cfg.Stats.BufferSize))
 
 	if cfg.Stats.SyncEnabled {
 		logger.Info(fmt.Sprintf("Stats sync enabled with %v interval, syncing with %d servers",

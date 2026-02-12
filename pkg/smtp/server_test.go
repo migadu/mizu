@@ -38,7 +38,7 @@ func TestBackend_Configuration(t *testing.T) {
 	defaultCfg := config.DefaultConfig()
 	cfg := &defaultCfg
 	cfg.Local = true
-	statsMgr := stats.NewManager(true, 0, "test", false, 0, nil, 0, 0, logger)
+	statsMgr := stats.NewManager(true, 0, "test", false, 0, nil, 0, 0, 0, logger)
 
 	// Get first server config
 	if len(cfg.Servers) == 0 {

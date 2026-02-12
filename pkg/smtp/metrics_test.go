@@ -361,7 +361,7 @@ func TestBackend_NewSession_MetricsIncrement(t *testing.T) {
 		},
 	}
 
-	statsMgr := stats.NewManager(true, 0, "test", false, 0, nil, 0, 0, logger)
+	statsMgr := stats.NewManager(true, 0, "test", false, 0, nil, 0, 0, 0, logger)
 
 	var wg sync.WaitGroup
 	var count atomic.Int64

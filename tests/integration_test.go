@@ -28,6 +28,7 @@ func TestStatsIntegration(t *testing.T) {
 		nil,
 		0, // maxIPEntries (unlimited for test)
 		0, // maxDomainEntries (unlimited for test)
+		0, // bufferSize (use default)
 		logger,
 	)
 	statsMgr.Start()
@@ -139,6 +140,7 @@ func TestComponentsIntegration(t *testing.T) {
 		nil,
 		0, // maxIPEntries (unlimited for test)
 		0, // maxDomainEntries (unlimited for test)
+		0, // bufferSize (use default)
 		logger,
 	)
 	statsMgr.Start()

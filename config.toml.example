@@ -142,11 +142,12 @@ password = ""
 
 [stats]
 enabled = true
-retention_seconds = 86400
-sync_enabled = false
-sync_interval_seconds = 60
-max_ip_entries = 100000
-max_domain_entries = 50000
+retention_seconds = 86400          # How long to keep stats (24 hours)
+sync_enabled = false                # Enable cluster-wide stats sync via S3
+sync_interval_seconds = 60          # How often to sync stats (1 minute)
+max_ip_entries = 100000             # Maximum IP entries to track
+max_domain_entries = 50000          # Maximum domain entries to track
+buffer_size = 100000                # Event channel buffer size (increase if seeing "channel is full" warnings)
 
 [cluster]
 enabled = false

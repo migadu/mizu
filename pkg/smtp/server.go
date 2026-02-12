@@ -863,15 +863,25 @@ func (s *Session) Mail(from string, opts *smtp.MailOptions) error {
 			wg.Add(1)
 			concurrency.SafeGo(s.Logger, "spf-check", func() {
 				defer wg.Done()
-				res, err := validation.CheckSPF(context.Background(), ip, s.helo, from)
+				// Extract domain from email address for SPF lookup
+				// SPF library needs the domain to look up SPF records, not the HELO hostname
+				domain := from
+				if idx := strings.Index(from, "@"); idx != -1 {
+					domain = from[idx+1:]
+				}
+				// If no domain could be extracted (e.g., null sender <>), use HELO as fallback
+				if domain == "" || domain == from {
+					domain = s.helo
+				}
+				res, err := validation.CheckSPF(context.Background(), ip, domain, from)
 				if err != nil {
-					s.Logger.Info("SPF check error", "from", from, "error", err)
+					s.Logger.Info("SPF check error", "from", from, "domain", domain, "error", err)
 					if s.metrics != nil {
 						s.metrics.SMTPSPFChecks.WithLabelValues(s.serverName(), "error").Inc()
 					}
 				} else if res != nil {
 					resultStr := string(*res)
-					s.Logger.Info("SPF result", "from", from, "result", resultStr)
+					s.Logger.Info("SPF result", "from", from, "domain", domain, "result", resultStr)
 
 					// Record SPF check result in metrics
 					if s.metrics != nil {

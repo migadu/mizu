@@ -44,7 +44,7 @@ func TestMail_NullSenderRejection(t *testing.T) {
 					},
 				})
 			}
-			statsManager := stats.NewManager(false, 0, "test", false, 0, nil, 0, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			statsManager := stats.NewManager(false, 0, "test", false, 0, nil, 0, 0, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
 			cbConfig := poster.CircuitBreakerConfig{
 				Enabled:          true,
 				FailureThreshold: 5,
@@ -113,7 +113,7 @@ func TestMail_NullSenderPreventsBackscatter(t *testing.T) {
 			},
 		})
 	}
-	statsManager := stats.NewManager(false, 0, "test", false, 0, nil, 0, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	statsManager := stats.NewManager(false, 0, "test", false, 0, nil, 0, 0, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	defer statsManager.Stop()
 	cbConfig := poster.CircuitBreakerConfig{
 		Enabled:          true,

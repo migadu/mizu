@@ -46,7 +46,7 @@ func createTestBackend(t *testing.T) *Backend {
 		},
 	}
 
-	statsManager := stats.NewManager(false, 0, "", false, 0, nil, 0, 0, logger)
+	statsManager := stats.NewManager(false, 0, "", false, 0, nil, 0, 0, 0, logger)
 	// Use a unique metrics name to avoid duplicate registration
 	metricsInstance := metrics.New("test_" + generateTraceID())
 

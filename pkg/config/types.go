@@ -448,6 +448,7 @@ type StatsConfig struct {
 	SyncIntervalSeconds int  `toml:"sync_interval_seconds"` // How often to sync/export stats in seconds (default: 60)
 	MaxIPEntries        int  `toml:"max_ip_entries"`        // Maximum number of IP entries to track (0 = unlimited, default: 100000)
 	MaxDomainEntries    int  `toml:"max_domain_entries"`    // Maximum number of domain entries to track (0 = unlimited, default: 50000)
+	BufferSize          int  `toml:"buffer_size"`           // Event channel buffer size (default: 100000)
 }
 
 // DefaultConfig returns a Config with sensible default values
@@ -516,6 +517,7 @@ func DefaultConfig() Config {
 			SyncIntervalSeconds: 60,     // Default 1m (60s) sync interval
 			MaxIPEntries:        100000, // 100k IP entries
 			MaxDomainEntries:    50000,  // 50k domain entries
+			BufferSize:          100000, // 100k event buffer
 		},
 		Cluster: ClusterConfig{
 			Enabled:  false,

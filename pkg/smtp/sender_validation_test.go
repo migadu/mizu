@@ -61,7 +61,7 @@ func TestMail_SenderValidation_Accept(t *testing.T) {
 	}
 	cfg.Servers[0].SenderValidation.Enabled = true
 
-	statsManager := stats.NewManager(false, 0, "test", false, 0, nil, 0, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	statsManager := stats.NewManager(false, 0, "test", false, 0, nil, 0, 0, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	defer statsManager.Stop()
 
 	cbConfig := poster.CircuitBreakerConfig{
@@ -117,7 +117,7 @@ func TestMail_SenderValidation_Reject(t *testing.T) {
 	}
 	cfg.Servers[0].SenderValidation.Enabled = true
 
-	statsManager := stats.NewManager(false, 0, "test", false, 0, nil, 0, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	statsManager := stats.NewManager(false, 0, "test", false, 0, nil, 0, 0, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	defer statsManager.Stop()
 
 	cbConfig := poster.CircuitBreakerConfig{
@@ -187,7 +187,7 @@ func TestMail_SenderValidation_TemporaryFailure(t *testing.T) {
 	}
 	cfg.Servers[0].SenderValidation.Enabled = true
 
-	statsManager := stats.NewManager(false, 0, "test", false, 0, nil, 0, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	statsManager := stats.NewManager(false, 0, "test", false, 0, nil, 0, 0, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	defer statsManager.Stop()
 
 	cbConfig := poster.CircuitBreakerConfig{
@@ -253,7 +253,7 @@ func TestMail_SenderValidation_Disabled(t *testing.T) {
 	}
 	cfg.Servers[0].SenderValidation.Enabled = false
 
-	statsManager := stats.NewManager(false, 0, "test", false, 0, nil, 0, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	statsManager := stats.NewManager(false, 0, "test", false, 0, nil, 0, 0, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	defer statsManager.Stop()
 
 	cbConfig := poster.CircuitBreakerConfig{
@@ -344,7 +344,7 @@ func TestMail_SenderValidation_Integration(t *testing.T) {
 			})
 		}
 
-		statsManager := stats.NewManager(false, 0, "test", false, 0, nil, 0, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		statsManager := stats.NewManager(false, 0, "test", false, 0, nil, 0, 0, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
 		defer statsManager.Stop()
 
 		cbConfig := poster.CircuitBreakerConfig{
@@ -395,7 +395,7 @@ func TestMail_SenderValidation_Integration(t *testing.T) {
 			})
 		}
 
-		statsManager := stats.NewManager(false, 0, "test", false, 0, nil, 0, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		statsManager := stats.NewManager(false, 0, "test", false, 0, nil, 0, 0, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
 		defer statsManager.Stop()
 
 		cbConfig := poster.CircuitBreakerConfig{

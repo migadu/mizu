@@ -14,7 +14,7 @@ func TestMergeIPEntry(t *testing.T) {
 
 	// --- Test Case 1: Merging into an empty manager (new entry) ---
 	t.Run("New IP Entry", func(t *testing.T) {
-		manager := NewManager(true, 24*time.Hour, "test-host", false, 0, nil, 0, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		manager := NewManager(true, 24*time.Hour, "test-host", false, 0, nil, 0, 0, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
 		remoteIP := "1.1.1.1"
 		remoteEntry := &IPExport{
 			FirstSeen:   now.Add(-1 * time.Hour),
@@ -45,7 +45,7 @@ func TestMergeIPEntry(t *testing.T) {
 
 	// --- Test Case 2: Merging an existing entry ---
 	t.Run("Existing IP Entry", func(t *testing.T) {
-		manager := NewManager(true, 24*time.Hour, "test-host", false, 0, nil, 0, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		manager := NewManager(true, 24*time.Hour, "test-host", false, 0, nil, 0, 0, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
 		ip := "2.2.2.2"
 
 		// Setup initial local entry
@@ -101,7 +101,7 @@ func TestMergeDomainEntry(t *testing.T) {
 
 	// --- Test Case 1: New domain entry ---
 	t.Run("New Domain Entry", func(t *testing.T) {
-		manager := NewManager(true, 24*time.Hour, "test-host", false, 0, nil, 0, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		manager := NewManager(true, 24*time.Hour, "test-host", false, 0, nil, 0, 0, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
 		domain := "newdomain.com"
 		remoteEntry := &DomainExport{
 			FirstSeen: now.Add(-1 * time.Hour),
@@ -124,7 +124,7 @@ func TestMergeDomainEntry(t *testing.T) {
 
 	// --- Test Case 2: Existing domain entry ---
 	t.Run("Existing Domain Entry", func(t *testing.T) {
-		manager := NewManager(true, 24*time.Hour, "test-host", false, 0, nil, 0, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		manager := NewManager(true, 24*time.Hour, "test-host", false, 0, nil, 0, 0, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
 		domain := "existing.com"
 
 		manager.domains[domain] = &DomainEntry{

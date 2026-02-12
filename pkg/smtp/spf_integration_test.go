@@ -24,7 +24,7 @@ func TestSPFEvaluation_WithPortInRemoteAddr(t *testing.T) {
 		from:         "Alexandre.Bellerive@gg.ca",
 		serverConfig: &config.ServerConfig{Name: "test", Type: "relay", SPFCheck: true},
 		globalConfig: &config.Config{Local: false},
-		statsManager: stats.NewManager(true, 0, "test", false, 0, nil, 0, 0, logger),
+		statsManager: stats.NewManager(true, 0, "test", false, 0, nil, 0, 0, 0, logger),
 		Logger:       logger,
 		senderDomain: "gg.ca",
 	}
@@ -136,7 +136,7 @@ func TestSessionRemoteAddr_NeverHasPort(t *testing.T) {
 				remoteAddr:   remoteAddr, // Must use cleaned variable, not c.Conn().RemoteAddr().String()
 				serverConfig: &config.ServerConfig{Name: "test", Type: "relay", SPFCheck: true},
 				globalConfig: &config.Config{Local: false},
-				statsManager: stats.NewManager(true, 0, "test", false, 0, nil, 0, 0, logger),
+				statsManager: stats.NewManager(true, 0, "test", false, 0, nil, 0, 0, 0, logger),
 				Logger:       logger,
 			}
 

@@ -57,7 +57,7 @@ func TestCircuitBreakerIntegration_OpenReturns451(t *testing.T) {
 		HTTPTimeoutSeconds: 5,
 	}
 
-	statsManager := stats.NewManager(false, 0, "test", false, 0, nil, 0, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	statsManager := stats.NewManager(false, 0, "test", false, 0, nil, 0, 0, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	defer statsManager.Stop()
 
 	// Step 1: Make 3 failed delivery attempts to open the circuit
@@ -233,7 +233,7 @@ func TestCircuitBreakerIntegration_PermanentFailureReturns550(t *testing.T) {
 		HTTPTimeoutSeconds: 5,
 	}
 
-	statsManager := stats.NewManager(false, 0, "test", false, 0, nil, 0, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	statsManager := stats.NewManager(false, 0, "test", false, 0, nil, 0, 0, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	defer statsManager.Stop()
 
 	session := &Session{
@@ -312,7 +312,7 @@ func TestCircuitBreakerIntegration_4xxErrorsDoNotTriggerCircuit(t *testing.T) {
 		HTTPTimeoutSeconds: 5,
 	}
 
-	statsManager := stats.NewManager(false, 0, "test", false, 0, nil, 0, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	statsManager := stats.NewManager(false, 0, "test", false, 0, nil, 0, 0, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	defer statsManager.Stop()
 
 	session := &Session{

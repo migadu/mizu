@@ -19,7 +19,7 @@ func TestNewManager(t *testing.T) {
 	syncInterval := 1 * time.Minute
 	syncServers := []string{"server1", "server2"}
 
-	manager := NewManager(enabled, retention, hostname, syncEnabled, syncInterval, syncServers, 0, 0, logger)
+	manager := NewManager(enabled, retention, hostname, syncEnabled, syncInterval, syncServers, 0, 0, 0, logger)
 
 	if manager == nil {
 		t.Fatal("NewManager returned nil")
@@ -48,7 +48,7 @@ func TestNewManager(t *testing.T) {
 
 func TestManagerRecordConnection(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	manager := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 0, 0, logger)
+	manager := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 0, 0, 0, logger)
 	manager.Start()
 	defer manager.Stop()
 
@@ -105,7 +105,7 @@ func TestManagerRecordConnection(t *testing.T) {
 
 func TestManagerRecordMailFrom(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	manager := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 0, 0, logger)
+	manager := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 0, 0, 0, logger)
 	manager.Start()
 	defer manager.Stop()
 
@@ -146,7 +146,7 @@ func TestManagerRecordMailFrom(t *testing.T) {
 
 func TestManagerRecordInvalidRecipient(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	manager := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 0, 0, logger)
+	manager := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 0, 0, 0, logger)
 	manager.Start()
 	defer manager.Stop()
 
@@ -200,7 +200,7 @@ func TestManagerRecordInvalidRecipient(t *testing.T) {
 
 func TestManagerRecordSpoofingAttempt(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	manager := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 0, 0, logger)
+	manager := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 0, 0, 0, logger)
 	manager.Start()
 	defer manager.Stop()
 
@@ -244,7 +244,7 @@ func TestManagerRecordSpoofingAttempt(t *testing.T) {
 
 func TestManagerRecordDMARCFailure(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	manager := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 0, 0, logger)
+	manager := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 0, 0, 0, logger)
 	manager.Start()
 	defer manager.Stop()
 
@@ -288,7 +288,7 @@ func TestManagerRecordDMARCFailure(t *testing.T) {
 
 func TestManagerRecordJunkMessage(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	manager := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 0, 0, logger)
+	manager := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 0, 0, 0, logger)
 	manager.Start()
 	defer manager.Stop()
 
@@ -332,7 +332,7 @@ func TestManagerRecordJunkMessage(t *testing.T) {
 
 func TestManagerRecordHamDelivery(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	manager := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 0, 0, logger)
+	manager := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 0, 0, 0, logger)
 	manager.Start()
 	defer manager.Stop()
 
@@ -376,7 +376,7 @@ func TestManagerRecordHamDelivery(t *testing.T) {
 
 func TestManagerCheckIPReputation(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	manager := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 0, 0, logger)
+	manager := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 0, 0, 0, logger)
 	manager.Start()
 	defer manager.Stop()
 
@@ -408,7 +408,7 @@ func TestManagerCheckIPReputation(t *testing.T) {
 
 func TestManagerCheckDomainReputation(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	manager := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 0, 0, logger)
+	manager := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 0, 0, 0, logger)
 	manager.Start()
 	defer manager.Stop()
 
@@ -440,7 +440,7 @@ func TestManagerCheckDomainReputation(t *testing.T) {
 
 func TestManagerDisabled(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	manager := NewManager(false, 24*time.Hour, "test", false, 1*time.Minute, nil, 0, 0, logger)
+	manager := NewManager(false, 24*time.Hour, "test", false, 1*time.Minute, nil, 0, 0, 0, logger)
 	manager.Start()
 	defer manager.Stop()
 
@@ -557,7 +557,7 @@ func TestExtractDomainFromEmail(t *testing.T) {
 
 func TestManagerCleanup(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	manager := NewManager(true, 1*time.Hour, "test", false, 1*time.Minute, nil, 0, 0, logger)
+	manager := NewManager(true, 1*time.Hour, "test", false, 1*time.Minute, nil, 0, 0, 0, logger)
 	manager.Start()
 	defer manager.Stop()
 
