@@ -50,7 +50,7 @@ func (s *Session) Auth(mech string) (sasl.Server, error) {
 	// Update and check TLS state (skip in local mode)
 	s.updateTLSState()
 	if !s.globalConfig.Local && s.tlsState == nil {
-		s.Logger.Warn("AUTH attempted without TLS", "remote_addr", s.remoteAddr)
+		s.Logger.Warn("AUTH attempted without TLS", "remote_addr", s.remoteAddr, "remote_host", s.ptr)
 		return nil, &smtp.SMTPError{
 			Code:         538,
 			EnhancedCode: smtp.EnhancedCode{5, 7, 11},
