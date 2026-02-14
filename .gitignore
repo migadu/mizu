@@ -19,3 +19,4 @@ config.toml
 *.pem
 *.key
 test-config.toml
+mizu-server

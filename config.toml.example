@@ -88,8 +88,9 @@ shutdown_timeout_seconds = 60
 max_connections = 100
 
 [logging]
-level = "info"
-format = "console"
+level = "info"       # debug, info, warn, error
+format = "console"   # console (human-readable), json (structured)
+output = "syslog"    # stderr, stdout, syslog, or /path/to/file.log
 
 [dns]
 resolvers = []

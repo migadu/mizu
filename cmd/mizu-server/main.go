@@ -62,12 +62,7 @@ func main() {
 	}
 
 	// Setup logging
-	logFormat := cfg.Logging.Format
-	if logFormat == "" {
-		logFormat = "console" // Default to console format
-	}
-	verbose := cfg.Logging.Level == "debug"
-	logger, err := logging.Setup(logFormat, verbose)
+	logger, err := logging.NewLogger(cfg.Logging)
 	if err != nil {
 		log.Fatalf("Failed to setup logging: %v", err)
 	}

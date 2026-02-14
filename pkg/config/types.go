@@ -412,6 +412,7 @@ type BlacklistsConfig struct {
 type LoggingConfig struct {
 	Level  string `toml:"level"`  // Log level: debug, info, warn, error (default: info)
 	Format string `toml:"format"` // Output format: console (human-readable) or json (structured) (default: console)
+	Output string `toml:"output"` // Output destination: stderr, stdout, syslog, or /path/to/file.log (default: syslog)
 }
 
 // TLSConfig holds TLS/certificate configuration
@@ -529,6 +530,7 @@ func DefaultConfig() Config {
 		Logging: LoggingConfig{
 			Level:  "info",
 			Format: "console",
+			Output: "syslog",
 		},
 		Local: false,
 	}
