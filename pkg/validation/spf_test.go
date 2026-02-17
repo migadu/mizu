@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/emersion/go-msgauth/authres"
-	"github.com/mileusna/spf"
+	"github.com/migadu/spf"
 )
 
 func TestConvertSPFResult(t *testing.T) {
@@ -94,7 +94,7 @@ func TestCheckSPF_RealDNS(t *testing.T) {
 				t.Fatalf("Failed to parse IP: %s", tt.ip)
 			}
 
-			result, err := CheckSPF(context.Background(), ip, tt.domain, tt.sender)
+			result, err := CheckSPF(context.Background(), ip, tt.domain, tt.sender, net.DefaultResolver)
 			if err != nil {
 				t.Logf("SPF check returned error: %v (this may be expected)", err)
 			}

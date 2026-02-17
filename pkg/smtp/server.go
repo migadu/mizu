@@ -886,7 +886,7 @@ func (s *Session) Mail(from string, opts *smtp.MailOptions) error {
 				if domain == "" || domain == from {
 					domain = s.helo
 				}
-				res, err := validation.CheckSPF(context.Background(), ip, domain, from)
+				res, err := validation.CheckSPF(context.Background(), ip, domain, from, s.dnsResolver)
 				if err != nil {
 					s.Logger.Info("SPF check error", "from", from, "domain", domain, "error", err)
 					if s.metrics != nil {

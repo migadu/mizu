@@ -37,7 +37,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	gosmtp "github.com/emersion/go-smtp"
-	"github.com/mileusna/spf"
 )
 
 // Version information, injected at build time
@@ -163,8 +162,6 @@ func main() {
 	dnsResolver, dnsCache := smtp.NewDNSResolver(cfg.DNS.Resolvers, dnsTimeout, dnsCacheTTL)
 	if len(cfg.DNS.Resolvers) > 0 {
 		logger.Info("Using custom DNS resolvers: " + strings.Join(cfg.DNS.Resolvers, ", "))
-		// Configure SPF library to use the same DNS server (it uses a global variable)
-		spf.DNSServer = cfg.DNS.Resolvers[0] // Use the first configured resolver
 	} else {
 		logger.Info("Using system default DNS resolver")
 	}

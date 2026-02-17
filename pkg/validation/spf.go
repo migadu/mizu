@@ -5,17 +5,73 @@ import (
 	"net"
 
 	"github.com/emersion/go-msgauth/authres"
-	"github.com/mileusna/spf"
+	"github.com/migadu/spf"
 )
 
-// CheckSPF performs an SPF check for the given IP, HELO host, and sender.
-func CheckSPF(ctx context.Context, ip net.IP, heloHost, sender string) (*spf.Result, error) {
-	// The spf library uses its own context handling internally, so we don't pass ctx.
-	res := spf.CheckHost(ip, heloHost, sender, "")
+// spfResolver adapts a *net.Resolver to the spf.Resolver interface.
+type spfResolver struct {
+	r *net.Resolver
+}
+
+func (s *spfResolver) LookupTXT(ctx context.Context, domain string) ([]string, error) {
+	return s.r.LookupTXT(ctx, domain)
+}
+
+func (s *spfResolver) LookupMX(ctx context.Context, domain string) ([]string, error) {
+	mxs, err := s.r.LookupMX(ctx, domain)
+	if err != nil {
+		return nil, err
+	}
+	hosts := make([]string, len(mxs))
+	for i, mx := range mxs {
+		hosts[i] = mx.Host
+	}
+	return hosts, nil
+}
+
+func (s *spfResolver) LookupA(ctx context.Context, domain string) ([]net.IP, error) {
+	addrs, err := s.r.LookupHost(ctx, domain)
+	if err != nil {
+		return nil, err
+	}
+	var ips []net.IP
+	for _, a := range addrs {
+		if ip := net.ParseIP(a); ip != nil {
+			if ip.To4() != nil {
+				ips = append(ips, ip)
+			}
+		}
+	}
+	return ips, nil
+}
+
+func (s *spfResolver) LookupAAAA(ctx context.Context, domain string) ([]net.IP, error) {
+	addrs, err := s.r.LookupHost(ctx, domain)
+	if err != nil {
+		return nil, err
+	}
+	var ips []net.IP
+	for _, a := range addrs {
+		if ip := net.ParseIP(a); ip != nil {
+			if ip.To4() == nil {
+				ips = append(ips, ip)
+			}
+		}
+	}
+	return ips, nil
+}
+
+func (s *spfResolver) LookupPTR(ctx context.Context, ip net.IP) ([]string, error) {
+	return s.r.LookupAddr(ctx, ip.String())
+}
+
+// CheckSPF performs an SPF check using the provided DNS resolver.
+func CheckSPF(ctx context.Context, ip net.IP, heloHost, sender string, resolver *net.Resolver) (*spf.Result, error) {
+	res := spf.CheckHostWithResolver(ctx, ip, heloHost, sender, "", &spfResolver{r: resolver})
 	return &res, nil
 }
 
-// ConvertSPFResult converts a result from the mileusna/spf library to the
+// ConvertSPFResult converts a result from the migadu/spf library to the
 // standard authres.SPFResultValue used by the go-msgauth library.
 func ConvertSPFResult(res spf.Result) authres.ResultValue {
 	switch res {
