@@ -11,6 +11,7 @@ import (
 // It provides thread-safe operations for tracking and releasing connections.
 type ConnectionTracker struct {
 	mu                  sync.RWMutex
+	name                string         // Health checker name (empty = default "connection_tracker")
 	maxConnections      int            // Maximum total concurrent connections (0 = unlimited)
 	maxConnectionsPerIP int            // Maximum concurrent connections per IP (0 = unlimited)
 	totalConnections    int            // Current total number of connections
@@ -112,8 +113,16 @@ func (ct *ConnectionTracker) GetLimits() (maxTotal, maxPerIP int) {
 	return ct.maxConnections, ct.maxConnectionsPerIP
 }
 
+// SetName sets a custom health checker name (e.g. "connection_tracker:mx-primary").
+func (ct *ConnectionTracker) SetName(name string) {
+	ct.name = name
+}
+
 // Name returns the component name for health checks.
 func (ct *ConnectionTracker) Name() string {
+	if ct.name != "" {
+		return ct.name
+	}
 	return "connection_tracker"
 }
 

@@ -34,6 +34,7 @@ type ClusterManager interface {
 // DistributedTracker wraps ConnectionTracker with memberlist gossip and S3 sync capabilities
 type DistributedTracker struct {
 	local    *ConnectionTracker // Local connection tracking (fast path)
+	name     string             // Health checker name (empty = default)
 	hostname string             // This server's hostname
 	logger   *slog.Logger
 
@@ -852,8 +853,16 @@ func (dt *DistributedTracker) NotifyUpdate(node *memberlist.Node) {
 		"addr", node.Address())
 }
 
+// SetName sets a custom health checker name (e.g. "distributed_connections:mx-primary").
+func (dt *DistributedTracker) SetName(name string) {
+	dt.name = name
+}
+
 // Name returns the name of this health checker
 func (dt *DistributedTracker) Name() string {
+	if dt.name != "" {
+		return dt.name
+	}
 	return "distributed_connections"
 }
 

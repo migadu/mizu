@@ -161,7 +161,7 @@ type ComponentStatus struct {
 }
 
 func cmdHealth() {
-	resp, err := httpGet("/health")
+	resp, err := httpGetHealth("/health")
 	if err != nil {
 		fatal("Failed to get health status: %v", err)
 	}
@@ -390,7 +390,7 @@ func cmdStats() {
 }
 
 func cmdConnections() {
-	resp, err := httpGet("/health")
+	resp, err := httpGetHealth("/health")
 	if err != nil {
 		fatal("Failed to get health status: %v", err)
 	}
@@ -400,10 +400,12 @@ func cmdConnections() {
 		fatal("Failed to parse health response: %v", err)
 	}
 
-	// Find connection tracker components (connection_tracker or distributed_connections)
+	// Find connection tracker components (connection_tracker:* or distributed_connections:*)
 	found := false
 	for name, comp := range health.Components {
-		if name != "connection_tracker" && name != "distributed_connections" {
+		isDistributed := strings.HasPrefix(name, "distributed_connections")
+		isLocal := strings.HasPrefix(name, "connection_tracker")
+		if !isDistributed && !isLocal {
 			continue
 		}
 		found = true
@@ -413,10 +415,8 @@ func cmdConnections() {
 			continue
 		}
 
-		isDistributed := name == "distributed_connections"
-
-		fmt.Println("Connection Tracker (used for limiting)")
-		fmt.Println("======================================")
+		fmt.Printf("Connection Tracker: %s\n", name)
+		fmt.Println(strings.Repeat("=", len("Connection Tracker: ")+len(name)))
 		fmt.Println()
 
 		statusIcon := "✓"
@@ -519,7 +519,7 @@ func getFloat(m map[string]any, key string) float64 {
 }
 
 func cmdCerts() {
-	resp, err := httpGet("/health")
+	resp, err := httpGetHealth("/health")
 	if err != nil {
 		fatal("Failed to get health status: %v", err)
 	}
@@ -1077,7 +1077,19 @@ func handleTLSCache(ctx context.Context) {
 
 // HTTP helper functions
 
+// httpGet performs a GET request and requires HTTP 200.
 func httpGet(path string) ([]byte, error) {
+	return httpGetAccepting(path, http.StatusOK)
+}
+
+// httpGetHealth performs a GET request to the health endpoint,
+// accepting both HTTP 200 (healthy) and HTTP 503 (unhealthy) as valid responses.
+func httpGetHealth(path string) ([]byte, error) {
+	return httpGetAccepting(path, http.StatusOK, http.StatusServiceUnavailable)
+}
+
+// httpGetAccepting performs a GET request and accepts the specified status codes.
+func httpGetAccepting(path string, acceptedStatuses ...int) ([]byte, error) {
 	client := &http.Client{Timeout: timeout}
 	url := serverURL + path
 
@@ -1102,11 +1114,13 @@ func httpGet(path string) ([]byte, error) {
 		return nil, err
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+	for _, accepted := range acceptedStatuses {
+		if resp.StatusCode == accepted {
+			return body, nil
+		}
 	}
 
-	return body, nil
+	return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 }
 
 func httpPost(path string, data io.Reader) ([]byte, error) {

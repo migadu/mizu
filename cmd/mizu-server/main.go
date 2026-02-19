@@ -223,8 +223,10 @@ func main() {
 		// after the health server, so we use AddChecker to register them lazily)
 		if healthServer != nil {
 			if backend.DistTracker != nil {
+				backend.DistTracker.SetName("distributed_connections:" + serverCfg.Name)
 				healthServer.AddChecker(backend.DistTracker)
 			} else if backend.ConnTracker != nil {
+				backend.ConnTracker.SetName("connection_tracker:" + serverCfg.Name)
 				healthServer.AddChecker(backend.ConnTracker)
 			}
 		}
