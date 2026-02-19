@@ -635,10 +635,12 @@ func startHealthServer(cfg *config.Config, logger *slog.Logger, statsManager *st
 			}
 		}
 	}
-	// Check TLS certificates for all enabled servers
+	// Check TLS certificates only for servers with implicit TLS (e.g. port 465).
+	// STARTTLS ports (25, 587) cannot be checked with tls.Dial - they require
+	// a plaintext SMTP greeting followed by STARTTLS upgrade.
 	if !cfg.Local {
 		for _, srv := range cfg.Servers {
-			if srv.Hostname != "" && srv.Hostname != "mail.yourdomain.com" {
+			if srv.Hostname != "" && srv.Hostname != "mail.yourdomain.com" && srv.UsesImplicitTLS() {
 				_, portStr, err := net.SplitHostPort(srv.ListenAddr)
 				if err != nil {
 					logger.Warn("Could not parse listen address for health check",

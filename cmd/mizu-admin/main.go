@@ -178,11 +178,6 @@ func cmdHealth() {
 	}
 	fmt.Printf("%s Overall Status: %s\n\n", statusIcon, strings.ToUpper(health.Status))
 
-	// Print component details
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
-	fmt.Fprintln(w, "COMPONENT\tSTATUS\tDETAILS")
-	fmt.Fprintln(w, "─────────\t──────\t───────")
-
 	// Sort component names for consistent output
 	names := make([]string, 0, len(health.Components))
 	for name := range health.Components {
@@ -200,19 +195,28 @@ func cmdHealth() {
 			icon = "⚠"
 		}
 
-		details := ""
+		fmt.Printf("%s %s: %s\n", icon, name, comp.Status)
+
 		if comp.Details != nil {
-			detailsJSON, _ := json.MarshalIndent(comp.Details, "", "  ")
-			details = string(detailsJSON)
-			// Compact single-line details
-			if !strings.Contains(details, "\n") {
-				details = strings.TrimSpace(details)
+			if details, ok := comp.Details.(map[string]any); ok {
+				// Sort detail keys for consistent output
+				keys := make([]string, 0, len(details))
+				for k := range details {
+					keys = append(keys, k)
+				}
+				sort.Strings(keys)
+
+				for _, k := range keys {
+					v := details[k]
+					fmt.Printf("    %-28s %v\n", k+":", v)
+				}
+			} else {
+				// Fallback for non-map details
+				fmt.Printf("    %v\n", comp.Details)
 			}
 		}
-
-		fmt.Fprintf(w, "%s %s\t%s\t%s\n", icon, name, comp.Status, details)
+		fmt.Println()
 	}
-	w.Flush()
 }
 
 // Stats response structures
