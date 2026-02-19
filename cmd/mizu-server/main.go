@@ -143,6 +143,7 @@ func main() {
 	}
 
 	// Initialize and start health check server (before starting SMTP servers)
+	// Note: Connection trackers are registered later via AddChecker after server backends are created
 	healthServer := startHealthServer(cfg, logger, statsManager, nil, nil, s3Client)
 
 	// Set ACME handler on health server if autocert is enabled
@@ -217,6 +218,16 @@ func main() {
 			s3Client,
 			logger,
 		)
+
+		// Register connection tracker as health checker (trackers are created per-server,
+		// after the health server, so we use AddChecker to register them lazily)
+		if healthServer != nil {
+			if backend.DistTracker != nil {
+				healthServer.AddChecker(backend.DistTracker)
+			} else if backend.ConnTracker != nil {
+				healthServer.AddChecker(backend.ConnTracker)
+			}
+		}
 
 		// Create server-specific context
 		serverCtx, serverCancel := context.WithCancel(ctx)

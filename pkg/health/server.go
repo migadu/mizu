@@ -212,6 +212,13 @@ func (s *Server) basicAuthMiddlewareWithCredsHandler(next http.Handler, username
 	})
 }
 
+// AddChecker registers an additional health checker after the server is created.
+// This is useful when components (like per-server connection trackers) are created
+// after the health server has been initialized.
+func (s *Server) AddChecker(checker Checker) {
+	s.checkers = append(s.checkers, checker)
+}
+
 // RegisterHandler registers an additional HTTP handler
 func (s *Server) RegisterHandler(pattern string, handler http.HandlerFunc) {
 	if s.mux != nil {

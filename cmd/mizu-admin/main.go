@@ -82,6 +82,8 @@ func main() {
 		cmdBlockedIPs()
 	case "stats":
 		cmdStats()
+	case "connections":
+		cmdConnections()
 	case "certs":
 		cmdCerts()
 	case "tls":
@@ -109,6 +111,7 @@ Commands:
   health             Show overall health status and component details
   blocked-ips        Show blocked IP addresses and their reputation
   stats              Show message statistics (accepted/rejected/junk)
+  connections        Show connection tracker state used for limiting decisions
   certs              Show TLS certificate status and expiry (from health endpoint)
   tls                Manage TLS certificates (list, delete, clean, sync)
   renew-cert         Force certificate renewal (requires server support)
@@ -332,7 +335,7 @@ func cmdStats() {
 	fmt.Printf("Total IPs tracked:        %d\n", stats.Summary.TotalIPs)
 	fmt.Printf("Total domains tracked:    %d\n", stats.Summary.TotalDomains)
 	fmt.Printf("Blocked IPs:              %d\n", stats.Summary.BlockedIPs)
-	fmt.Printf("Active connections:       %d\n", stats.Summary.ActiveConnections)
+	fmt.Printf("Active connections (local): %d\n", stats.Summary.ActiveConnections)
 	fmt.Println()
 
 	fmt.Printf("Total messages:           %d\n", stats.Summary.TotalMessages)
@@ -384,6 +387,135 @@ func cmdStats() {
 		)
 	}
 	w.Flush()
+}
+
+func cmdConnections() {
+	resp, err := httpGet("/health")
+	if err != nil {
+		fatal("Failed to get health status: %v", err)
+	}
+
+	var health HealthResponse
+	if err := json.Unmarshal(resp, &health); err != nil {
+		fatal("Failed to parse health response: %v", err)
+	}
+
+	// Find connection tracker components (connection_tracker or distributed_connections)
+	found := false
+	for name, comp := range health.Components {
+		if name != "connection_tracker" && name != "distributed_connections" {
+			continue
+		}
+		found = true
+
+		details, ok := comp.Details.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		isDistributed := name == "distributed_connections"
+
+		fmt.Println("Connection Tracker (used for limiting)")
+		fmt.Println("======================================")
+		fmt.Println()
+
+		statusIcon := "✓"
+		switch comp.Status {
+		case "unhealthy":
+			statusIcon = "✗"
+		case "degraded":
+			statusIcon = "⚠"
+		}
+		fmt.Printf("Status:                   %s %s\n", statusIcon, strings.ToUpper(comp.Status))
+
+		if isDistributed {
+			fmt.Printf("Mode:                     distributed\n")
+			printDetailInt(details, "local_connections", "Local connections")
+			printDetailInt(details, "global_connections", "Global connections (limiter)")
+			printDetailInt(details, "unique_ips", "Unique IPs")
+			printDetailInt(details, "active_peers", "Active peers")
+			printDetailInt(details, "stale_peers", "Stale peers")
+			printDetailInt(details, "cluster_members", "Cluster members")
+		} else {
+			fmt.Printf("Mode:                     local\n")
+			printDetailInt(details, "total_connections", "Total connections (limiter)")
+			printDetailInt(details, "unique_ips", "Unique IPs")
+			printDetailInt(details, "max_total_connections", "Max total connections")
+			printDetailInt(details, "max_connections_per_ip", "Max connections per IP")
+			printDetailFloat(details, "total_utilization_percent", "Total utilization")
+			printDetailFloat(details, "per_ip_utilization_percent", "Busiest IP utilization")
+			if ip, ok := details["busiest_ip"].(string); ok && ip != "" {
+				conns := int(getFloat(details, "busiest_ip_connections"))
+				fmt.Printf("  Busiest IP:               %s (%d connections)\n", ip, conns)
+			}
+		}
+
+		// Show per-IP breakdown if available
+		if perIP, ok := details["per_ip"].(map[string]any); ok && len(perIP) > 0 {
+			fmt.Println()
+			fmt.Println("Per-IP Connections")
+			fmt.Println("──────────────────")
+			w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+			fmt.Fprintln(w, "IP ADDRESS\tCONNECTIONS")
+
+			type ipEntry struct {
+				ip    string
+				count int
+			}
+			entries := make([]ipEntry, 0, len(perIP))
+			for ip, count := range perIP {
+				entries = append(entries, ipEntry{ip, int(getFloat(map[string]any{ip: count}, ip))})
+			}
+			sort.Slice(entries, func(i, j int) bool {
+				return entries[i].count > entries[j].count
+			})
+			for _, e := range entries {
+				fmt.Fprintf(w, "%s\t%d\n", e.ip, e.count)
+			}
+			w.Flush()
+		}
+		fmt.Println()
+	}
+
+	if !found {
+		fmt.Println("No connection tracker data available")
+		fmt.Println("(Connection trackers may not be registered as health checkers)")
+		fmt.Println()
+		fmt.Println("Falling back to stats-based connection count:")
+
+		// Fall back to stats
+		statsResp, err := httpGet("/api/stats")
+		if err != nil {
+			fatal("Failed to get stats: %v", err)
+		}
+		var stats StatsResponse
+		if err := json.Unmarshal(statsResp, &stats); err != nil {
+			fatal("Failed to parse stats response: %v", err)
+		}
+		fmt.Printf("  Active connections (stats): %d\n", stats.Summary.ActiveConnections)
+		fmt.Println()
+		fmt.Println("Note: This count comes from the local ConnectionTracker but does NOT")
+		fmt.Println("include distributed peer counts used for cluster-wide limiting.")
+	}
+}
+
+func printDetailInt(details map[string]any, key, label string) {
+	if val, ok := details[key]; ok {
+		fmt.Printf("  %-25s %v\n", label+":", int(getFloat(map[string]any{key: val}, key)))
+	}
+}
+
+func printDetailFloat(details map[string]any, key, label string) {
+	if val := getFloat(details, key); val > 0 {
+		fmt.Printf("  %-25s %.1f%%\n", label+":", val)
+	}
+}
+
+func getFloat(m map[string]any, key string) float64 {
+	if v, ok := m[key].(float64); ok {
+		return v
+	}
+	return 0
 }
 
 func cmdCerts() {
