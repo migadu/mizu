@@ -380,6 +380,15 @@ func (m *Manager) handleEvent(e event) {
 			entry.IsDenied = true
 			entry.mu.Unlock()
 		}
+		// Track which server(s) saw this IP
+		if e.ServerName != "" {
+			entry.mu.Lock()
+			if entry.Servers == nil {
+				entry.Servers = make(map[string]struct{})
+			}
+			entry.Servers[e.ServerName] = struct{}{}
+			entry.mu.Unlock()
+		}
 	case eventMailFrom:
 		if e.Domain != "" {
 			entry := m.getOrCreateDomain(e.Domain)
@@ -623,6 +632,7 @@ func (m *Manager) getOrCreateIP(ip string) *IPEntry {
 	now := time.Now()
 	entry = &IPEntry{
 		FirstSeen: now,
+		Servers:   make(map[string]struct{}),
 		LastSeen:  now,
 	}
 	m.ips[ip] = entry

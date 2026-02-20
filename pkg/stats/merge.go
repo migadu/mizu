@@ -56,6 +56,16 @@ func (m *Manager) mergeIPEntry(ip string, remote *IPExport) int {
 		local.IsDenied = true
 	}
 
+	// Union server sets
+	if len(remote.Servers) > 0 {
+		if local.Servers == nil {
+			local.Servers = make(map[string]struct{})
+		}
+		for _, s := range remote.Servers {
+			local.Servers[s] = struct{}{}
+		}
+	}
+
 	return 1
 }
 

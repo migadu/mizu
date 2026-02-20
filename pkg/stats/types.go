@@ -27,10 +27,11 @@ const (
 type IPEntry struct {
 	FirstSeen   time.Time
 	LastSeen    time.Time
-	Connections int64 // Total connections from this IP
-	Positive    int64 // Ham messages delivered
-	Negative    int64 // Junk + failed recipients + spoofing + DMARC failures
-	IsDenied    bool  // Set true if no rDNS
+	Connections int64               // Total connections from this IP
+	Positive    int64               // Ham messages delivered
+	Negative    int64               // Junk + failed recipients + spoofing + DMARC failures
+	IsDenied    bool                // Set true if no rDNS
+	Servers     map[string]struct{} // Config server names that saw this IP
 	mu          sync.RWMutex
 }
 
@@ -285,6 +286,7 @@ type IPExport struct {
 	Positive    int64     `json:"positive"`
 	Negative    int64     `json:"negative"`
 	IsDenied    bool      `json:"is_denied"`
+	Servers     []string  `json:"servers,omitempty"`
 }
 
 // DomainExport is the JSON-serializable version of DomainEntry
@@ -321,6 +323,11 @@ func (e *IPEntry) ToExport() *IPExport {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
+	var servers []string
+	for s := range e.Servers {
+		servers = append(servers, s)
+	}
+
 	return &IPExport{
 		FirstSeen:   e.FirstSeen,
 		LastSeen:    e.LastSeen,
@@ -328,6 +335,7 @@ func (e *IPEntry) ToExport() *IPExport {
 		Positive:    e.Positive,
 		Negative:    e.Negative,
 		IsDenied:    e.IsDenied,
+		Servers:     servers,
 	}
 }
 
@@ -358,6 +366,12 @@ func (e *IPEntry) FromExport(export *IPExport) {
 	e.Positive = export.Positive
 	e.Negative = export.Negative
 	e.IsDenied = export.IsDenied
+	if len(export.Servers) > 0 {
+		e.Servers = make(map[string]struct{}, len(export.Servers))
+		for _, s := range export.Servers {
+			e.Servers[s] = struct{}{}
+		}
+	}
 }
 
 // FromExport updates DomainEntry from DomainExport (used in merging)

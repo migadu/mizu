@@ -234,6 +234,7 @@ type IPStats struct {
 	Negative    int64     `json:"negative"`
 	IsDenied    bool      `json:"is_denied"`
 	Reputation  float64   `json:"reputation"`
+	Servers     []string  `json:"servers,omitempty"`
 }
 
 type StatsSummary struct {
@@ -290,8 +291,8 @@ func cmdBlockedIPs() {
 	fmt.Printf("Blocked IP Addresses (%d total)\n\n", len(blockedIPs))
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
-	fmt.Fprintln(w, "IP ADDRESS\tREPUTATION\tCONNECTIONS\tPOSITIVE\tNEGATIVE\tLAST SEEN\tREASON")
-	fmt.Fprintln(w, "──────────\t──────────\t───────────\t────────\t────────\t─────────\t──────")
+	fmt.Fprintln(w, "IP ADDRESS\tREPUTATION\tCONNECTIONS\tPOSITIVE\tNEGATIVE\tLAST SEEN\tSERVER\tREASON")
+	fmt.Fprintln(w, "──────────\t──────────\t───────────\t────────\t────────\t─────────\t──────\t──────")
 
 	// Sort by reputation (worst first)
 	type ipEntry struct {
@@ -312,13 +313,19 @@ func cmdBlockedIPs() {
 			reason = "No rDNS"
 		}
 
-		fmt.Fprintf(w, "%s\t%.2f\t%d\t%d\t%d\t%s\t%s\n",
+		serverStr := strings.Join(entry.stats.Servers, ", ")
+		if serverStr == "" {
+			serverStr = "-"
+		}
+
+		fmt.Fprintf(w, "%s\t%.2f\t%d\t%d\t%d\t%s\t%s\t%s\n",
 			entry.ip,
 			entry.stats.Reputation,
 			entry.stats.Connections,
 			entry.stats.Positive,
 			entry.stats.Negative,
 			entry.stats.LastSeen.Format("2006-01-02 15:04"),
+			serverStr,
 			reason,
 		)
 	}
