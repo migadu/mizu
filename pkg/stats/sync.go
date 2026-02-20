@@ -113,6 +113,20 @@ func (m *Manager) syncFromServer(ctx context.Context, s3Client *s3.Client, bucke
 	// Merge the stats
 	merged := m.mergeStats(&remoteStats)
 
+	// Capture peer's per-server summary if available
+	if remoteStats.Summary != nil {
+		m.peerSummariesMu.Lock()
+		m.peerSummaries[serverHostname] = &ServerSummary{
+			Hostname:         serverHostname,
+			TotalMessages:    remoteStats.Summary.TotalMessages,
+			AcceptedMessages: remoteStats.Summary.AcceptedMessages,
+			RejectedMessages: remoteStats.Summary.RejectedMessages,
+			JunkMessages:     remoteStats.Summary.JunkMessages,
+			LastUpdated:      remoteStats.Timestamp,
+		}
+		m.peerSummariesMu.Unlock()
+	}
+
 	// Update last sync time
 	m.lastSyncMu.Lock()
 	m.lastSync[serverHostname] = *objInfo.LastModified

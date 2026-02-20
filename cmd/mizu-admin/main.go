@@ -221,9 +221,10 @@ func cmdHealth() {
 
 // Stats response structures
 type StatsResponse struct {
-	IPs     map[string]IPStats     `json:"ips"`
-	Domains map[string]DomainStats `json:"domains"`
-	Summary StatsSummary           `json:"summary"`
+	IPs     map[string]IPStats        `json:"ips"`
+	Domains map[string]DomainStats    `json:"domains"`
+	Summary StatsSummary              `json:"summary"`
+	Servers map[string]*ServerSummary `json:"servers,omitempty"`
 }
 
 type IPStats struct {
@@ -242,6 +243,8 @@ type DomainStats struct {
 	Messages   int64     `json:"messages"`
 	Positive   int64     `json:"positive"`
 	Negative   int64     `json:"negative"`
+	Junk       int64     `json:"junk"`
+	Rejected   int64     `json:"rejected"`
 	Reputation float64   `json:"reputation"`
 }
 
@@ -256,6 +259,15 @@ type StatsSummary struct {
 	JunkMessages      int64 `json:"junk_messages"`
 	EventsProcessed   int64 `json:"events_processed"`
 	EventsDropped     int64 `json:"events_dropped"`
+}
+
+type ServerSummary struct {
+	Hostname         string    `json:"hostname"`
+	TotalMessages    int64     `json:"total_messages"`
+	AcceptedMessages int64     `json:"accepted_messages"`
+	RejectedMessages int64     `json:"rejected_messages"`
+	JunkMessages     int64     `json:"junk_messages"`
+	LastUpdated      time.Time `json:"last_updated"`
 }
 
 func cmdBlockedIPs() {
@@ -331,8 +343,48 @@ func cmdStats() {
 		fatal("Failed to parse stats response: %v", err)
 	}
 
-	fmt.Println("Message Statistics")
-	fmt.Println("==================")
+	// Per-server breakdown (shown first if available)
+	if len(stats.Servers) > 0 {
+		// Sort server names for consistent output
+		serverNames := make([]string, 0, len(stats.Servers))
+		for name := range stats.Servers {
+			serverNames = append(serverNames, name)
+		}
+		sort.Strings(serverNames)
+
+		for _, name := range serverNames {
+			srv := stats.Servers[name]
+			fmt.Printf("Server: %s\n", name)
+			fmt.Println(strings.Repeat("─", len("Server: ")+len(name)))
+
+			fmt.Printf("  Total messages:           %d\n", srv.TotalMessages)
+			fmt.Printf("    Accepted (ham):         %d\n", srv.AcceptedMessages)
+			fmt.Printf("    Rejected:               %d\n", srv.RejectedMessages)
+			fmt.Printf("    Junk:                   %d\n", srv.JunkMessages)
+
+			if srv.TotalMessages > 0 {
+				resolved := srv.AcceptedMessages + srv.RejectedMessages + srv.JunkMessages
+				acceptRate := float64(srv.AcceptedMessages) / float64(srv.TotalMessages) * 100
+				rejectRate := float64(srv.RejectedMessages) / float64(srv.TotalMessages) * 100
+				junkRate := float64(srv.JunkMessages) / float64(srv.TotalMessages) * 100
+				pendingRate := float64(srv.TotalMessages-resolved) / float64(srv.TotalMessages) * 100
+				fmt.Printf("    Accept rate:            %.1f%%\n", acceptRate)
+				fmt.Printf("    Reject rate:            %.1f%%\n", rejectRate)
+				fmt.Printf("    Junk rate:              %.1f%%\n", junkRate)
+				if pendingRate > 0 {
+					fmt.Printf("    Pending/other:          %.1f%%\n", pendingRate)
+				}
+			}
+
+			if !srv.LastUpdated.IsZero() {
+				fmt.Printf("  Last updated:             %s\n", srv.LastUpdated.Format("2006-01-02 15:04:05"))
+			}
+			fmt.Println()
+		}
+	}
+
+	fmt.Println("Aggregate Statistics")
+	fmt.Println("====================")
 	fmt.Println()
 
 	// Summary
@@ -344,15 +396,30 @@ func cmdStats() {
 
 	fmt.Printf("Total messages:           %d\n", stats.Summary.TotalMessages)
 	fmt.Printf("  Accepted (ham):         %d\n", stats.Summary.AcceptedMessages)
-	fmt.Printf("  Rejected/Junk:          %d\n", stats.Summary.RejectedMessages)
-	fmt.Printf("  Marked as junk:         %d\n", stats.Summary.JunkMessages)
+	fmt.Printf("  Rejected:               %d\n", stats.Summary.RejectedMessages)
+	fmt.Printf("  Junk:                   %d\n", stats.Summary.JunkMessages)
+
+	if stats.Summary.TotalMessages > 0 {
+		resolved := stats.Summary.AcceptedMessages + stats.Summary.RejectedMessages + stats.Summary.JunkMessages
+		pending := stats.Summary.TotalMessages - resolved
+		if pending > 0 {
+			fmt.Printf("  Pending/other:          %d\n", pending)
+		}
+	}
 	fmt.Println()
 
 	if stats.Summary.TotalMessages > 0 {
+		resolved := stats.Summary.AcceptedMessages + stats.Summary.RejectedMessages + stats.Summary.JunkMessages
 		acceptRate := float64(stats.Summary.AcceptedMessages) / float64(stats.Summary.TotalMessages) * 100
 		rejectRate := float64(stats.Summary.RejectedMessages) / float64(stats.Summary.TotalMessages) * 100
+		junkRate := float64(stats.Summary.JunkMessages) / float64(stats.Summary.TotalMessages) * 100
+		pendingRate := float64(stats.Summary.TotalMessages-resolved) / float64(stats.Summary.TotalMessages) * 100
 		fmt.Printf("Accept rate:              %.1f%%\n", acceptRate)
 		fmt.Printf("Reject rate:              %.1f%%\n", rejectRate)
+		fmt.Printf("Junk rate:                %.1f%%\n", junkRate)
+		if pendingRate > 0 {
+			fmt.Printf("Pending/other:            %.1f%%\n", pendingRate)
+		}
 		fmt.Println()
 	}
 
@@ -364,7 +431,7 @@ func cmdStats() {
 	fmt.Println("Top 10 Domains by Message Volume")
 	fmt.Println("─────────────────────────────────")
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
-	fmt.Fprintln(w, "DOMAIN\tMESSAGES\tACCEPTED\tREJECTED\tREPUTATION")
+	fmt.Fprintln(w, "DOMAIN\tMESSAGES\tACCEPTED\tREJECTED\tJUNK\tREPUTATION")
 
 	type domainEntry struct {
 		domain string
@@ -382,11 +449,12 @@ func cmdStats() {
 		if i >= 10 {
 			break
 		}
-		fmt.Fprintf(w, "%s\t%d\t%d\t%d\t%.2f\n",
+		fmt.Fprintf(w, "%s\t%d\t%d\t%d\t%d\t%.2f\n",
 			entry.domain,
 			entry.stats.Messages,
 			entry.stats.Positive,
-			entry.stats.Negative,
+			entry.stats.Rejected,
+			entry.stats.Junk,
 			entry.stats.Reputation,
 		)
 	}

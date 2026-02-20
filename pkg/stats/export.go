@@ -94,6 +94,16 @@ func (m *Manager) createExport(hostname string) *StatsExport {
 	}
 	m.domainMu.RUnlock()
 
+	// Include local server message counts in export
+	m.localCountersMu.RLock()
+	export.Summary = &ExportSummary{
+		TotalMessages:    int64(m.localTotalMessages),
+		AcceptedMessages: int64(m.localAcceptedMessages),
+		RejectedMessages: int64(m.localRejectedMessages),
+		JunkMessages:     int64(m.localJunkMessages),
+	}
+	m.localCountersMu.RUnlock()
+
 	return export
 }
 

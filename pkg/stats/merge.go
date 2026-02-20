@@ -91,6 +91,8 @@ func (m *Manager) mergeDomainEntry(domain string, remote *DomainExport) int {
 	local.Messages += remote.Messages
 	local.Positive += remote.Positive
 	local.Negative += remote.Negative
+	local.Junk += remote.Junk
+	local.Rejected += remote.Rejected
 
 	return 1
 }

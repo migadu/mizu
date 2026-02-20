@@ -74,6 +74,17 @@ type Manager struct {
 	eventsDropped   uint64 // Total events dropped due to full channel
 	metricsMu       sync.RWMutex
 
+	// Local message counters (only this server's events, not merged from peers)
+	localTotalMessages    uint64
+	localAcceptedMessages uint64
+	localRejectedMessages uint64
+	localJunkMessages     uint64
+	localCountersMu       sync.RWMutex
+
+	// Per-server summaries collected during sync
+	peerSummaries   map[string]*ServerSummary
+	peerSummariesMu sync.RWMutex
+
 	// Connection trackers for active connection count
 	connTrackers   []ConnectionTracker
 	connTrackersMu sync.RWMutex
@@ -122,6 +133,7 @@ func NewManager(enabled bool, retentionDuration time.Duration, hostname string, 
 		cancel:            cancel,
 		eventChan:         make(chan event, bufferSize),
 		connTrackers:      make([]ConnectionTracker, 0),
+		peerSummaries:     make(map[string]*ServerSummary),
 	}
 }
 
@@ -237,17 +249,70 @@ func (m *Manager) handleEvent(e event) {
 		if e.Domain != "" {
 			entry := m.getOrCreateDomain(e.Domain)
 			entry.IncrementMessages()
+
+			// Track local message count
+			m.localCountersMu.Lock()
+			m.localTotalMessages++
+			m.localCountersMu.Unlock()
 		}
 	case eventInvalidRecipient:
 		m.applyNegativeWeight(e.IP, e.Domain, WeightInvalidRecipient)
+		// Track unweighted rejected count on domain
+		if e.Domain != "" {
+			domainEntry := m.getOrCreateDomain(e.Domain)
+			domainEntry.mu.Lock()
+			domainEntry.Rejected++
+			domainEntry.mu.Unlock()
+		}
+		// Track local rejected count
+		m.localCountersMu.Lock()
+		m.localRejectedMessages++
+		m.localCountersMu.Unlock()
 	case eventSpoofingAttempt:
 		m.applyNegativeWeight(e.IP, e.Domain, WeightSpoofingAttempt)
+		// Track unweighted rejected count on domain
+		if e.Domain != "" {
+			domainEntry := m.getOrCreateDomain(e.Domain)
+			domainEntry.mu.Lock()
+			domainEntry.Rejected++
+			domainEntry.mu.Unlock()
+		}
+		// Track local rejected count
+		m.localCountersMu.Lock()
+		m.localRejectedMessages++
+		m.localCountersMu.Unlock()
 	case eventDMARCFailure:
 		m.applyNegativeWeight(e.IP, e.Domain, WeightDMARCFailure)
+		// Track unweighted rejected count on domain
+		if e.Domain != "" {
+			domainEntry := m.getOrCreateDomain(e.Domain)
+			domainEntry.mu.Lock()
+			domainEntry.Rejected++
+			domainEntry.mu.Unlock()
+		}
+		// Track local rejected count
+		m.localCountersMu.Lock()
+		m.localRejectedMessages++
+		m.localCountersMu.Unlock()
 	case eventJunkMessage:
 		m.applyNegativeWeight(e.IP, e.Domain, WeightJunkMessage)
+		// Track unweighted junk count on domain
+		if e.Domain != "" {
+			domainEntry := m.getOrCreateDomain(e.Domain)
+			domainEntry.mu.Lock()
+			domainEntry.Junk++
+			domainEntry.mu.Unlock()
+		}
+		// Track local junk count
+		m.localCountersMu.Lock()
+		m.localJunkMessages++
+		m.localCountersMu.Unlock()
 	case eventHamDelivery:
 		m.applyPositiveWeight(e.IP, e.Domain, WeightHamDelivery)
+		// Track local accepted count
+		m.localCountersMu.Lock()
+		m.localAcceptedMessages++
+		m.localCountersMu.Unlock()
 	}
 }
 
@@ -643,12 +708,15 @@ func (m *Manager) GetStatsSnapshot() *StatsSnapshot {
 
 	m.domainMu.RLock()
 	domains := make(map[string]*DomainExport, len(m.domains))
-	var totalMessages, acceptedMessages, rejectedMessages int64
+	var totalMessages, acceptedMessages, rejectedMessages, junkMessages int64
 	for domain, entry := range m.domains {
 		domains[domain] = entry.ToExport()
+		entry.mu.RLock()
 		totalMessages += entry.Messages
-		acceptedMessages += entry.Positive
-		rejectedMessages += entry.Negative
+		acceptedMessages += entry.Positive // Positive tracks ham deliveries (weight=1)
+		rejectedMessages += entry.Rejected // Unweighted rejected count
+		junkMessages += entry.Junk         // Unweighted junk count
+		entry.mu.RUnlock()
 	}
 	m.domainMu.RUnlock()
 
@@ -666,6 +734,9 @@ func (m *Manager) GetStatsSnapshot() *StatsSnapshot {
 	}
 	m.connTrackersMu.RUnlock()
 
+	// Build per-server breakdown
+	servers := m.buildServerSummaries()
+
 	return &StatsSnapshot{
 		IPs:     ips,
 		Domains: domains,
@@ -677,10 +748,43 @@ func (m *Manager) GetStatsSnapshot() *StatsSnapshot {
 			TotalMessages:     totalMessages,
 			AcceptedMessages:  acceptedMessages,
 			RejectedMessages:  rejectedMessages,
+			JunkMessages:      junkMessages,
 			EventsProcessed:   int64(eventsProcessed),
 			EventsDropped:     int64(eventsDropped),
 		},
+		Servers: servers,
 	}
+}
+
+// buildServerSummaries returns per-server message statistics
+func (m *Manager) buildServerSummaries() map[string]*ServerSummary {
+	servers := make(map[string]*ServerSummary)
+
+	// Add local server summary
+	hostname := m.hostname
+	if hostname == "" {
+		hostname = "local"
+	}
+
+	m.localCountersMu.RLock()
+	servers[hostname] = &ServerSummary{
+		Hostname:         hostname,
+		TotalMessages:    int64(m.localTotalMessages),
+		AcceptedMessages: int64(m.localAcceptedMessages),
+		RejectedMessages: int64(m.localRejectedMessages),
+		JunkMessages:     int64(m.localJunkMessages),
+		LastUpdated:      time.Now(),
+	}
+	m.localCountersMu.RUnlock()
+
+	// Add peer summaries collected during sync
+	m.peerSummariesMu.RLock()
+	for hostname, summary := range m.peerSummaries {
+		servers[hostname] = summary
+	}
+	m.peerSummariesMu.RUnlock()
+
+	return servers
 }
 
 func (m *Manager) Name() string {

@@ -39,8 +39,10 @@ type DomainEntry struct {
 	FirstSeen time.Time
 	LastSeen  time.Time
 	Messages  int64 // Total messages from this domain
-	Positive  int64 // Ham messages
-	Negative  int64 // Junk + invalid recipients + DMARC failures
+	Positive  int64 // Ham messages (weighted, used for reputation)
+	Negative  int64 // Junk + invalid recipients + DMARC failures (weighted, used for reputation)
+	Junk      int64 // Actual junk message count (unweighted)
+	Rejected  int64 // Actual rejected message count (unweighted)
 	mu        sync.RWMutex
 }
 
@@ -292,6 +294,16 @@ type DomainExport struct {
 	Messages  int64     `json:"messages"`
 	Positive  int64     `json:"positive"`
 	Negative  int64     `json:"negative"`
+	Junk      int64     `json:"junk,omitempty"`     // Actual junk message count (unweighted)
+	Rejected  int64     `json:"rejected,omitempty"` // Actual rejected message count (unweighted)
+}
+
+// ExportSummary provides per-server message counts in exports
+type ExportSummary struct {
+	TotalMessages    int64 `json:"total_messages"`
+	AcceptedMessages int64 `json:"accepted_messages"`
+	RejectedMessages int64 `json:"rejected_messages"`
+	JunkMessages     int64 `json:"junk_messages"`
 }
 
 // StatsExport is the complete stats export structure
@@ -301,6 +313,7 @@ type StatsExport struct {
 	Timestamp time.Time                `json:"timestamp"`
 	IPs       map[string]*IPExport     `json:"ips"`
 	Domains   map[string]*DomainExport `json:"domains"`
+	Summary   *ExportSummary           `json:"summary,omitempty"` // Per-server message counts
 }
 
 // ToExport converts IPEntry to IPExport
@@ -329,6 +342,8 @@ func (e *DomainEntry) ToExport() *DomainExport {
 		Messages:  e.Messages,
 		Positive:  e.Positive,
 		Negative:  e.Negative,
+		Junk:      e.Junk,
+		Rejected:  e.Rejected,
 	}
 }
 
@@ -355,13 +370,26 @@ func (e *DomainEntry) FromExport(export *DomainExport) {
 	e.Messages = export.Messages
 	e.Positive = export.Positive
 	e.Negative = export.Negative
+	e.Junk = export.Junk
+	e.Rejected = export.Rejected
+}
+
+// ServerSummary provides per-server message statistics
+type ServerSummary struct {
+	Hostname         string    `json:"hostname"`
+	TotalMessages    int64     `json:"total_messages"`
+	AcceptedMessages int64     `json:"accepted_messages"`
+	RejectedMessages int64     `json:"rejected_messages"`
+	JunkMessages     int64     `json:"junk_messages"`
+	LastUpdated      time.Time `json:"last_updated"`
 }
 
 // StatsSnapshot is a complete snapshot of stats for API responses
 type StatsSnapshot struct {
-	IPs     map[string]*IPExport     `json:"ips"`
-	Domains map[string]*DomainExport `json:"domains"`
-	Summary StatsSummary             `json:"summary"`
+	IPs     map[string]*IPExport      `json:"ips"`
+	Domains map[string]*DomainExport  `json:"domains"`
+	Summary StatsSummary              `json:"summary"`
+	Servers map[string]*ServerSummary `json:"servers,omitempty"` // Per-server breakdown
 }
 
 // StatsSummary provides aggregated statistics
