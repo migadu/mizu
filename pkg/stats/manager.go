@@ -74,12 +74,9 @@ type Manager struct {
 	eventsDropped   uint64 // Total events dropped due to full channel
 	metricsMu       sync.RWMutex
 
-	// Local message counters (only this server's events, not merged from peers)
-	localTotalMessages    uint64
-	localAcceptedMessages uint64
-	localRejectedMessages uint64
-	localJunkMessages     uint64
-	localCountersMu       sync.RWMutex
+	// Per-config-server message counters (e.g., "mx-primary", "mx-submission")
+	srvCounters   map[string]*srvCounters
+	srvCountersMu sync.RWMutex
 
 	// Per-server summaries collected during sync
 	peerSummaries   map[string]*ServerSummary
@@ -90,6 +87,14 @@ type Manager struct {
 	connTrackersMu sync.RWMutex
 }
 
+// srvCounters tracks message counters for a single config server name
+type srvCounters struct {
+	total    uint64
+	accepted uint64
+	rejected uint64
+	junk     uint64
+}
+
 // ConnectionTracker interface for getting active connection stats
 type ConnectionTracker interface {
 	GetStats() (total int, uniqueIPs int, perIP map[string]int)
@@ -97,9 +102,95 @@ type ConnectionTracker interface {
 
 // event represents a statistical event to be processed
 type event struct {
-	Type   eventType
-	IP     string
-	Domain string
+	Type       eventType
+	IP         string
+	Domain     string
+	ServerName string // Config server name (e.g., "mx-primary", "mx-submission")
+}
+
+// ServerRecorder wraps a Manager with a server name for per-config-server tracking.
+// It has the same method signatures as Manager for Record* and Check* methods,
+// allowing it to be used as a drop-in replacement in the SMTP Backend/Session.
+type ServerRecorder struct {
+	manager    *Manager
+	serverName string
+}
+
+// NewServerRecorder creates a recorder that tags all events with the given server name.
+func NewServerRecorder(manager *Manager, serverName string) *ServerRecorder {
+	return &ServerRecorder{manager: manager, serverName: serverName}
+}
+
+// Manager returns the underlying stats manager (for registration, health checks, etc.)
+func (r *ServerRecorder) Manager() *Manager {
+	return r.manager
+}
+
+func (r *ServerRecorder) RecordConnection(ip string, hasRDNS bool) {
+	if r.manager == nil || !r.manager.enabled {
+		return
+	}
+	rdnsStatus := "yes"
+	if !hasRDNS {
+		rdnsStatus = "no"
+	}
+	r.manager.sendEvent(event{Type: eventConnection, IP: ip, Domain: rdnsStatus, ServerName: r.serverName})
+}
+
+func (r *ServerRecorder) RecordMailFrom(domain string) {
+	if r.manager == nil || !r.manager.enabled || domain == "" {
+		return
+	}
+	r.manager.sendEvent(event{Type: eventMailFrom, Domain: domain, ServerName: r.serverName})
+}
+
+func (r *ServerRecorder) RecordInvalidRecipient(ip, domain string) {
+	if r.manager == nil || !r.manager.enabled {
+		return
+	}
+	r.manager.sendEvent(event{Type: eventInvalidRecipient, IP: ip, Domain: domain, ServerName: r.serverName})
+}
+
+func (r *ServerRecorder) RecordSpoofingAttempt(ip, domain string) {
+	if r.manager == nil || !r.manager.enabled {
+		return
+	}
+	r.manager.sendEvent(event{Type: eventSpoofingAttempt, IP: ip, Domain: domain, ServerName: r.serverName})
+}
+
+func (r *ServerRecorder) RecordDMARCFailure(ip, domain string) {
+	if r.manager == nil || !r.manager.enabled {
+		return
+	}
+	r.manager.sendEvent(event{Type: eventDMARCFailure, IP: ip, Domain: domain, ServerName: r.serverName})
+}
+
+func (r *ServerRecorder) RecordJunkMessage(ip, domain string) {
+	if r.manager == nil || !r.manager.enabled {
+		return
+	}
+	r.manager.sendEvent(event{Type: eventJunkMessage, IP: ip, Domain: domain, ServerName: r.serverName})
+}
+
+func (r *ServerRecorder) RecordHamDelivery(ip, domain string) {
+	if r.manager == nil || !r.manager.enabled {
+		return
+	}
+	r.manager.sendEvent(event{Type: eventHamDelivery, IP: ip, Domain: domain, ServerName: r.serverName})
+}
+
+func (r *ServerRecorder) CheckIPReputation(ip string) (shouldDeny bool, reputation float64) {
+	if r.manager == nil {
+		return false, 0
+	}
+	return r.manager.CheckIPReputation(ip)
+}
+
+func (r *ServerRecorder) CheckDomainReputation(domain string) (shouldDeny bool, reputation float64) {
+	if r.manager == nil {
+		return false, 0
+	}
+	return r.manager.CheckDomainReputation(domain)
 }
 
 // NewManager creates a new stats manager
@@ -133,8 +224,23 @@ func NewManager(enabled bool, retentionDuration time.Duration, hostname string, 
 		cancel:            cancel,
 		eventChan:         make(chan event, bufferSize),
 		connTrackers:      make([]ConnectionTracker, 0),
+		srvCounters:       make(map[string]*srvCounters),
 		peerSummaries:     make(map[string]*ServerSummary),
 	}
+}
+
+// getOrCreateSrvCounters returns the counters for a server name, creating if needed.
+// Caller must hold srvCountersMu write lock.
+func (m *Manager) getOrCreateSrvCounters(name string) *srvCounters {
+	if name == "" {
+		name = "_default"
+	}
+	c, ok := m.srvCounters[name]
+	if !ok {
+		c = &srvCounters{}
+		m.srvCounters[name] = c
+	}
+	return c
 }
 
 // RegisterConnectionTracker adds a connection tracker to monitor active connections
@@ -250,10 +356,11 @@ func (m *Manager) handleEvent(e event) {
 			entry := m.getOrCreateDomain(e.Domain)
 			entry.IncrementMessages()
 
-			// Track local message count
-			m.localCountersMu.Lock()
-			m.localTotalMessages++
-			m.localCountersMu.Unlock()
+			// Track per-server message count
+			m.srvCountersMu.Lock()
+			c := m.getOrCreateSrvCounters(e.ServerName)
+			c.total++
+			m.srvCountersMu.Unlock()
 		}
 	case eventInvalidRecipient:
 		m.applyNegativeWeight(e.IP, e.Domain, WeightInvalidRecipient)
@@ -264,10 +371,10 @@ func (m *Manager) handleEvent(e event) {
 			domainEntry.Rejected++
 			domainEntry.mu.Unlock()
 		}
-		// Track local rejected count
-		m.localCountersMu.Lock()
-		m.localRejectedMessages++
-		m.localCountersMu.Unlock()
+		// Track per-server rejected count
+		m.srvCountersMu.Lock()
+		m.getOrCreateSrvCounters(e.ServerName).rejected++
+		m.srvCountersMu.Unlock()
 	case eventSpoofingAttempt:
 		m.applyNegativeWeight(e.IP, e.Domain, WeightSpoofingAttempt)
 		// Track unweighted rejected count on domain
@@ -277,10 +384,10 @@ func (m *Manager) handleEvent(e event) {
 			domainEntry.Rejected++
 			domainEntry.mu.Unlock()
 		}
-		// Track local rejected count
-		m.localCountersMu.Lock()
-		m.localRejectedMessages++
-		m.localCountersMu.Unlock()
+		// Track per-server rejected count
+		m.srvCountersMu.Lock()
+		m.getOrCreateSrvCounters(e.ServerName).rejected++
+		m.srvCountersMu.Unlock()
 	case eventDMARCFailure:
 		m.applyNegativeWeight(e.IP, e.Domain, WeightDMARCFailure)
 		// Track unweighted rejected count on domain
@@ -290,10 +397,10 @@ func (m *Manager) handleEvent(e event) {
 			domainEntry.Rejected++
 			domainEntry.mu.Unlock()
 		}
-		// Track local rejected count
-		m.localCountersMu.Lock()
-		m.localRejectedMessages++
-		m.localCountersMu.Unlock()
+		// Track per-server rejected count
+		m.srvCountersMu.Lock()
+		m.getOrCreateSrvCounters(e.ServerName).rejected++
+		m.srvCountersMu.Unlock()
 	case eventJunkMessage:
 		m.applyNegativeWeight(e.IP, e.Domain, WeightJunkMessage)
 		// Track unweighted junk count on domain
@@ -303,16 +410,16 @@ func (m *Manager) handleEvent(e event) {
 			domainEntry.Junk++
 			domainEntry.mu.Unlock()
 		}
-		// Track local junk count
-		m.localCountersMu.Lock()
-		m.localJunkMessages++
-		m.localCountersMu.Unlock()
+		// Track per-server junk count
+		m.srvCountersMu.Lock()
+		m.getOrCreateSrvCounters(e.ServerName).junk++
+		m.srvCountersMu.Unlock()
 	case eventHamDelivery:
 		m.applyPositiveWeight(e.IP, e.Domain, WeightHamDelivery)
-		// Track local accepted count
-		m.localCountersMu.Lock()
-		m.localAcceptedMessages++
-		m.localCountersMu.Unlock()
+		// Track per-server accepted count
+		m.srvCountersMu.Lock()
+		m.getOrCreateSrvCounters(e.ServerName).accepted++
+		m.srvCountersMu.Unlock()
 	}
 }
 
@@ -756,31 +863,28 @@ func (m *Manager) GetStatsSnapshot() *StatsSnapshot {
 	}
 }
 
-// buildServerSummaries returns per-server message statistics
+// buildServerSummaries returns per-config-server message statistics
 func (m *Manager) buildServerSummaries() map[string]*ServerSummary {
 	servers := make(map[string]*ServerSummary)
 
-	// Add local server summary
-	hostname := m.hostname
-	if hostname == "" {
-		hostname = "local"
+	// Add per-config-server summaries from local counters
+	m.srvCountersMu.RLock()
+	for name, c := range m.srvCounters {
+		servers[name] = &ServerSummary{
+			Hostname:         name,
+			TotalMessages:    int64(c.total),
+			AcceptedMessages: int64(c.accepted),
+			RejectedMessages: int64(c.rejected),
+			JunkMessages:     int64(c.junk),
+			LastUpdated:      time.Now(),
+		}
 	}
-
-	m.localCountersMu.RLock()
-	servers[hostname] = &ServerSummary{
-		Hostname:         hostname,
-		TotalMessages:    int64(m.localTotalMessages),
-		AcceptedMessages: int64(m.localAcceptedMessages),
-		RejectedMessages: int64(m.localRejectedMessages),
-		JunkMessages:     int64(m.localJunkMessages),
-		LastUpdated:      time.Now(),
-	}
-	m.localCountersMu.RUnlock()
+	m.srvCountersMu.RUnlock()
 
 	// Add peer summaries collected during sync
 	m.peerSummariesMu.RLock()
-	for hostname, summary := range m.peerSummaries {
-		servers[hostname] = summary
+	for name, summary := range m.peerSummaries {
+		servers[name] = summary
 	}
 	m.peerSummariesMu.RUnlock()
 

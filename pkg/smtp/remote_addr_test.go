@@ -158,7 +158,7 @@ func TestRemoteAddrConsistency(t *testing.T) {
 		remoteAddr:   "198.103.213.10", // Port already stripped by NewSession
 		serverConfig: &config.ServerConfig{Name: "test", Type: "relay"},
 		globalConfig: &config.Config{Local: true},
-		statsManager: stats.NewManager(true, 0, "test", false, 0, nil, 0, 0, 0, logger),
+		statsManager: stats.NewServerRecorder(stats.NewManager(true, 0, "test", false, 0, nil, 0, 0, 0, logger), "test"),
 		Logger:       logger,
 		ctx:          ctx,
 		cancel:       cancel,

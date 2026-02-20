@@ -205,11 +205,17 @@ func main() {
 			recipientValidator = initRecipientValidator(serverCfg, logger)
 		}
 
+		// Create per-server stats recorder (tags events with server name)
+		var serverRecorder *stats.ServerRecorder
+		if statsManager != nil {
+			serverRecorder = stats.NewServerRecorder(statsManager, serverCfg.Name)
+		}
+
 		// Create server-specific backend
 		backend := createServerBackend(
 			serverCfg,
 			cfg,
-			statsManager,
+			serverRecorder,
 			dnsResolver,
 			metricsInstance,
 			senderValidator,
@@ -729,7 +735,7 @@ func startStatsLoops(ctx context.Context, statsMgr *stats.Manager, s3Client *s3.
 func createServerBackend(
 	serverCfg *config.ServerConfig,
 	globalCfg *config.Config,
-	statsManager *stats.Manager,
+	statsRecorder *stats.ServerRecorder,
 	dnsResolver *net.Resolver,
 	metricsInstance *metrics.Metrics,
 	senderValidator smtp.SenderValidator,
@@ -748,8 +754,8 @@ func createServerBackend(
 	connTracker := smtp.NewConnectionTracker(serverCfg.Limits.MaxConnections, serverCfg.Limits.MaxConnectionsPerIP)
 
 	// Register connection tracker with stats manager for active connection monitoring
-	if statsManager != nil {
-		statsManager.RegisterConnectionTracker(connTracker)
+	if statsRecorder != nil {
+		statsRecorder.Manager().RegisterConnectionTracker(connTracker)
 	}
 
 	// Create distributed tracker if enabled for this server
@@ -897,7 +903,7 @@ func createServerBackend(
 	return &smtp.Backend{
 		ServerConfig:       serverCfg,
 		GlobalConfig:       globalCfg,
-		StatsManager:       statsManager,
+		StatsManager:       statsRecorder,
 		CircuitBreaker:     serverCircuitBreaker,
 		HTTPClient:         serverHTTPClient,
 		DNSResolver:        dnsResolver,

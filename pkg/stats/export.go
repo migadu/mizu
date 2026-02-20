@@ -94,15 +94,22 @@ func (m *Manager) createExport(hostname string) *StatsExport {
 	}
 	m.domainMu.RUnlock()
 
-	// Include local server message counts in export
-	m.localCountersMu.RLock()
-	export.Summary = &ExportSummary{
-		TotalMessages:    int64(m.localTotalMessages),
-		AcceptedMessages: int64(m.localAcceptedMessages),
-		RejectedMessages: int64(m.localRejectedMessages),
-		JunkMessages:     int64(m.localJunkMessages),
+	// Include aggregated local server message counts in export
+	m.srvCountersMu.RLock()
+	var totalMsg, acceptedMsg, rejectedMsg, junkMsg int64
+	for _, c := range m.srvCounters {
+		totalMsg += int64(c.total)
+		acceptedMsg += int64(c.accepted)
+		rejectedMsg += int64(c.rejected)
+		junkMsg += int64(c.junk)
 	}
-	m.localCountersMu.RUnlock()
+	export.Summary = &ExportSummary{
+		TotalMessages:    totalMsg,
+		AcceptedMessages: acceptedMsg,
+		RejectedMessages: rejectedMsg,
+		JunkMessages:     junkMsg,
+	}
+	m.srvCountersMu.RUnlock()
 
 	return export
 }

@@ -364,15 +364,16 @@ func cmdStats() {
 
 			if srv.TotalMessages > 0 {
 				resolved := srv.AcceptedMessages + srv.RejectedMessages + srv.JunkMessages
+				incomplete := srv.TotalMessages - resolved
 				acceptRate := float64(srv.AcceptedMessages) / float64(srv.TotalMessages) * 100
 				rejectRate := float64(srv.RejectedMessages) / float64(srv.TotalMessages) * 100
 				junkRate := float64(srv.JunkMessages) / float64(srv.TotalMessages) * 100
-				pendingRate := float64(srv.TotalMessages-resolved) / float64(srv.TotalMessages) * 100
 				fmt.Printf("    Accept rate:            %.1f%%\n", acceptRate)
 				fmt.Printf("    Reject rate:            %.1f%%\n", rejectRate)
 				fmt.Printf("    Junk rate:              %.1f%%\n", junkRate)
-				if pendingRate > 0 {
-					fmt.Printf("    Pending/other:          %.1f%%\n", pendingRate)
+				if incomplete > 0 {
+					incompleteRate := float64(incomplete) / float64(srv.TotalMessages) * 100
+					fmt.Printf("    Incomplete:             %d (%.1f%%)  # MAIL FROM received, no outcome\n", incomplete, incompleteRate)
 				}
 			}
 
@@ -401,24 +402,25 @@ func cmdStats() {
 
 	if stats.Summary.TotalMessages > 0 {
 		resolved := stats.Summary.AcceptedMessages + stats.Summary.RejectedMessages + stats.Summary.JunkMessages
-		pending := stats.Summary.TotalMessages - resolved
-		if pending > 0 {
-			fmt.Printf("  Pending/other:          %d\n", pending)
+		incomplete := stats.Summary.TotalMessages - resolved
+		if incomplete > 0 {
+			fmt.Printf("  Incomplete:             %d  # MAIL FROM received, no outcome\n", incomplete)
 		}
 	}
 	fmt.Println()
 
 	if stats.Summary.TotalMessages > 0 {
 		resolved := stats.Summary.AcceptedMessages + stats.Summary.RejectedMessages + stats.Summary.JunkMessages
+		incomplete := stats.Summary.TotalMessages - resolved
 		acceptRate := float64(stats.Summary.AcceptedMessages) / float64(stats.Summary.TotalMessages) * 100
 		rejectRate := float64(stats.Summary.RejectedMessages) / float64(stats.Summary.TotalMessages) * 100
 		junkRate := float64(stats.Summary.JunkMessages) / float64(stats.Summary.TotalMessages) * 100
-		pendingRate := float64(stats.Summary.TotalMessages-resolved) / float64(stats.Summary.TotalMessages) * 100
 		fmt.Printf("Accept rate:              %.1f%%\n", acceptRate)
 		fmt.Printf("Reject rate:              %.1f%%\n", rejectRate)
 		fmt.Printf("Junk rate:                %.1f%%\n", junkRate)
-		if pendingRate > 0 {
-			fmt.Printf("Pending/other:            %.1f%%\n", pendingRate)
+		if incomplete > 0 {
+			incompleteRate := float64(incomplete) / float64(stats.Summary.TotalMessages) * 100
+			fmt.Printf("Incomplete:               %.1f%%  # MAIL FROM received, no outcome\n", incompleteRate)
 		}
 		fmt.Println()
 	}

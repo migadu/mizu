@@ -51,7 +51,7 @@ func TestBackend_Configuration(t *testing.T) {
 	backend := &Backend{
 		ServerConfig: serverCfg,
 		GlobalConfig: cfg,
-		StatsManager: statsMgr,
+		StatsManager: stats.NewServerRecorder(statsMgr, "test"),
 		Logger:       logger,
 	}
 

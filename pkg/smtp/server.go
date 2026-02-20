@@ -98,7 +98,7 @@ type RecipientValidationResponse struct {
 type Backend struct {
 	ServerConfig   *config.ServerConfig   // Server-specific configuration (this server instance)
 	GlobalConfig   *config.Config         // Global configuration (shared across servers)
-	StatsManager   *stats.Manager         // IP and domain reputation tracking
+	StatsManager   *stats.ServerRecorder  // IP and domain reputation tracking (per-server)
 	CircuitBreaker *poster.CircuitBreaker // Circuit breaker for destination HTTP calls
 	HTTPClient     *net_http.Client       // HTTP client for posting emails to destination
 	Logger         *slog.Logger           // Structured logger for debugging and monitoring
@@ -541,7 +541,7 @@ type Session struct {
 	serverConfig   *config.ServerConfig   // Server-specific configuration (this server instance)
 	globalConfig   *config.Config         // Global configuration (shared across servers)
 	tlsState       *tls.ConnectionState   // TLS connection state (nil if not using TLS)
-	statsManager   *stats.Manager         // IP and domain reputation tracking
+	statsManager   *stats.ServerRecorder  // IP and domain reputation tracking (per-server)
 	circuitBreaker *poster.CircuitBreaker // Circuit breaker for HTTP destination
 	httpClient     *net_http.Client       // HTTP client for posting emails to destination
 	dnsResolver    *net.Resolver          // DNS resolver (custom or system default)

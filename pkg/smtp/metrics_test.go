@@ -369,7 +369,7 @@ func TestBackend_NewSession_MetricsIncrement(t *testing.T) {
 	backend := &Backend{
 		ServerConfig:       serverCfg,
 		GlobalConfig:       &cfg,
-		StatsManager:       statsMgr,
+		StatsManager:       stats.NewServerRecorder(statsMgr, "test"),
 		Metrics:            m,
 		Logger:             logger,
 		ActiveSessionsWg:   &wg,

@@ -58,7 +58,7 @@ func TestMail_NullSenderRejection(t *testing.T) {
 				helo:           "test.example.com", // Set HELO to pass that check
 				serverConfig:   &cfg.Servers[0],
 				globalConfig:   cfg,
-				statsManager:   statsManager,
+				statsManager:   stats.NewServerRecorder(statsManager, "test"),
 				circuitBreaker: cb,
 				Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
 				remoteAddr:     "192.0.2.1:12345",
@@ -128,7 +128,7 @@ func TestMail_NullSenderPreventsBackscatter(t *testing.T) {
 		helo:           "attacker.example.com",
 		serverConfig:   &cfg.Servers[0],
 		globalConfig:   cfg,
-		statsManager:   statsManager,
+		statsManager:   stats.NewServerRecorder(statsManager, "test"),
 		circuitBreaker: cb,
 		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
 		remoteAddr:     "198.51.100.1:54321",
