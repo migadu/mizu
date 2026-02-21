@@ -358,9 +358,6 @@ func cmdStats() {
 			fmt.Println(strings.Repeat("─", len("Server: ")+len(name)))
 
 			fmt.Printf("  Total messages:           %d\n", srv.TotalMessages)
-			fmt.Printf("    Accepted (ham):         %d\n", srv.AcceptedMessages)
-			fmt.Printf("    Rejected:               %d\n", srv.RejectedMessages)
-			fmt.Printf("    Junk:                   %d\n", srv.JunkMessages)
 
 			if srv.TotalMessages > 0 {
 				resolved := srv.AcceptedMessages + srv.RejectedMessages + srv.JunkMessages
@@ -368,13 +365,12 @@ func cmdStats() {
 				acceptRate := float64(srv.AcceptedMessages) / float64(srv.TotalMessages) * 100
 				rejectRate := float64(srv.RejectedMessages) / float64(srv.TotalMessages) * 100
 				junkRate := float64(srv.JunkMessages) / float64(srv.TotalMessages) * 100
-				fmt.Printf("    Accept rate:            %.1f%%\n", acceptRate)
-				fmt.Printf("    Reject rate:            %.1f%%\n", rejectRate)
-				fmt.Printf("    Junk rate:              %.1f%%\n", junkRate)
-				if incomplete > 0 {
-					incompleteRate := float64(incomplete) / float64(srv.TotalMessages) * 100
-					fmt.Printf("    Incomplete:             %d (%.1f%%) \n", incomplete, incompleteRate)
-				}
+				incompleteRate := float64(incomplete) / float64(srv.TotalMessages) * 100
+
+				fmt.Printf("    Accepted:               %d  %6.1f%%\n", srv.AcceptedMessages, acceptRate)
+				fmt.Printf("    Rejected:               %d  %6.1f%%\n", srv.RejectedMessages, rejectRate)
+				fmt.Printf("    Junk:                   %d  %6.1f%%\n", srv.JunkMessages, junkRate)
+				fmt.Printf("    Incomplete:             %d  %6.1f%%\n", incomplete, incompleteRate)
 			}
 
 			if !srv.LastUpdated.IsZero() {
