@@ -72,15 +72,15 @@ func TestMergeIPEntry(t *testing.T) {
 
 		localEntry := manager.ips[ip]
 
-		// Check summed values
-		if localEntry.Connections != 13 { // 5 + 8
-			t.Errorf("Expected connections to be 13, got %d", localEntry.Connections)
+		// Check max-wins values (prevents counter inflation across sync cycles)
+		if localEntry.Connections != 8 { // max(5, 8)
+			t.Errorf("Expected connections to be 8, got %d", localEntry.Connections)
 		}
-		if localEntry.Positive != 22 { // 10 + 12
-			t.Errorf("Expected positive to be 22, got %d", localEntry.Positive)
+		if localEntry.Positive != 12 { // max(10, 12)
+			t.Errorf("Expected positive to be 12, got %d", localEntry.Positive)
 		}
-		if localEntry.Negative != 7 { // 3 + 4
-			t.Errorf("Expected negative to be 7, got %d", localEntry.Negative)
+		if localEntry.Negative != 4 { // max(3, 4)
+			t.Errorf("Expected negative to be 4, got %d", localEntry.Negative)
 		}
 
 		// Check other fields
@@ -146,14 +146,15 @@ func TestMergeDomainEntry(t *testing.T) {
 		manager.mergeDomainEntry(domain, remoteEntry)
 		localEntry := manager.domains[domain]
 
-		if localEntry.Messages != 25 { // 10 + 15
-			t.Errorf("Expected messages to be 25, got %d", localEntry.Messages)
+		// Check max-wins values (prevents counter inflation across sync cycles)
+		if localEntry.Messages != 15 { // max(10, 15)
+			t.Errorf("Expected messages to be 15, got %d", localEntry.Messages)
 		}
-		if localEntry.Positive != 18 { // 8 + 10
-			t.Errorf("Expected positive to be 18, got %d", localEntry.Positive)
+		if localEntry.Positive != 10 { // max(8, 10)
+			t.Errorf("Expected positive to be 10, got %d", localEntry.Positive)
 		}
-		if localEntry.Negative != 7 { // 2 + 5
-			t.Errorf("Expected negative to be 7, got %d", localEntry.Negative)
+		if localEntry.Negative != 5 { // max(2, 5)
+			t.Errorf("Expected negative to be 5, got %d", localEntry.Negative)
 		}
 	})
 }

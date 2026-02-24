@@ -13,14 +13,14 @@ import (
 // This prevents head-of-line blocking in the Accept() loop by deferring the
 // expensive TLS handshake until the first Read/Write operation.
 type DeferredTLSConn struct {
-	tcpConn           net.Conn
-	tlsConfig         *tls.Config
-	logger            *slog.Logger
-	handshakeComplete bool
-	handshakeMutex    sync.Mutex
-	tlsConn           *tls.Conn
-	handshakeErr      error
-	handshakeTimeout  time.Duration
+	tcpConn          net.Conn
+	tlsConfig        *tls.Config
+	logger           *slog.Logger
+	handshakeOnce    sync.Once
+	handshakeMutex   sync.Mutex // Protects tlsConn for SetDeadline/Close before handshake
+	tlsConn          *tls.Conn
+	handshakeErr     error
+	handshakeTimeout time.Duration
 }
 
 // NewDeferredTLSConn creates a new deferred TLS connection wrapper.
@@ -34,18 +34,25 @@ func NewDeferredTLSConn(tcpConn net.Conn, tlsConfig *tls.Config, handshakeTimeou
 	}
 }
 
-// PerformHandshake performs the TLS handshake with timeout.
-// This method is idempotent - it will only perform the handshake once.
-func (c *DeferredTLSConn) PerformHandshake() error {
+// HandshakeComplete returns whether the TLS handshake has been performed.
+// This is safe to call concurrently from any goroutine.
+func (c *DeferredTLSConn) HandshakeComplete() bool {
 	c.handshakeMutex.Lock()
 	defer c.handshakeMutex.Unlock()
+	return c.tlsConn != nil || c.handshakeErr != nil
+}
 
-	// Idempotent - only perform once
-	if c.handshakeComplete {
-		return c.handshakeErr
-	}
-	c.handshakeComplete = true
+// PerformHandshake performs the TLS handshake with timeout.
+// This method is idempotent - it will only perform the handshake once via sync.Once.
+func (c *DeferredTLSConn) PerformHandshake() error {
+	c.handshakeOnce.Do(func() {
+		c.doHandshake()
+	})
+	return c.handshakeErr
+}
 
+// doHandshake performs the actual TLS handshake. Called exactly once via sync.Once.
+func (c *DeferredTLSConn) doHandshake() {
 	remoteAddr := c.tcpConn.RemoteAddr().String()
 	if c.logger != nil {
 		c.logger.Debug("Starting deferred TLS handshake", "remote_addr", remoteAddr)
@@ -55,33 +62,33 @@ func (c *DeferredTLSConn) PerformHandshake() error {
 	tlsConfig := c.tlsConfig.Clone()
 
 	// Create TLS connection over TCP connection
-	c.tlsConn = tls.Server(c.tcpConn, tlsConfig)
+	tlsConn := tls.Server(c.tcpConn, tlsConfig)
 
 	// Set handshake timeout
 	if c.handshakeTimeout > 0 {
 		deadline := time.Now().Add(c.handshakeTimeout)
-		if err := c.tlsConn.SetDeadline(deadline); err != nil {
+		if err := tlsConn.SetDeadline(deadline); err != nil {
 			c.handshakeErr = fmt.Errorf("failed to set handshake deadline: %w", err)
 			if c.logger != nil {
 				c.logger.Error("Failed to set TLS handshake deadline", "error", c.handshakeErr)
 			}
-			return c.handshakeErr
+			return
 		}
 	}
 
 	// Perform the handshake
 	startTime := time.Now()
-	if err := c.tlsConn.Handshake(); err != nil {
+	if err := tlsConn.Handshake(); err != nil {
 		c.handshakeErr = fmt.Errorf("TLS handshake failed: %w", err)
 		if c.logger != nil {
 			c.logger.Warn("TLS handshake failed", "remote_addr", remoteAddr, "error", err, "duration", time.Since(startTime))
 		}
-		return c.handshakeErr
+		return
 	}
 
 	// Clear deadline after successful handshake
 	if c.handshakeTimeout > 0 {
-		c.tlsConn.SetDeadline(time.Time{})
+		tlsConn.SetDeadline(time.Time{})
 	}
 
 	duration := time.Since(startTime)
@@ -89,11 +96,15 @@ func (c *DeferredTLSConn) PerformHandshake() error {
 		c.logger.Debug("TLS handshake completed successfully",
 			"remote_addr", remoteAddr,
 			"duration", duration,
-			"tls_version", tlsVersionString(c.tlsConn.ConnectionState().Version),
-			"cipher_suite", tls.CipherSuiteName(c.tlsConn.ConnectionState().CipherSuite))
+			"tls_version", tlsVersionString(tlsConn.ConnectionState().Version),
+			"cipher_suite", tls.CipherSuiteName(tlsConn.ConnectionState().CipherSuite))
 	}
 
-	return nil
+	// Store tlsConn only on success — readers of c.tlsConn can use it as
+	// an implicit "handshake succeeded" signal.
+	c.handshakeMutex.Lock()
+	c.tlsConn = tlsConn
+	c.handshakeMutex.Unlock()
 }
 
 // Read implements net.Conn.Read
@@ -180,14 +191,9 @@ func (c *DeferredTLSConn) ConnectionState() tls.ConnectionState {
 	return tls.ConnectionState{}
 }
 
-// ensureHandshake ensures the TLS handshake has been performed
+// ensureHandshake ensures the TLS handshake has been performed.
+// sync.Once provides both the fast path (already done) and slow path (first call).
 func (c *DeferredTLSConn) ensureHandshake() error {
-	// Fast path: handshake already done
-	if c.handshakeComplete {
-		return c.handshakeErr
-	}
-
-	// Slow path: need to perform handshake
 	return c.PerformHandshake()
 }
 

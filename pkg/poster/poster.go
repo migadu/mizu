@@ -13,11 +13,31 @@ import (
 	"log/slog"
 )
 
-// NewHTTPClient creates a new HTTP client with the specified timeout.
+// NewHTTPClient creates a new HTTP client with the specified timeout and connection pool settings.
 // The timeout controls the maximum time for the entire request/response cycle.
-func NewHTTPClient(timeout time.Duration) *http.Client {
+// maxIdleConnsPerHost controls how many idle connections to keep per backend host (0 = use default 100).
+// maxConnsPerHost limits total connections per host (0 = unlimited).
+// idleConnTimeout controls how long idle connections stay in the pool (0 = use default 90s).
+// These settings are critical for high-throughput relay scenarios — Go's default of 2 idle
+// connections per host is insufficient when posting many emails to a single backend.
+func NewHTTPClient(timeout time.Duration, maxIdleConnsPerHost, maxConnsPerHost int, idleConnTimeout time.Duration) *http.Client {
+	// Apply sensible defaults if not configured
+	if maxIdleConnsPerHost <= 0 {
+		maxIdleConnsPerHost = 100
+	}
+	if idleConnTimeout <= 0 {
+		idleConnTimeout = 90 * time.Second
+	}
+
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConns = maxIdleConnsPerHost * 2 // Total idle connections across all hosts
+	transport.MaxIdleConnsPerHost = maxIdleConnsPerHost
+	transport.MaxConnsPerHost = maxConnsPerHost // 0 = unlimited
+	transport.IdleConnTimeout = idleConnTimeout
+
 	return &http.Client{
-		Timeout: timeout,
+		Timeout:   timeout,
+		Transport: transport,
 	}
 }
 
@@ -185,20 +205,30 @@ func IsRetryableError(err error) bool {
 	}
 
 	// Check for specific network errors that are generally retryable.
-	// This is more robust than string matching.
 	var netErr net.Error
 	if errors.As(err, &netErr) {
-		if netErr.Timeout() || netErr.Temporary() {
+		// Timeouts are always retryable
+		if netErr.Timeout() {
 			return true
 		}
 
-		// A DNS lookup error can be temporary.
+		// DNS lookup errors can be temporary
 		var dnsErr *net.DNSError
 		if errors.As(err, &dnsErr) {
 			return true
 		}
 
-		return strings.Contains(err.Error(), "connection refused")
+		// Connection refused is retryable (server may come back up)
+		if strings.Contains(err.Error(), "connection refused") {
+			return true
+		}
+
+		// Connection reset / broken pipe are retryable
+		if strings.Contains(err.Error(), "connection reset") || strings.Contains(err.Error(), "broken pipe") {
+			return true
+		}
+
+		return false
 	}
 
 	// Default to non-retryable for unknown errors to avoid infinite retry loops on unexpected issues.

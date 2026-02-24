@@ -100,7 +100,7 @@ type ServerLimitsConfig struct {
 type ServerValidationConfig struct {
 	AllowNullSender      bool   `toml:"allow_null_sender"`      // Allow bounce messages with null sender (<>) - typically true for relay, false for submission
 	MissingHeadersAction string `toml:"missing_headers_action"` // Action for missing Message-ID/Date headers: "reject", "fix", "none" (default: "reject" for submission, "fix" for relay)
-	LoopDetection        bool   `toml:"loop_detection"`         // Enable mail loop detection by checking Received headers (default: true)
+	LoopDetection        *bool  `toml:"loop_detection"`         // Enable mail loop detection by checking Received headers (default: true, set to false to disable)
 	MaxHops              int    `toml:"max_hops"`               // Maximum number of hops (Received headers) before rejecting (default: 30, RFC 5321 recommends 100)
 }
 
@@ -260,6 +260,13 @@ func (s *ServerConfig) ApplyDefaults(defaults DefaultsConfig) {
 	if s.Limits.MaxConnections == 0 {
 		s.Limits.MaxConnections = defaults.MaxConnections
 	}
+
+	// Apply validation defaults
+	// LoopDetection defaults to true for safety (uses pointer to detect unset)
+	if s.Validation.LoopDetection == nil {
+		trueVal := true
+		s.Validation.LoopDetection = &trueVal
+	}
 }
 
 // RateLimitConfig holds rate limiting configuration
@@ -370,11 +377,14 @@ type RecipientValidationConfig struct {
 
 // DeliveryConfig holds configuration for the HTTP delivery endpoint
 type DeliveryConfig struct {
-	URL                string               `toml:"url"`
-	AuthToken          string               `toml:"auth_token"`
-	MaxRetryAttempts   int                  `toml:"max_retry_attempts"`
-	HTTPTimeoutSeconds int                  `toml:"http_timeout_seconds"` // HTTP client timeout in seconds (default: 30)
-	CircuitBreaker     CircuitBreakerConfig `toml:"circuit_breaker"`
+	URL                    string               `toml:"url"`
+	AuthToken              string               `toml:"auth_token"`
+	MaxRetryAttempts       int                  `toml:"max_retry_attempts"`
+	HTTPTimeoutSeconds     int                  `toml:"http_timeout_seconds"`      // HTTP client timeout in seconds (default: 30)
+	MaxIdleConnsPerHost    int                  `toml:"max_idle_conns_per_host"`   // Max idle connections per backend host (default: 100, Go default is only 2)
+	MaxConnsPerHost        int                  `toml:"max_conns_per_host"`        // Max total connections per backend host (default: 0 = unlimited)
+	IdleConnTimeoutSeconds int                  `toml:"idle_conn_timeout_seconds"` // How long idle connections stay in pool before closing (default: 90)
+	CircuitBreaker         CircuitBreakerConfig `toml:"circuit_breaker"`
 }
 
 // CircuitBreakerConfig holds configuration for the circuit breaker

@@ -42,13 +42,18 @@
 # cache_ttl_seconds = 300                           # Cache successful validations for 5 minutes
 # # Recipient Validation API contract (same as sender validation above)
 # [server.validation]
-# loop_detection = true                             # Enable mail loop detection (default: false) - prevents infinite loops by checking Received headers
+# loop_detection = true                             # Enable mail loop detection (default: true) - prevents infinite loops by checking Received headers
 # max_hops = 30                                     # Maximum hops before rejecting as loop (default: 30, RFC 5321 recommends 100)
 # allow_null_sender = true                          # Allow bounce messages with null sender <> (default: true for relay, false for submission)
 # missing_headers_action = "fix"                    # Action for missing Date/Message-ID: "reject", "fix", "none" (default: "reject" for submission, "fix" for relay)
 # [server.delivery]
 # url = "https://backend.example.com/incoming"
 # auth_token = "${DELIVERY_AUTH_TOKEN}"
+# max_retry_attempts = 3                                # Number of delivery attempts with exponential backoff (default: 3)
+# http_timeout_seconds = 30                             # HTTP client timeout per request (default: 30)
+# max_idle_conns_per_host = 100                         # Idle connections kept per backend host (default: 100, Go default is only 2)
+# max_conns_per_host = 0                                # Max total connections per host (default: 0 = unlimited, set to match backend capacity)
+# idle_conn_timeout_seconds = 90                        # How long idle connections stay in pool before closing (default: 90)
 #
 # [[server]]
 # name = "submission"
@@ -116,9 +121,11 @@ s3_region = "us-east-1"
 [tls]
 enabled = false
 provider = "file"
+
 [tls.file]
 cert_file = ""
 key_file = ""
+
 [tls.letsencrypt]
 email = "admin@example.com"
 domains = []

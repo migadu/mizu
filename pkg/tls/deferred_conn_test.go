@@ -90,7 +90,7 @@ func TestDeferredTLSConn(t *testing.T) {
 	}()
 
 	// Server side: handshake should NOT be performed yet
-	if deferredConn.handshakeComplete {
+	if deferredConn.HandshakeComplete() {
 		t.Error("Handshake should not be complete before first Read/Write")
 	}
 
@@ -102,7 +102,7 @@ func TestDeferredTLSConn(t *testing.T) {
 	}
 
 	// Verify handshake was performed
-	if !deferredConn.handshakeComplete {
+	if !deferredConn.HandshakeComplete() {
 		t.Error("Handshake should be complete after Read")
 	}
 

@@ -22,7 +22,7 @@ func TestPostEmailToDestinationWithContext_SuccessFirstAttempt(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(30 * time.Second)
+	client := NewHTTPClient(30*time.Second, 0, 0, 0)
 	err := PostEmailToDestinationWithContext(context.Background(), "test email", server.URL, "api-key", 3, false, "sender@example.com", []string{"recipient@example.com"}, "", "", nil, client, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	if err != nil {
@@ -47,7 +47,7 @@ func TestPostEmailToDestinationWithContext_SuccessAfterRetries(t *testing.T) {
 	defer server.Close()
 
 	// Use a custom HTTP client with a very short timeout to speed up the test
-	client := NewHTTPClient(100 * time.Millisecond)
+	client := NewHTTPClient(100*time.Millisecond, 0, 0, 0)
 
 	err := PostEmailToDestinationWithContext(context.Background(), "test email", server.URL, "api-key", 4, false, "sender@example.com", []string{"recipient@example.com"}, "", "", nil, client, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
@@ -69,7 +69,7 @@ func TestPostEmailToDestinationWithContext_FailureAllRetries(t *testing.T) {
 	defer server.Close()
 
 	// Use a custom HTTP client with a very short timeout to speed up the test
-	client := NewHTTPClient(100 * time.Millisecond)
+	client := NewHTTPClient(100*time.Millisecond, 0, 0, 0)
 
 	maxRetries := 3
 	err := PostEmailToDestinationWithContext(context.Background(), "test email", server.URL, "api-key", maxRetries, false, "", nil, "", "", nil, client, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -97,7 +97,7 @@ func TestPostEmailToDestinationWithContext_NonRetryableError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(30 * time.Second)
+	client := NewHTTPClient(30*time.Second, 0, 0, 0)
 	err := PostEmailToDestinationWithContext(context.Background(), "test email", server.URL, "api-key", 3, false, "", nil, "", "", nil, client, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	if err == nil {
@@ -126,7 +126,7 @@ func TestPostEmailToDestinationWithContext_ContextCancellation(t *testing.T) {
 	defer server.Close()
 
 	// Use a custom HTTP client with a very short timeout to speed up the test
-	client := NewHTTPClient(100 * time.Millisecond)
+	client := NewHTTPClient(100*time.Millisecond, 0, 0, 0)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -153,7 +153,7 @@ func TestPostEmailToDestinationWithContext_NetworkError(t *testing.T) {
 	server.Close() // This ensures requests will fail with a network error.
 
 	// Use a custom HTTP client with a very short timeout to speed up the test
-	client := NewHTTPClient(100 * time.Millisecond)
+	client := NewHTTPClient(100*time.Millisecond, 0, 0, 0)
 
 	maxRetries := 3
 	err := PostEmailToDestinationWithContext(context.Background(), "test email", url, "api-key", maxRetries, false, "", nil, "", "", nil, client, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -182,7 +182,7 @@ func TestPostEmailToDestinationWithContext_JunkHeader(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(30 * time.Second)
+	client := NewHTTPClient(30*time.Second, 0, 0, 0)
 	err := PostEmailToDestinationWithContext(context.Background(), "test email", server.URL, "api-key", 1, true, "", nil, "", "", nil, client, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("Expected no error, but got: %v", err)
@@ -202,7 +202,7 @@ func TestPostEmailToDestinationWithContext_EnvelopeHeaders(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(30 * time.Second)
+	client := NewHTTPClient(30*time.Second, 0, 0, 0)
 	err := PostEmailToDestinationWithContext(context.Background(), "test email", server.URL, "api-key", 1, false, "sender@example.com", []string{"recipient1@example.com", "recipient2@example.com"}, "", "", nil, client, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("Expected no error, but got: %v", err)
@@ -226,7 +226,7 @@ func TestPostEmailToDestinationWithContext_TraceIDHeader(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(30 * time.Second)
+	client := NewHTTPClient(30*time.Second, 0, 0, 0)
 	testTraceID := "abc123def456"
 	err := PostEmailToDestinationWithContext(context.Background(), "test email", server.URL, "api-key", 1, false, "", nil, testTraceID, "", nil, client, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {

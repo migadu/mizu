@@ -59,6 +59,10 @@ type Cluster struct {
 	// Leader election
 	leader    string
 	leaderMtx sync.RWMutex
+
+	// Lifecycle
+	done         chan struct{} // Closed on Shutdown to stop background goroutines
+	shutdownOnce sync.Once     // Ensures Shutdown runs exactly once
 }
 
 // Config holds configuration for creating a cluster
@@ -83,6 +87,7 @@ func NewCluster(cfg Config) (*Cluster, error) {
 		logger:        cfg.Logger,
 		stateDelegate: cfg.StateDelegate,
 		eventDelegate: cfg.EventDelegate,
+		done:          make(chan struct{}),
 	}
 
 	// Create memberlist configuration
@@ -163,8 +168,13 @@ func NewCluster(cfg Config) (*Cluster, error) {
 	concurrency.SafeGo(cfg.Logger, "cluster-leader-ticker", func() {
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
-		for range ticker.C {
-			cluster.updateLeader()
+		for {
+			select {
+			case <-cluster.done:
+				return
+			case <-ticker.C:
+				cluster.updateLeader()
+			}
 		}
 	})
 
@@ -279,12 +289,27 @@ func (c *Cluster) LocalNode() *memberlist.Node {
 	return c.ml.LocalNode()
 }
 
-// Shutdown gracefully shuts down the cluster
+// Shutdown gracefully shuts down the cluster.
+// It first stops background goroutines, then gracefully leaves the cluster
+// (notifying peers), and finally shuts down the memberlist transport.
+// This method is idempotent — calling it multiple times is safe.
 func (c *Cluster) Shutdown() error {
-	if c.ml != nil {
-		return c.ml.Shutdown()
-	}
-	return nil
+	var err error
+	c.shutdownOnce.Do(func() {
+		// Stop background goroutines (leader ticker)
+		close(c.done)
+
+		if c.ml != nil {
+			// Gracefully leave the cluster so peers get a departure notification
+			// instead of detecting this node as failed via failure detection.
+			// Use a 5-second timeout to avoid blocking shutdown indefinitely.
+			if leaveErr := c.ml.Leave(5 * time.Second); leaveErr != nil {
+				c.logger.Warn("Failed to gracefully leave cluster", "error", leaveErr)
+			}
+			err = c.ml.Shutdown()
+		}
+	})
+	return err
 }
 
 // --- Leader Election ---

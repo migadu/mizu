@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -548,7 +549,7 @@ func (m *Manager) evictLRUIPs(n int) int {
 		return 0
 	}
 
-	// Build a list of candidates for eviction (sorted by LastSeen)
+	// Build a list of candidates for eviction
 	type candidate struct {
 		ip       string
 		lastSeen time.Time
@@ -561,14 +562,10 @@ func (m *Manager) evictLRUIPs(n int) int {
 		entry.mu.RUnlock()
 	}
 
-	// Sort by LastSeen (oldest first)
-	for i := 0; i < len(candidates)-1; i++ {
-		for j := i + 1; j < len(candidates); j++ {
-			if candidates[i].lastSeen.After(candidates[j].lastSeen) {
-				candidates[i], candidates[j] = candidates[j], candidates[i]
-			}
-		}
-	}
+	// Sort by LastSeen (oldest first) using O(n log n) sort
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].lastSeen.Before(candidates[j].lastSeen)
+	})
 
 	// Evict the oldest n entries
 	evicted := 0
@@ -587,7 +584,7 @@ func (m *Manager) evictLRUDomains(n int) int {
 		return 0
 	}
 
-	// Build a list of candidates for eviction (sorted by LastSeen)
+	// Build a list of candidates for eviction
 	type candidate struct {
 		domain   string
 		lastSeen time.Time
@@ -600,14 +597,10 @@ func (m *Manager) evictLRUDomains(n int) int {
 		entry.mu.RUnlock()
 	}
 
-	// Sort by LastSeen (oldest first)
-	for i := 0; i < len(candidates)-1; i++ {
-		for j := i + 1; j < len(candidates); j++ {
-			if candidates[i].lastSeen.After(candidates[j].lastSeen) {
-				candidates[i], candidates[j] = candidates[j], candidates[i]
-			}
-		}
-	}
+	// Sort by LastSeen (oldest first) using O(n log n) sort
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].lastSeen.Before(candidates[j].lastSeen)
+	})
 
 	// Evict the oldest n entries
 	evicted := 0

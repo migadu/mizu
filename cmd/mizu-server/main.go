@@ -919,8 +919,16 @@ func createServerBackend(
 			"timeout_seconds", serverCfg.Delivery.CircuitBreaker.TimeoutSeconds)
 	}
 
-	serverHTTPClient := poster.NewHTTPClient(time.Duration(serverCfg.Delivery.HTTPTimeoutSeconds) * time.Second)
-	serverLogger.Info("HTTP client created", "timeout_seconds", serverCfg.Delivery.HTTPTimeoutSeconds)
+	serverHTTPClient := poster.NewHTTPClient(
+		time.Duration(serverCfg.Delivery.HTTPTimeoutSeconds)*time.Second,
+		serverCfg.Delivery.MaxIdleConnsPerHost,
+		serverCfg.Delivery.MaxConnsPerHost,
+		time.Duration(serverCfg.Delivery.IdleConnTimeoutSeconds)*time.Second,
+	)
+	serverLogger.Info("HTTP client created",
+		"timeout_seconds", serverCfg.Delivery.HTTPTimeoutSeconds,
+		"max_idle_conns_per_host", serverCfg.Delivery.MaxIdleConnsPerHost,
+		"max_conns_per_host", serverCfg.Delivery.MaxConnsPerHost)
 
 	// Create Backend
 	var activeSessionsWg sync.WaitGroup

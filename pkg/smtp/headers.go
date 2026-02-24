@@ -155,7 +155,10 @@ func modifySubject(rawEmail, pattern string) string {
 	var result []string
 	subjectModified := false
 
-	for i, line := range lines {
+	// Use index-based loop so we can properly advance past folded continuation lines.
+	// A range loop would revisit continuation lines even after incrementing i.
+	for i := 0; i < len(lines); i++ {
+		line := lines[i]
 		// Look for Subject header (case-insensitive)
 		if !subjectModified && len(line) >= 8 && strings.EqualFold(line[:8], "Subject:") {
 			// Extract original subject (everything after "Subject: ")

@@ -1233,7 +1233,7 @@ func (s *Session) handleLocalMode(rawEmail string) error {
 // It may mark the message as junk or return an SMTPError for a hard rejection.
 func (s *Session) performPreDeliveryChecks(rawEmail string) error {
 	// Mail loop detection (check before other validations to prevent wasting resources)
-	loopDetectionEnabled := s.serverConfig.Validation.LoopDetection
+	loopDetectionEnabled := s.serverConfig.Validation.LoopDetection != nil && *s.serverConfig.Validation.LoopDetection
 	if loopDetectionEnabled {
 		maxHops := s.serverConfig.Validation.MaxHops
 		if maxHops <= 0 {

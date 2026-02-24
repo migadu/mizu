@@ -57,7 +57,7 @@ func createTestBackend(t *testing.T) *Backend {
 		ServerConfig:       serverCfg,
 		GlobalConfig:       globalCfg,
 		StatsManager:       stats.NewServerRecorder(statsManager, "test"),
-		HTTPClient:         poster.NewHTTPClient(5 * time.Second),
+		HTTPClient:         poster.NewHTTPClient(5*time.Second, 0, 0, 0),
 		DNSResolver:        &net.Resolver{},
 		Metrics:            metricsInstance,
 		Logger:             logger,

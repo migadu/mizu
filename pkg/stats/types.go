@@ -91,7 +91,12 @@ func (e *IPEntry) IncrementConnections() {
 func (e *IPEntry) GetReputation() float64 {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
+	return e.getReputationLocked()
+}
 
+// getReputationLocked computes the reputation score without acquiring locks.
+// Caller must hold e.mu.RLock() or e.mu.Lock().
+func (e *IPEntry) getReputationLocked() float64 {
 	if e.Connections < MinDataThreshold {
 		return 0 // Neutral - not enough data
 	}
@@ -129,7 +134,8 @@ func (e *IPEntry) ShouldDeny() bool {
 	}
 
 	// Deny if reputation < -0.2
-	return e.GetReputation() < ReputationDenyThreshold
+	// Use lock-free internal method to avoid recursive RLock deadlock
+	return e.getReputationLocked() < ReputationDenyThreshold
 }
 
 // IsExpired checks if the entry is older than the retention duration
@@ -213,7 +219,12 @@ func (e *DomainEntry) IncrementMessages() {
 func (e *DomainEntry) GetReputation() float64 {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
+	return e.getReputationLocked()
+}
 
+// getReputationLocked computes the reputation score without acquiring locks.
+// Caller must hold e.mu.RLock() or e.mu.Lock().
+func (e *DomainEntry) getReputationLocked() float64 {
 	if e.Messages < MinDataThreshold {
 		return 0 // Neutral - not enough data
 	}
@@ -245,7 +256,8 @@ func (e *DomainEntry) ShouldDeny() bool {
 	}
 
 	// Deny if reputation < -0.2
-	return e.GetReputation() < ReputationDenyThreshold
+	// Use lock-free internal method to avoid recursive RLock deadlock
+	return e.getReputationLocked() < ReputationDenyThreshold
 }
 
 // IsExpired checks if the entry is older than the retention duration
