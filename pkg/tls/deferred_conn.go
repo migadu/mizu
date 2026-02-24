@@ -180,6 +180,13 @@ func (c *DeferredTLSConn) ConnectionState() tls.ConnectionState {
 	return tls.ConnectionState{}
 }
 
+// NetConn returns the underlying TCP connection before TLS wrapping.
+// This is used by go-smtp's STARTTLS handler to unwrap the deferred TLS
+// connection and avoid double-encrypting when upgrading to TLS in-band.
+func (c *DeferredTLSConn) NetConn() net.Conn {
+	return c.tcpConn
+}
+
 // ensureHandshake ensures the TLS handshake has been performed
 func (c *DeferredTLSConn) ensureHandshake() error {
 	// Fast path: handshake already done
