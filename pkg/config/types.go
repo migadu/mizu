@@ -7,18 +7,17 @@ import (
 
 // Config holds all configuration for the SMTP server(s)
 type Config struct {
-	Servers    []ServerConfig   `toml:"server"`   // Multiple SMTP server instances
-	Defaults   DefaultsConfig   `toml:"defaults"` // Default values for all servers
-	Logging    LoggingConfig    `toml:"logging"`  // Logging configuration
-	DNS        DNSConfig        `toml:"dns"`
-	Storage    StorageConfig    `toml:"storage"`
-	TLS        TLSConfig        `toml:"tls"`
-	Blacklists BlacklistsConfig `toml:"blacklists"`
-	Health     HealthConfig     `toml:"health"`
-	Metrics    MetricsConfig    `toml:"metrics"`
-	Stats      StatsConfig      `toml:"stats"`
-	Cluster    ClusterConfig    `toml:"cluster"` // Global cluster/peering configuration
-	Local      bool             `toml:"local"`   // Local development mode (disables TLS and validation)
+	Servers  []ServerConfig `toml:"server"`   // Multiple SMTP server instances
+	Defaults DefaultsConfig `toml:"defaults"` // Default values for all servers
+	Logging  LoggingConfig  `toml:"logging"`  // Logging configuration
+	DNS      DNSConfig      `toml:"dns"`
+	Storage  StorageConfig  `toml:"storage"`
+	TLS      TLSConfig      `toml:"tls"`
+	Health   HealthConfig   `toml:"health"`
+	Metrics  MetricsConfig  `toml:"metrics"`
+	Stats    StatsConfig    `toml:"stats"`
+	Cluster  ClusterConfig  `toml:"cluster"` // Global cluster/peering configuration
+	Local    bool           `toml:"local"`   // Local development mode (disables TLS and validation)
 }
 
 // DefaultsConfig provides default values that can be overridden per-server
@@ -65,14 +64,13 @@ type ServerConfig struct {
 	DMARCCheck            bool   `toml:"dmarc_check"`             // Enable DMARC validation
 	DMARCRejectAction     string `toml:"dmarc_reject_action"`     // Action for policy=reject: "none", "reject", "junk" (default: "reject")
 	DMARCQuarantineAction string `toml:"dmarc_quarantine_action"` // Action for policy=quarantine: "none", "reject", "junk" (default: "junk")
-	ReputationCheck       bool   `toml:"reputation_check"`        // Enable IP reputation checking (default: true for relay, false for submission)
 
 	// === Nested Configuration Sections ===
 	Validation ServerValidationConfig `toml:"validation"` // Message validation settings (applies to both relay and submission)
+	Reputation ServerReputationConfig `toml:"reputation"` // Reputation checking configuration
 	Auth       ServerAuthConfig       `toml:"auth"`       // Authentication configuration (use auth.required=true to require auth)
 	DNSChecks  ServerDNSChecksConfig  `toml:"dns_checks"` // DNS validation checks (rDNS, MX)
 	Junk       ServerJunkConfig       `toml:"junk"`       // Junk/spam detection configuration
-	DNSBL      ServerDNSBLConfig      `toml:"dnsbl"`      // DNS blacklist checking configuration
 
 	// === Rate Limiting (per-server) ===
 	RateLimit   RateLimitConfig         `toml:"rate_limit"`  // Rate limiting configuration
@@ -102,6 +100,25 @@ type ServerValidationConfig struct {
 	MissingHeadersAction string `toml:"missing_headers_action"` // Action for missing Message-ID/Date headers: "reject", "fix", "none" (default: "reject" for submission, "fix" for relay)
 	LoopDetection        *bool  `toml:"loop_detection"`         // Enable mail loop detection by checking Received headers (default: true, set to false to disable)
 	MaxHops              int    `toml:"max_hops"`               // Maximum number of hops (Received headers) before rejecting (default: 30, RFC 5321 recommends 100)
+}
+
+// ServerReputationConfig holds reputation checking configuration
+type ServerReputationConfig struct {
+	Enabled        bool                        `toml:"enabled"`          // Enable reputation checking (default: true for relay, false for submission)
+	MinIPScore     float64                     `toml:"min_ip_score"`     // Minimum IP reputation score (default: -0.2, range: -1.0 to 1.0)
+	MinDomainScore float64                     `toml:"min_domain_score"` // Minimum domain reputation score (default: -0.2, range: -1.0 to 1.0)
+	RejectCode     int                         `toml:"reject_code"`      // SMTP code for reputation rejection (default: 421, common: 421, 450, 451, 550)
+	RejectMessage  string                      `toml:"reject_message"`   // Message for reputation rejection (default: "poor reputation, please try again later")
+	DNSBL          ServerReputationDNSBLConfig `toml:"dnsbl"`            // DNS blacklist checking that feeds into reputation scoring
+}
+
+// ServerReputationDNSBLConfig holds DNSBL checking configuration for reputation
+type ServerReputationDNSBLConfig struct {
+	Enabled        bool     `toml:"enabled"`          // Enable DNSBL checking (default: false)
+	IPv4Lists      []string `toml:"ipv4_lists"`       // DNS blacklist servers for IPv4 (e.g., ["zen.spamhaus.org", "bl.spamcop.net"])
+	IPv6Lists      []string `toml:"ipv6_lists"`       // DNS blacklist servers for IPv6 (e.g., ["zen.spamhaus.org"])
+	TimeoutSeconds int      `toml:"timeout_seconds"`  // Timeout for DNSBL queries in seconds (default: 3)
+	Weight         int64    `toml:"weight"`           // Negative reputation weight for DNSBL hits (default: 5)
 }
 
 // ServerAuthConfig holds authentication configuration for submission servers
@@ -181,22 +198,11 @@ type ServerAuthCacheConfig struct {
 }
 
 // Removed: ServerSPFConfig, ServerDKIMConfig, ServerDMARCConfig, ServerARCConfig
-// These are now flattened into ServerConfig as simple boolean/string fields
-
-// ServerDNSBLConfig holds DNS blacklist checking configuration
-type ServerDNSBLConfig struct {
-	Enabled           bool     `toml:"enabled"`             // Enable DNS blacklist (RBL) checking
-	IPv4Lists         []string `toml:"ipv4_lists"`          // DNS blacklist servers for IPv4 addresses
-	IPv6Lists         []string `toml:"ipv6_lists"`          // DNS blacklist servers for IPv6 addresses
-	TimeoutSeconds    int      `toml:"timeout_seconds"`     // Timeout for blacklist queries in seconds (default: 3)
-	CheckHELOResolves bool     `toml:"check_helo_resolves"` // Whether to check if HELO hostname resolves
-	Action            string   `toml:"action"`              // Action when blacklisted: "reject", "junk", "none" (default: "reject")
-}
-
 // ServerDNSChecksConfig holds DNS validation checks
 type ServerDNSChecksConfig struct {
-	RequireRDNS     bool `toml:"require_rdns"`      // Require reverse DNS for sender IP
-	RequireSenderMX bool `toml:"require_sender_mx"` // Require sender domain to have MX records
+	RequireRDNS          bool `toml:"require_rdns"`           // Require reverse DNS for sender IP
+	RequireSenderMX      bool `toml:"require_sender_mx"`      // Require sender domain to have MX records
+	RequireResolvableHELO bool `toml:"require_resolvable_helo"` // Require HELO hostname to have DNS records (default: false)
 }
 
 // ServerJunkConfig holds junk/spam detection configuration
@@ -413,14 +419,6 @@ type MetricsConfig struct {
 	Password string `toml:"password"` // HTTP Basic Auth password
 }
 
-// BlacklistsConfig holds configuration for DNS blacklists
-type BlacklistsConfig struct {
-	Enabled           bool     `toml:"enabled"`             // Whether to enable blacklist checking
-	Lists             []string `toml:"lists"`               // DNS blacklist servers to check
-	TimeoutSeconds    int      `toml:"timeout_seconds"`     // Timeout for blacklist queries in seconds (default: 3)
-	CheckHELOResolves bool     `toml:"check_helo_resolves"` // Whether to check if HELO hostname resolves
-}
-
 // LoggingConfig holds logging configuration
 type LoggingConfig struct {
 	Level  string `toml:"level"`  // Log level: debug, info, warn, error (default: info)
@@ -505,12 +503,6 @@ func DefaultConfig() Config {
 				FallbackCacheDir:    "",
 				SyncIntervalMinutes: 5,
 			},
-		},
-		Blacklists: BlacklistsConfig{
-			Enabled:           true,
-			Lists:             []string{"zen.spamhaus.org"},
-			TimeoutSeconds:    3,     // Default 3s blacklist timeout
-			CheckHELOResolves: false, // Default to not checking HELO resolves
 		},
 		Health: HealthConfig{
 			Enabled:    true,

@@ -209,7 +209,12 @@ func main() {
 		// Create per-server stats recorder (tags events with server name)
 		var serverRecorder *stats.ServerRecorder
 		if statsManager != nil {
-			serverRecorder = stats.NewServerRecorder(statsManager, serverCfg.Name)
+			serverRecorder = stats.NewServerRecorder(
+				statsManager,
+				serverCfg.Name,
+				serverCfg.Reputation.MinIPScore,
+				serverCfg.Reputation.MinDomainScore,
+			)
 		}
 
 		// Create server-specific backend

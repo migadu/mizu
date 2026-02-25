@@ -471,7 +471,7 @@ func TestLRUEviction_ReputationPreserved(t *testing.T) {
 	goodIP := "192.168.1.100"
 	for i := 0; i < 20; i++ {
 		m.RecordConnection(goodIP, true)
-		m.RecordHamDelivery(goodIP, "good.com")
+		m.RecordHamDelivery(goodIP, "good.com", 1)
 	}
 
 	badIP1 := "192.168.1.101"

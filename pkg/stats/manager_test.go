@@ -337,7 +337,7 @@ func TestManagerRecordHamDelivery(t *testing.T) {
 	ip := "192.168.1.1"
 	domain := "example.com"
 
-	manager.RecordHamDelivery(ip, domain)
+	manager.RecordHamDelivery(ip, domain, 1)
 
 	var ipEntry *IPEntry
 	_ = waitFor(1*time.Second, func() bool {
@@ -370,6 +370,117 @@ func TestManagerRecordHamDelivery(t *testing.T) {
 	if domainEntry.GetPositive() != WeightHamDelivery {
 		t.Errorf("Domain Positive = %d; want %d", domainEntry.GetPositive(), WeightHamDelivery)
 	}
+}
+
+func TestManagerRecordHamDelivery_MultipleRecipients(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	manager := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 0, 0, 0, logger)
+	manager.Start()
+	defer manager.Stop()
+
+	ip := "192.168.1.1"
+	domain := "example.com"
+
+	// Simulate a mailing list sending to 100 recipients
+	manager.RecordHamDelivery(ip, domain, 100)
+
+	var ipEntry *IPEntry
+	_ = waitFor(1*time.Second, func() bool {
+		manager.ipMu.RLock()
+		defer manager.ipMu.RUnlock()
+		ipEntry = manager.ips[ip]
+		return ipEntry != nil && ipEntry.GetPositive() == WeightHamDelivery*100
+	})
+
+	if ipEntry == nil {
+		t.Fatal("IP entry not created")
+	}
+
+	expectedPositive := WeightHamDelivery * int64(100)
+	if ipEntry.GetPositive() != expectedPositive {
+		t.Errorf("IP Positive = %d; want %d (100 recipients × weight %d)", ipEntry.GetPositive(), expectedPositive, WeightHamDelivery)
+	}
+
+	var domainEntry *DomainEntry
+	_ = waitFor(1*time.Second, func() bool {
+		manager.domainMu.RLock()
+		defer manager.domainMu.RUnlock()
+		domainEntry = manager.domains[domain]
+		return domainEntry != nil && domainEntry.GetPositive() == WeightHamDelivery*100
+	})
+
+	if domainEntry == nil {
+		t.Fatal("Domain entry not created")
+	}
+
+	if domainEntry.GetPositive() != expectedPositive {
+		t.Errorf("Domain Positive = %d; want %d (100 recipients × weight %d)", domainEntry.GetPositive(), expectedPositive, WeightHamDelivery)
+	}
+}
+
+// TestManagerMailingListScenario verifies that a mailing list sending to 100 recipients
+// with 1 invalid recipient gets a net positive reputation, not net negative.
+// This was the original bug: per-message scoring gave +1 -2 = -1 instead of +100 -2 = +98.
+func TestManagerMailingListScenario(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	manager := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 0, 0, 0, logger)
+	manager.Start()
+	defer manager.Stop()
+
+	ip := "10.0.0.1"
+	domain := "googlegroups.com"
+
+	// Simulate: mailing list sends to 100 recipients, 1 is invalid
+	// The invalid recipient is caught during RCPT TO (before DATA)
+	manager.RecordInvalidRecipient(ip, domain)
+
+	// Wait for invalid recipient event to be processed
+	_ = waitFor(1*time.Second, func() bool {
+		manager.ipMu.RLock()
+		defer manager.ipMu.RUnlock()
+		ipEntry := manager.ips[ip]
+		return ipEntry != nil && ipEntry.GetNegative() == WeightInvalidRecipient
+	})
+
+	// The remaining 99 are delivered successfully
+	manager.RecordHamDelivery(ip, domain, 99)
+
+	// Wait for ham delivery event to be processed
+	_ = waitFor(1*time.Second, func() bool {
+		manager.ipMu.RLock()
+		defer manager.ipMu.RUnlock()
+		ipEntry := manager.ips[ip]
+		return ipEntry != nil && ipEntry.GetPositive() == WeightHamDelivery*99
+	})
+
+	manager.ipMu.RLock()
+	ipEntry := manager.ips[ip]
+	manager.ipMu.RUnlock()
+
+	if ipEntry == nil {
+		t.Fatal("IP entry not created")
+	}
+
+	// AddPositive has a redemption mechanism that reduces Negative.
+	// After InvalidRecipient: Positive=0, Negative=2
+	// After HamDelivery(99):  Positive=0+99=99, Negative=max(2-99,0)=0
+	expectedPositive := WeightHamDelivery * int64(99) // 99
+	expectedNegative := int64(0)                      // reduced to 0 by redemption
+
+	if ipEntry.GetPositive() != expectedPositive {
+		t.Errorf("IP Positive = %d; want %d", ipEntry.GetPositive(), expectedPositive)
+	}
+	if ipEntry.GetNegative() != expectedNegative {
+		t.Errorf("IP Negative = %d; want %d", ipEntry.GetNegative(), expectedNegative)
+	}
+
+	// Net score should be clearly positive for a legitimate mailing list
+	netScore := ipEntry.GetPositive() - ipEntry.GetNegative()
+	if netScore <= 0 {
+		t.Errorf("Net score = %d; should be positive for a legitimate mailing list", netScore)
+	}
+	t.Logf("Mailing list scenario: positive=%d, negative=%d, net=%d ✓",
+		ipEntry.GetPositive(), ipEntry.GetNegative(), netScore)
 }
 
 func TestManagerCheckIPReputation(t *testing.T) {
@@ -449,7 +560,7 @@ func TestManagerDisabled(t *testing.T) {
 	manager.RecordConnection(ip, true)
 	manager.RecordMailFrom(domain)
 	manager.RecordInvalidRecipient(ip, domain)
-	manager.RecordHamDelivery(ip, domain)
+	manager.RecordHamDelivery(ip, domain, 1)
 
 	// Give a moment for any potential (unwanted) processing
 	time.Sleep(50 * time.Millisecond)

@@ -4,7 +4,6 @@
 # [[server]]
 # name = "relay"
 # listen_addr = ":25"
-# reputation_check = true                               # Enable IP reputation checking (default: false) - rejects connections from IPs with poor reputation
 # disable_mizu_headers = false                          # Disable X-Mizu-* headers (keeps Received header, removes X-Mizu-Trace-ID, X-Mizu-Authentication-Results, X-Mizu-Junk)
 #
 # [server.limits]
@@ -46,6 +45,26 @@
 # max_hops = 30                                     # Maximum hops before rejecting as loop (default: 30, RFC 5321 recommends 100)
 # allow_null_sender = true                          # Allow bounce messages with null sender <> (default: true for relay, false for submission)
 # missing_headers_action = "fix"                    # Action for missing Date/Message-ID: "reject", "fix", "none" (default: "reject" for submission, "fix" for relay)
+#
+# [server.reputation]
+# enabled = false                                   # Enable reputation checking (default: false - opt-in for production deployments)
+# min_ip_score = -0.2                               # Minimum IP reputation score (default: -0.2, range: -1.0 to 1.0) - IPs below this are rejected
+# min_domain_score = -0.2                           # Minimum domain reputation score (default: -0.2, range: -1.0 to 1.0) - domains below this are rejected
+# reject_code = 421                                 # SMTP code for reputation rejection (default: 421, common: 421=temp fail, 450=temp fail, 451=local error, 550=perm fail)
+# reject_message = "poor reputation, please try again later"  # Custom rejection message
+#
+# [server.reputation.dnsbl]
+# enabled = false                                   # Enable DNSBL checking that feeds into reputation (default: false)
+# ipv4_lists = ["zen.spamhaus.org", "bl.spamcop.net"]  # DNS blacklist servers for IPv4
+# ipv6_lists = ["zen.spamhaus.org"]                 # DNS blacklist servers for IPv6
+# timeout_seconds = 3                               # Timeout for DNSBL queries (default: 3)
+# weight = 5                                        # Negative reputation weight for DNSBL hits (default: 5, range similar to other weights: 1-10)
+#
+# [server.dns_checks]
+# require_rdns = false                              # Require reverse DNS for sender IP (default: false)
+# require_sender_mx = false                         # Require sender domain to have MX records (default: false)
+# require_resolvable_helo = false                   # Require HELO hostname to have DNS records (default: false)
+#
 # [server.delivery]
 # url = "https://backend.example.com/incoming"
 # auth_token = "${DELIVERY_AUTH_TOKEN}"
@@ -58,8 +77,11 @@
 # [[server]]
 # name = "submission"
 # listen_addr = ":587"
-# reputation_check = false                              # Disable IP reputation checking for submission servers (default: false)
 # disable_mizu_headers = false                          # Disable X-Mizu-* headers (useful for outbound servers that don't need debugging headers)
+#
+# [server.reputation]
+# enabled = false                                   # Disable reputation checking for submission servers (default: false)
+#
 # [server.auth]
 # enabled = true                                    # Enable SMTP AUTH
 # required = true                                   # Require authentication before MAIL FROM
@@ -134,12 +156,6 @@ staging = false
 renew_before_days = 30
 fallback_cache_dir = ""
 sync_interval_minutes = 5
-
-[blacklists]
-enabled = true
-lists = ["zen.spamhaus.org"]
-timeout_seconds = 3
-check_helo_resolves = false
 
 [health]
 enabled = true

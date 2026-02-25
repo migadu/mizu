@@ -4,6 +4,7 @@
 package tests
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -40,7 +41,7 @@ func TestStatsIntegration(t *testing.T) {
 		for i := 0; i < 15; i++ {
 			statsMgr.RecordConnection(goodIP, true)
 			statsMgr.RecordMailFrom("good.com")
-			statsMgr.RecordHamDelivery(goodIP, "good.com")
+			statsMgr.RecordHamDelivery(goodIP, "good.com", 1)
 		}
 
 		shouldDeny, reputation := statsMgr.CheckIPReputation(goodIP)
@@ -65,7 +66,7 @@ func TestStatsIntegration(t *testing.T) {
 		statsMgr.RecordSpoofingAttempt(testIP, testDomain)
 		statsMgr.RecordDMARCFailure(testIP, testDomain)
 		statsMgr.RecordJunkMessage(testIP, testDomain)
-		statsMgr.RecordHamDelivery(testIP, testDomain)
+		statsMgr.RecordHamDelivery(testIP, testDomain, 1)
 
 		// Check that reputation can be queried (may be 0 due to insufficient data, that's okay)
 		_, ipRep := statsMgr.CheckIPReputation(testIP)
@@ -153,7 +154,7 @@ func TestComponentsIntegration(t *testing.T) {
 
 	statsMgr.RecordConnection(testIP, true)
 	statsMgr.RecordMailFrom(testDomain)
-	statsMgr.RecordHamDelivery(testIP, testDomain)
+	statsMgr.RecordHamDelivery(testIP, testDomain, 1)
 
 	shouldDeny, _ := statsMgr.CheckIPReputation(testIP)
 	if shouldDeny {

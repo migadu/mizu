@@ -345,62 +345,48 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 			return nil, ErrInternalServerError
 		}
 
-		// Check DNS blacklists (RBLs) to prevent spam
-		if be.ServerConfig.DNSBL.Enabled {
+		// Check DNS blacklists (DNSBL) for reputation scoring
+		if be.ServerConfig.Reputation.Enabled && be.ServerConfig.Reputation.DNSBL.Enabled {
 			// Determine which DNSBL lists to use based on IP version
 			var lists []string
 			if ip.To4() != nil {
 				// IPv4 address
-				lists = be.ServerConfig.DNSBL.IPv4Lists
+				lists = be.ServerConfig.Reputation.DNSBL.IPv4Lists
 			} else {
 				// IPv6 address
-				lists = be.ServerConfig.DNSBL.IPv6Lists
+				lists = be.ServerConfig.Reputation.DNSBL.IPv6Lists
 			}
 
 			if len(lists) > 0 {
-				timeoutSecs := be.ServerConfig.DNSBL.TimeoutSeconds
+				timeoutSecs := be.ServerConfig.Reputation.DNSBL.TimeoutSeconds
 				if timeoutSecs == 0 {
 					timeoutSecs = 3 // Default timeout
 				}
 				checker := blacklist.NewChecker(lists, time.Duration(timeoutSecs)*time.Second, be.Logger)
 				isListed, reason, err := checker.CheckIP(ip)
 				if err != nil {
-					be.Logger.Error("Blacklist check error", "error", err, "ip", host)
-					// Don't reject on blacklist check errors - fail open for availability
+					be.Logger.Error("DNSBL check error", "error", err, "ip", host)
+					// Don't penalize on DNSBL check errors - fail open for availability
 				} else if isListed {
-					// Determine action based on configuration
-					action := be.ServerConfig.DNSBL.Action
-					if action == "" {
-						action = "reject" // Default to reject
+					// Record DNSBL hit in reputation system
+					weight := be.ServerConfig.Reputation.DNSBL.Weight
+					if weight == 0 {
+						weight = 5 // Default weight
+					}
+
+					be.Logger.Info("DNSBL hit - recording negative reputation",
+						"server", be.ServerConfig.Name,
+						"remote_addr", remoteAddr,
+						"reason", reason,
+						"weight", weight)
+
+					if be.StatsManager != nil {
+						be.StatsManager.RecordDNSBLHit(ipStr, weight)
 					}
 
 					// Record blacklist detection in metrics
 					if be.Metrics != nil {
 						be.Metrics.SMTPBlacklistChecks.WithLabelValues(be.ServerConfig.Name, "blocked").Inc()
-					}
-
-					switch action {
-					case "reject":
-						// Reject the connection
-						be.Logger.Info("Rejecting connection - IP blacklisted",
-							"server", be.ServerConfig.Name,
-							"remote_addr", remoteAddr,
-							"reason", reason)
-						if be.Metrics != nil {
-							be.Metrics.SMTPMessagesRejected.WithLabelValues(be.ServerConfig.Name, be.ServerConfig.Type, "blacklist").Inc()
-						}
-						return nil, &smtp.SMTPError{
-							Code:         550,
-							EnhancedCode: smtp.EnhancedCode{5, 7, 1},
-							Message:      fmt.Sprintf("your IP address is blacklisted: %s", reason),
-						}
-					case "junk":
-						// Mark for junk but allow connection
-						be.Logger.Info("Allowing blacklisted IP but marking as junk", "ip", host, "reason", reason)
-						// Note: The session will be created and marked as junk
-					case "none":
-						// Just log but take no action
-						be.Logger.Info("Blacklisted IP detected but no action configured", "ip", host, "reason", reason)
 					}
 				} else if be.Metrics != nil {
 					// Record successful blacklist check
@@ -461,17 +447,28 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 			be.StatsManager.RecordConnection(ipStr, hasRDNS)
 
 			// Check IP reputation if enabled for this server
-			if be.ServerConfig.ReputationCheck {
+			if be.ServerConfig.Reputation.Enabled {
 				if shouldDeny, reputation := be.StatsManager.CheckIPReputation(ipStr); shouldDeny {
 					be.Logger.Info("Rejecting connection - poor IP reputation",
 						"server", be.ServerConfig.Name,
 						"remote_addr", remoteAddr,
 						"remote_host", ptrRecord,
 						"score", reputation)
+
+					// Use configured rejection code and message
+					rejectCode := be.ServerConfig.Reputation.RejectCode
+					if rejectCode == 0 {
+						rejectCode = 421 // Default temporary failure
+					}
+					rejectMessage := be.ServerConfig.Reputation.RejectMessage
+					if rejectMessage == "" {
+						rejectMessage = "poor reputation, please try again later"
+					}
+
 					return nil, &smtp.SMTPError{
-						Code:         421,
+						Code:         rejectCode,
 						EnhancedCode: smtp.EnhancedCode{4, 7, 1},
-						Message:      "please try again later",
+						Message:      rejectMessage,
 					}
 				}
 			}
@@ -682,8 +679,12 @@ func (s *Session) Helo(hostname string) error {
 		}
 
 		// Optional: Verify HELO hostname has valid DNS records
-		if s.globalConfig.Blacklists.CheckHELOResolves {
-			resolves, reason, err := blacklist.CheckHELOResolves(hostname, time.Duration(s.globalConfig.Blacklists.TimeoutSeconds)*time.Second)
+		if s.serverConfig.DNSChecks.RequireResolvableHELO {
+			timeoutSecs := s.globalConfig.DNS.TimeoutSeconds
+			if timeoutSecs == 0 {
+				timeoutSecs = 5 // Default DNS timeout
+			}
+			resolves, reason, err := blacklist.CheckHELOResolves(hostname, time.Duration(timeoutSecs)*time.Second)
 			if err != nil || !resolves {
 				s.Logger.Warn("Rejecting HELO/EHLO - hostname check failed", "hostname", hostname, "reason", reason)
 				return &smtp.SMTPError{
@@ -870,10 +871,21 @@ func (s *Session) Mail(from string, opts *smtp.MailOptions) error {
 		// Check domain reputation
 		if shouldDeny, reputation := s.statsManager.CheckDomainReputation(senderDomain); shouldDeny {
 			s.Logger.Warn("Rejecting MAIL FROM - poor domain reputation", "from", from, "score", reputation)
+
+			// Use configured rejection code and message
+			rejectCode := s.serverConfig.Reputation.RejectCode
+			if rejectCode == 0 {
+				rejectCode = 421 // Default temporary failure
+			}
+			rejectMessage := s.serverConfig.Reputation.RejectMessage
+			if rejectMessage == "" {
+				rejectMessage = "poor reputation, please try again later"
+			}
+
 			return &smtp.SMTPError{
-				Code:         421,
+				Code:         rejectCode,
 				EnhancedCode: smtp.EnhancedCode{4, 7, 1},
-				Message:      "please try again later",
+				Message:      rejectMessage,
 			}
 		}
 	}
@@ -1576,10 +1588,16 @@ func (s *Session) finalizeSuccessfulDelivery() {
 		if s.isJunk {
 			s.statsManager.RecordJunkMessage(s.remoteAddr, s.senderDomain)
 		} else {
-			s.statsManager.RecordHamDelivery(s.remoteAddr, s.senderDomain)
+			// Award reputation per successful recipient, not per message.
+			// This ensures mailing lists and bulk senders get proportional
+			// positive reputation (e.g., 100 recipients = +100, not +1).
+			s.statsManager.RecordHamDelivery(s.remoteAddr, s.senderDomain, len(s.to))
 		}
 	}
-	s.Logger.Info("Email delivered successfully", "from", s.from, "to", s.to)
+	s.Logger.Info("Email delivered successfully",
+		"from", s.from,
+		"to", s.to,
+		"recipient_count", len(s.to))
 }
 
 // recordDMARCFailure is a helper to record DMARC failure stats.

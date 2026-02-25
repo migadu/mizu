@@ -31,6 +31,7 @@ const (
 	eventInvalidRecipient
 	eventSpoofingAttempt
 	eventDMARCFailure
+	eventDNSBLHit
 	eventJunkMessage
 	eventHamDelivery
 )
@@ -118,25 +119,42 @@ type event struct {
 	IP         string
 	Domain     string
 	ServerName string // Config server name (e.g., "mx-primary", "mx-submission")
+	Count      int    // Multiplier for weighted events (e.g., recipient count for ham delivery)
 }
 
 // ServerRecorder wraps a Manager with a server name for per-config-server tracking.
 // It has the same method signatures as Manager for Record* and Check* methods,
 // allowing it to be used as a drop-in replacement in the SMTP Backend/Session.
 type ServerRecorder struct {
-	manager    *Manager
-	serverName string
+	manager        *Manager
+	serverName     string
+	minIPScore     float64 // Minimum IP reputation threshold (default: -0.2)
+	minDomainScore float64 // Minimum domain reputation threshold (default: -0.2)
 }
 
 // NewServerRecorder creates a recorder that tags all events with the given server name.
 // It eagerly registers the server name so it appears in stats even with zero traffic.
-func NewServerRecorder(manager *Manager, serverName string) *ServerRecorder {
+// minIPScore and minDomainScore default to ReputationDenyThreshold (-0.2) if set to 0.
+func NewServerRecorder(manager *Manager, serverName string, minIPScore, minDomainScore float64) *ServerRecorder {
+	// Apply defaults if thresholds are not set
+	if minIPScore == 0 {
+		minIPScore = ReputationDenyThreshold
+	}
+	if minDomainScore == 0 {
+		minDomainScore = ReputationDenyThreshold
+	}
+
 	if manager != nil {
 		manager.srvCountersMu.Lock()
 		manager.getOrCreateSrvCounters(serverName)
 		manager.srvCountersMu.Unlock()
 	}
-	return &ServerRecorder{manager: manager, serverName: serverName}
+	return &ServerRecorder{
+		manager:        manager,
+		serverName:     serverName,
+		minIPScore:     minIPScore,
+		minDomainScore: minDomainScore,
+	}
 }
 
 // Manager returns the underlying stats manager (for registration, health checks, etc.)
@@ -192,6 +210,14 @@ func (r *ServerRecorder) RecordDMARCFailure(ip, domain string) {
 	r.manager.sendEvent(event{Type: eventDMARCFailure, IP: ip, Domain: domain, ServerName: r.serverName})
 }
 
+func (r *ServerRecorder) RecordDNSBLHit(ip string, weight int64) {
+	if r.manager == nil || !r.manager.enabled {
+		return
+	}
+	// Store weight in Domain field as string (bit of a hack but avoids changing event struct)
+	r.manager.sendEvent(event{Type: eventDNSBLHit, IP: ip, Domain: fmt.Sprintf("%d", weight), ServerName: r.serverName})
+}
+
 func (r *ServerRecorder) RecordJunkMessage(ip, domain string) {
 	if r.manager == nil || !r.manager.enabled {
 		return
@@ -199,25 +225,34 @@ func (r *ServerRecorder) RecordJunkMessage(ip, domain string) {
 	r.manager.sendEvent(event{Type: eventJunkMessage, IP: ip, Domain: domain, ServerName: r.serverName})
 }
 
-func (r *ServerRecorder) RecordHamDelivery(ip, domain string) {
+func (r *ServerRecorder) RecordHamDelivery(ip, domain string, recipientCount int) {
 	if r.manager == nil || !r.manager.enabled {
 		return
 	}
-	r.manager.sendEvent(event{Type: eventHamDelivery, IP: ip, Domain: domain, ServerName: r.serverName})
+	if recipientCount <= 0 {
+		recipientCount = 1
+	}
+	r.manager.sendEvent(event{Type: eventHamDelivery, IP: ip, Domain: domain, ServerName: r.serverName, Count: recipientCount})
 }
 
 func (r *ServerRecorder) CheckIPReputation(ip string) (shouldDeny bool, reputation float64) {
 	if r.manager == nil {
 		return false, 0
 	}
-	return r.manager.CheckIPReputation(ip)
+	// Get reputation from manager, but apply server-specific threshold
+	_, reputation = r.manager.CheckIPReputation(ip)
+	shouldDeny = reputation < r.minIPScore
+	return shouldDeny, reputation
 }
 
 func (r *ServerRecorder) CheckDomainReputation(domain string) (shouldDeny bool, reputation float64) {
 	if r.manager == nil {
 		return false, 0
 	}
-	return r.manager.CheckDomainReputation(domain)
+	// Get reputation from manager, but apply server-specific threshold
+	_, reputation = r.manager.CheckDomainReputation(domain)
+	shouldDeny = reputation < r.minDomainScore
+	return shouldDeny, reputation
 }
 
 // NewManager creates a new stats manager
@@ -465,6 +500,20 @@ func (m *Manager) handleEvent(e event) {
 			d.rejected++
 		}
 		m.srvCountersMu.Unlock()
+	case eventDNSBLHit:
+		// Weight is stored in Domain field as string
+		weight := int64(WeightDNSBLHit) // Default weight
+		if e.Domain != "" {
+			var w int64
+			if n, err := fmt.Sscanf(e.Domain, "%d", &w); err == nil && n == 1 {
+				weight = w // Successfully parsed custom weight
+			}
+		}
+		// Apply negative weight to IP only (DNSBL is IP-based)
+		if e.IP != "" {
+			ipEntry := m.getOrCreateIP(e.IP)
+			ipEntry.AddNegative(weight)
+		}
 	case eventJunkMessage:
 		m.applyNegativeWeight(e.IP, e.Domain, WeightJunkMessage)
 		// Track unweighted junk count on domain
@@ -483,13 +532,20 @@ func (m *Manager) handleEvent(e event) {
 		}
 		m.srvCountersMu.Unlock()
 	case eventHamDelivery:
-		m.applyPositiveWeight(e.IP, e.Domain, WeightHamDelivery)
+		// Apply positive weight multiplied by recipient count.
+		// This ensures mailing lists get proportional positive reputation.
+		count := e.Count
+		if count <= 0 {
+			count = 1
+		}
+		weight := WeightHamDelivery * int64(count)
+		m.applyPositiveWeight(e.IP, e.Domain, weight)
 		// Track per-server accepted count + per-server domain accepted
 		m.srvCountersMu.Lock()
 		sc := m.getOrCreateSrvCounters(e.ServerName)
-		sc.accepted++
+		sc.accepted += uint64(count)
 		if d := sc.getOrCreateDomain(e.Domain); d != nil {
-			d.accepted++
+			d.accepted += int64(count)
 		}
 		m.srvCountersMu.Unlock()
 	}
@@ -737,11 +793,17 @@ func (m *Manager) RecordJunkMessage(ip, domain string) {
 }
 
 // RecordHamDelivery records a successful ham (non-spam) delivery.
-func (m *Manager) RecordHamDelivery(ip, domain string) {
+// recipientCount indicates the number of recipients successfully delivered to.
+// This ensures reputation scoring is proportional to the number of recipients,
+// fixing incorrect scoring for mailing lists and bulk senders.
+func (m *Manager) RecordHamDelivery(ip, domain string, recipientCount int) {
 	if !m.enabled {
 		return
 	}
-	m.sendEvent(event{Type: eventHamDelivery, IP: ip, Domain: domain})
+	if recipientCount <= 0 {
+		recipientCount = 1
+	}
+	m.sendEvent(event{Type: eventHamDelivery, IP: ip, Domain: domain, Count: recipientCount})
 }
 
 // sendEvent is a non-blocking send to the event channel.
