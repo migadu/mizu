@@ -34,6 +34,7 @@ const (
 	eventDNSBLHit
 	eventJunkMessage
 	eventHamDelivery
+	eventSPFFailure
 )
 
 // Manager handles IP and domain reputation tracking
@@ -182,32 +183,43 @@ func (r *ServerRecorder) RecordDeniedConnection(ip string) {
 	r.manager.sendEvent(event{Type: eventDeniedConnection, IP: ip, ServerName: r.serverName})
 }
 
-func (r *ServerRecorder) RecordMailFrom(domain string) {
-	if r.manager == nil || !r.manager.enabled || domain == "" {
-		return
-	}
-	r.manager.sendEvent(event{Type: eventMailFrom, Domain: domain, ServerName: r.serverName})
-}
-
-func (r *ServerRecorder) RecordInvalidRecipient(ip, domain string) {
+func (r *ServerRecorder) RecordMailFrom() {
 	if r.manager == nil || !r.manager.enabled {
 		return
 	}
-	r.manager.sendEvent(event{Type: eventInvalidRecipient, IP: ip, Domain: domain, ServerName: r.serverName})
+	r.manager.sendEvent(event{Type: eventMailFrom, ServerName: r.serverName})
 }
 
-func (r *ServerRecorder) RecordSpoofingAttempt(ip, domain string) {
+func (r *ServerRecorder) RecordInvalidRecipient(ip string) {
 	if r.manager == nil || !r.manager.enabled {
 		return
 	}
-	r.manager.sendEvent(event{Type: eventSpoofingAttempt, IP: ip, Domain: domain, ServerName: r.serverName})
+	r.manager.sendEvent(event{Type: eventInvalidRecipient, IP: ip, ServerName: r.serverName})
 }
 
-func (r *ServerRecorder) RecordDMARCFailure(ip, domain string) {
+func (r *ServerRecorder) RecordSpoofingAttempt(ip string) {
 	if r.manager == nil || !r.manager.enabled {
 		return
 	}
-	r.manager.sendEvent(event{Type: eventDMARCFailure, IP: ip, Domain: domain, ServerName: r.serverName})
+	r.manager.sendEvent(event{Type: eventSpoofingAttempt, IP: ip, ServerName: r.serverName})
+}
+
+func (r *ServerRecorder) RecordDMARCFailure(ip string) {
+	if r.manager == nil || !r.manager.enabled {
+		return
+	}
+	r.manager.sendEvent(event{Type: eventDMARCFailure, IP: ip, ServerName: r.serverName})
+}
+
+// RecordSPFFailure records a hard SPF fail against the sender's IP.
+// Only applied to IP reputation (not domain) because the MAIL FROM domain
+// is unverified and trivially forged — penalizing the domain would harm
+// innocent domains that spammers impersonate.
+func (r *ServerRecorder) RecordSPFFailure(ip string) {
+	if r.manager == nil || !r.manager.enabled {
+		return
+	}
+	r.manager.sendEvent(event{Type: eventSPFFailure, IP: ip, ServerName: r.serverName})
 }
 
 func (r *ServerRecorder) RecordDNSBLHit(ip string, weight int64) {
@@ -218,21 +230,21 @@ func (r *ServerRecorder) RecordDNSBLHit(ip string, weight int64) {
 	r.manager.sendEvent(event{Type: eventDNSBLHit, IP: ip, Domain: fmt.Sprintf("%d", weight), ServerName: r.serverName})
 }
 
-func (r *ServerRecorder) RecordJunkMessage(ip, domain string) {
+func (r *ServerRecorder) RecordJunkMessage(ip string) {
 	if r.manager == nil || !r.manager.enabled {
 		return
 	}
-	r.manager.sendEvent(event{Type: eventJunkMessage, IP: ip, Domain: domain, ServerName: r.serverName})
+	r.manager.sendEvent(event{Type: eventJunkMessage, IP: ip, ServerName: r.serverName})
 }
 
-func (r *ServerRecorder) RecordHamDelivery(ip, domain string, recipientCount int) {
+func (r *ServerRecorder) RecordHamDelivery(ip string, recipientCount int) {
 	if r.manager == nil || !r.manager.enabled {
 		return
 	}
 	if recipientCount <= 0 {
 		recipientCount = 1
 	}
-	r.manager.sendEvent(event{Type: eventHamDelivery, IP: ip, Domain: domain, ServerName: r.serverName, Count: recipientCount})
+	r.manager.sendEvent(event{Type: eventHamDelivery, IP: ip, ServerName: r.serverName, Count: recipientCount})
 }
 
 func (r *ServerRecorder) CheckIPReputation(ip string) (shouldDeny bool, reputation float64) {
@@ -439,16 +451,18 @@ func (m *Manager) handleEvent(e event) {
 		if e.Domain != "" {
 			entry := m.getOrCreateDomain(e.Domain)
 			entry.IncrementMessages()
+		}
 
-			// Track per-server message count and per-server domain
-			m.srvCountersMu.Lock()
-			c := m.getOrCreateSrvCounters(e.ServerName)
-			c.total++
+		// Always track per-server message count (even without domain)
+		m.srvCountersMu.Lock()
+		c := m.getOrCreateSrvCounters(e.ServerName)
+		c.total++
+		if e.Domain != "" {
 			if d := c.getOrCreateDomain(e.Domain); d != nil {
 				d.messages++
 			}
-			m.srvCountersMu.Unlock()
 		}
+		m.srvCountersMu.Unlock()
 	case eventInvalidRecipient:
 		m.applyNegativeWeight(e.IP, e.Domain, WeightInvalidRecipient)
 		// Track unweighted rejected count on domain
@@ -548,6 +562,14 @@ func (m *Manager) handleEvent(e event) {
 			d.accepted += int64(count)
 		}
 		m.srvCountersMu.Unlock()
+	case eventSPFFailure:
+		// Apply negative weight to IP only (not domain).
+		// The MAIL FROM domain is unverified and trivially forged by spammers.
+		// Penalizing the domain would harm innocent domains being impersonated.
+		if e.IP != "" {
+			ipEntry := m.getOrCreateIP(e.IP)
+			ipEntry.AddNegative(WeightSPFFailure)
+		}
 	}
 }
 
@@ -752,58 +774,73 @@ func (m *Manager) RecordConnection(ip string, hasRDNS bool) {
 	m.sendEvent(event{Type: eventConnection, IP: ip, Domain: rdnsStatus})
 }
 
-// RecordMailFrom records a MAIL FROM command by sending an event.
-func (m *Manager) RecordMailFrom(domain string) {
-	if !m.enabled || domain == "" {
+// RecordMailFrom records a MAIL FROM command for per-server message counting.
+func (m *Manager) RecordMailFrom() {
+	if !m.enabled {
 		return
 	}
-	m.sendEvent(event{Type: eventMailFrom, Domain: domain})
+	m.sendEvent(event{Type: eventMailFrom})
 }
 
 // RecordInvalidRecipient records an attempt to send to a non-existent address.
-func (m *Manager) RecordInvalidRecipient(ip, domain string) {
+// Only IP reputation is affected (domain is unverified and trivially forged).
+func (m *Manager) RecordInvalidRecipient(ip string) {
 	if !m.enabled {
 		return
 	}
-	m.sendEvent(event{Type: eventInvalidRecipient, IP: ip, Domain: domain})
+	m.sendEvent(event{Type: eventInvalidRecipient, IP: ip})
 }
 
 // RecordSpoofingAttempt records a spoofing attempt.
-func (m *Manager) RecordSpoofingAttempt(ip, domain string) {
+// Only IP reputation is affected (domain is unverified and trivially forged).
+func (m *Manager) RecordSpoofingAttempt(ip string) {
 	if !m.enabled {
 		return
 	}
-	m.sendEvent(event{Type: eventSpoofingAttempt, IP: ip, Domain: domain})
+	m.sendEvent(event{Type: eventSpoofingAttempt, IP: ip})
 }
 
 // RecordDMARCFailure records a DMARC policy failure.
-func (m *Manager) RecordDMARCFailure(ip, domain string) {
+// Only IP reputation is affected (domain is unverified and trivially forged).
+func (m *Manager) RecordDMARCFailure(ip string) {
 	if !m.enabled {
 		return
 	}
-	m.sendEvent(event{Type: eventDMARCFailure, IP: ip, Domain: domain})
+	m.sendEvent(event{Type: eventDMARCFailure, IP: ip})
+}
+
+// RecordSPFFailure records a hard SPF failure against the sender's IP.
+// Only applied to IP reputation (not domain) because the MAIL FROM domain
+// is unverified and trivially forged.
+func (m *Manager) RecordSPFFailure(ip string) {
+	if !m.enabled {
+		return
+	}
+	m.sendEvent(event{Type: eventSPFFailure, IP: ip})
 }
 
 // RecordJunkMessage records a junk/spam message.
-func (m *Manager) RecordJunkMessage(ip, domain string) {
+// Only IP reputation is affected (domain is unverified and trivially forged).
+func (m *Manager) RecordJunkMessage(ip string) {
 	if !m.enabled {
 		return
 	}
-	m.sendEvent(event{Type: eventJunkMessage, IP: ip, Domain: domain})
+	m.sendEvent(event{Type: eventJunkMessage, IP: ip})
 }
 
 // RecordHamDelivery records a successful ham (non-spam) delivery.
 // recipientCount indicates the number of recipients successfully delivered to.
 // This ensures reputation scoring is proportional to the number of recipients,
 // fixing incorrect scoring for mailing lists and bulk senders.
-func (m *Manager) RecordHamDelivery(ip, domain string, recipientCount int) {
+// Only IP reputation is affected (domain is unverified and trivially forged).
+func (m *Manager) RecordHamDelivery(ip string, recipientCount int) {
 	if !m.enabled {
 		return
 	}
 	if recipientCount <= 0 {
 		recipientCount = 1
 	}
-	m.sendEvent(event{Type: eventHamDelivery, IP: ip, Domain: domain, Count: recipientCount})
+	m.sendEvent(event{Type: eventHamDelivery, IP: ip, Count: recipientCount})
 }
 
 // sendEvent is a non-blocking send to the event channel.

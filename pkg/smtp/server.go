@@ -864,30 +864,16 @@ func (s *Session) Mail(from string, opts *smtp.MailOptions) error {
 	senderDomain := stats.ExtractDomainFromEmail(from)
 	s.senderDomain = senderDomain
 
-	// Record MAIL FROM in stats
-	if s.statsManager != nil && senderDomain != "" {
-		s.statsManager.RecordMailFrom(senderDomain)
-
-		// Check domain reputation
-		if shouldDeny, reputation := s.statsManager.CheckDomainReputation(senderDomain); shouldDeny {
-			s.Logger.Warn("Rejecting MAIL FROM - poor domain reputation", "from", from, "score", reputation)
-
-			// Use configured rejection code and message
-			rejectCode := s.serverConfig.Reputation.RejectCode
-			if rejectCode == 0 {
-				rejectCode = 421 // Default temporary failure
-			}
-			rejectMessage := s.serverConfig.Reputation.RejectMessage
-			if rejectMessage == "" {
-				rejectMessage = "poor reputation, please try again later"
-			}
-
-			return &smtp.SMTPError{
-				Code:         rejectCode,
-				EnhancedCode: smtp.EnhancedCode{4, 7, 1},
-				Message:      rejectMessage,
-			}
-		}
+	// Record MAIL FROM in stats (for observability only).
+	// NOTE: We do NOT check domain reputation here for rejection because the
+	// MAIL FROM domain is unverified at this point — any sender can forge it.
+	// Rejecting based on a forged domain's reputation would punish innocent
+	// domains that spammers impersonate. IP reputation (checked at connection
+	// time) is the correct signal since TCP source IPs cannot be forged.
+	// Record MAIL FROM for per-server message counting.
+	// Domain is not passed because it is unverified (trivially forged).
+	if s.statsManager != nil {
+		s.statsManager.RecordMailFrom()
 	}
 
 	// Note: Mailbox/domain validation is now handled by the destination HTTP endpoint
@@ -936,14 +922,22 @@ func (s *Session) Mail(from string, opts *smtp.MailOptions) error {
 						s.metrics.SMTPSPFChecks.WithLabelValues(s.serverName(), resultStr).Inc()
 					}
 
+					converted := validation.ConvertSPFResult(*res)
 					spfMu.Lock()
 					s.spfResult = &validation.SPFResult{
 						Domain: s.senderDomain,
 						Result: authres.SPFResult{
-							Value: validation.ConvertSPFResult(*res),
+							Value: converted,
 						},
 					}
 					spfMu.Unlock()
+
+					// Record hard SPF failure against the sender's IP for reputation.
+					// Only IP is penalized (not domain) because the MAIL FROM domain
+					// is unverified and trivially forged by spammers.
+					if converted == authres.ResultFail && s.statsManager != nil {
+						s.statsManager.RecordSPFFailure(s.remoteAddr)
+					}
 				}
 			})
 		}
@@ -1587,12 +1581,12 @@ func (s *Session) deliverSynchronous(signedEmail string) error {
 func (s *Session) finalizeSuccessfulDelivery() {
 	if s.statsManager != nil {
 		if s.isJunk {
-			s.statsManager.RecordJunkMessage(s.remoteAddr, s.senderDomain)
+			s.statsManager.RecordJunkMessage(s.remoteAddr)
 		} else {
 			// Award reputation per successful recipient, not per message.
 			// This ensures mailing lists and bulk senders get proportional
 			// positive reputation (e.g., 100 recipients = +100, not +1).
-			s.statsManager.RecordHamDelivery(s.remoteAddr, s.senderDomain, len(s.to))
+			s.statsManager.RecordHamDelivery(s.remoteAddr, len(s.to))
 		}
 	}
 	s.Logger.Info("Email delivered successfully",
@@ -1604,7 +1598,7 @@ func (s *Session) finalizeSuccessfulDelivery() {
 // recordDMARCFailure is a helper to record DMARC failure stats.
 func (s *Session) recordDMARCFailure() {
 	if s.statsManager != nil {
-		s.statsManager.RecordDMARCFailure(s.remoteAddr, s.senderDomain)
+		s.statsManager.RecordDMARCFailure(s.remoteAddr)
 	}
 }
 
@@ -1642,7 +1636,7 @@ func (s *Session) validateHeaders(rawEmail string) error {
 
 				// Record this as a junk message for stats
 				if s.statsManager != nil {
-					s.statsManager.RecordJunkMessage(s.remoteAddr, s.senderDomain)
+					s.statsManager.RecordJunkMessage(s.remoteAddr)
 				}
 
 				switch action {

@@ -107,38 +107,28 @@ func TestManagerRecordMailFrom(t *testing.T) {
 	manager.Start()
 	defer manager.Stop()
 
-	domain := "example.com"
+	// RecordMailFrom no longer takes a domain (domain is unverified/forged).
+	// It only increments per-server total counters.
+	manager.RecordMailFrom()
+	manager.RecordMailFrom()
 
-	manager.RecordMailFrom(domain)
+	// Give event loop time to process
+	time.Sleep(200 * time.Millisecond)
 
-	var entry *DomainEntry
-	err := waitFor(1*time.Second, func() bool {
-		manager.domainMu.RLock()
-		defer manager.domainMu.RUnlock()
-		entry = manager.domains[domain]
-		return entry != nil && entry.GetMessages() == 1
-	})
-	if err != nil {
-		t.Fatal("Domain entry not created or message count incorrect after timeout")
-	}
-	if entry == nil {
-		t.Fatal("Domain entry not created")
+	// Verify per-server total counter incremented
+	manager.srvCountersMu.RLock()
+	sc := manager.srvCounters["_default"]
+	manager.srvCountersMu.RUnlock()
+	if sc == nil || sc.total != 2 {
+		t.Errorf("Per-server total = %v; want 2", sc)
 	}
 
-	if entry.GetMessages() != 1 {
-		t.Errorf("Messages = %d; want 1", entry.GetMessages())
-	}
-
-	// Record another
-	manager.RecordMailFrom(domain)
-	err = waitFor(1*time.Second, func() bool {
-		return entry.GetMessages() == 2
-	})
-	if err != nil {
-		t.Fatal("Message count did not increment to 2 after timeout")
-	}
-	if entry.GetMessages() != 2 {
-		t.Errorf("Messages = %d; want 2", entry.GetMessages())
+	// Verify NO domain entry is created (domain is not passed)
+	manager.domainMu.RLock()
+	domainCount := len(manager.domains)
+	manager.domainMu.RUnlock()
+	if domainCount != 0 {
+		t.Errorf("Expected 0 domain entries, got %d", domainCount)
 	}
 }
 
@@ -149,50 +139,30 @@ func TestManagerRecordInvalidRecipient(t *testing.T) {
 	defer manager.Stop()
 
 	ip := "192.168.1.1"
-	domain := "example.com"
 
-	manager.RecordInvalidRecipient(ip, domain)
+	manager.RecordInvalidRecipient(ip)
 
 	var ipEntry *IPEntry
-	err := waitFor(1*time.Second, func() bool {
+	_ = waitFor(1*time.Second, func() bool {
 		manager.ipMu.RLock()
 		defer manager.ipMu.RUnlock()
 		ipEntry = manager.ips[ip]
-		return ipEntry != nil
-	})
-	if err != nil {
-		t.Fatal("IP entry not created after timeout")
-	}
-
-	waitFor(1*time.Second, func() bool {
-		return ipEntry.GetNegative() == WeightInvalidRecipient
+		return ipEntry != nil && ipEntry.GetNegative() == WeightInvalidRecipient
 	})
 
 	if ipEntry == nil {
 		t.Fatal("IP entry not created")
 	}
-
 	if ipEntry.GetNegative() != WeightInvalidRecipient {
 		t.Errorf("IP Negative = %d; want %d", ipEntry.GetNegative(), WeightInvalidRecipient)
 	}
 
-	var domainEntry *DomainEntry
-	err = waitFor(1*time.Second, func() bool {
-		manager.domainMu.RLock()
-		defer manager.domainMu.RUnlock()
-		domainEntry = manager.domains[domain]
-		return domainEntry != nil
-	})
-	if err != nil {
-		t.Fatal("Domain entry not created after timeout")
-	}
-
-	if domainEntry == nil {
-		t.Fatal("Domain entry not created")
-	}
-
-	if domainEntry.GetNegative() != WeightInvalidRecipient {
-		t.Errorf("Domain Negative = %d; want %d", domainEntry.GetNegative(), WeightInvalidRecipient)
+	// Verify NO domain entry (domain is no longer passed)
+	manager.domainMu.RLock()
+	domainCount := len(manager.domains)
+	manager.domainMu.RUnlock()
+	if domainCount != 0 {
+		t.Errorf("Expected 0 domain entries, got %d", domainCount)
 	}
 }
 
@@ -203,9 +173,8 @@ func TestManagerRecordSpoofingAttempt(t *testing.T) {
 	defer manager.Stop()
 
 	ip := "192.168.1.1"
-	domain := "example.com"
 
-	manager.RecordSpoofingAttempt(ip, domain)
+	manager.RecordSpoofingAttempt(ip)
 
 	var ipEntry *IPEntry
 	_ = waitFor(1*time.Second, func() bool {
@@ -218,25 +187,8 @@ func TestManagerRecordSpoofingAttempt(t *testing.T) {
 	if ipEntry == nil {
 		t.Fatal("IP entry not created")
 	}
-
 	if ipEntry.GetNegative() != WeightSpoofingAttempt {
 		t.Errorf("IP Negative = %d; want %d", ipEntry.GetNegative(), WeightSpoofingAttempt)
-	}
-
-	var domainEntry *DomainEntry
-	_ = waitFor(1*time.Second, func() bool {
-		manager.domainMu.RLock()
-		defer manager.domainMu.RUnlock()
-		domainEntry = manager.domains[domain]
-		return domainEntry != nil && domainEntry.GetNegative() == WeightSpoofingAttempt
-	})
-
-	if domainEntry == nil {
-		t.Fatal("Domain entry not created")
-	}
-
-	if domainEntry.GetNegative() != WeightSpoofingAttempt {
-		t.Errorf("Domain Negative = %d; want %d", domainEntry.GetNegative(), WeightSpoofingAttempt)
 	}
 }
 
@@ -247,9 +199,8 @@ func TestManagerRecordDMARCFailure(t *testing.T) {
 	defer manager.Stop()
 
 	ip := "192.168.1.1"
-	domain := "example.com"
 
-	manager.RecordDMARCFailure(ip, domain)
+	manager.RecordDMARCFailure(ip)
 
 	var ipEntry *IPEntry
 	_ = waitFor(1*time.Second, func() bool {
@@ -262,25 +213,80 @@ func TestManagerRecordDMARCFailure(t *testing.T) {
 	if ipEntry == nil {
 		t.Fatal("IP entry not created")
 	}
-
 	if ipEntry.GetNegative() != WeightDMARCFailure {
 		t.Errorf("IP Negative = %d; want %d", ipEntry.GetNegative(), WeightDMARCFailure)
 	}
+}
 
-	var domainEntry *DomainEntry
+func TestManagerRecordSPFFailure(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	manager := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 0, 0, 0, logger)
+	manager.Start()
+	defer manager.Stop()
+
+	ip := "192.168.1.1"
+
+	manager.RecordSPFFailure(ip)
+
+	// Verify IP gets negative weight
+	var ipEntry *IPEntry
 	_ = waitFor(1*time.Second, func() bool {
-		manager.domainMu.RLock()
-		defer manager.domainMu.RUnlock()
-		domainEntry = manager.domains[domain]
-		return domainEntry != nil && domainEntry.GetNegative() == WeightDMARCFailure
+		manager.ipMu.RLock()
+		defer manager.ipMu.RUnlock()
+		ipEntry = manager.ips[ip]
+		return ipEntry != nil && ipEntry.GetNegative() == WeightSPFFailure
 	})
 
-	if domainEntry == nil {
-		t.Fatal("Domain entry not created")
+	if ipEntry == nil {
+		t.Fatal("IP entry not created")
 	}
 
-	if domainEntry.GetNegative() != WeightDMARCFailure {
-		t.Errorf("Domain Negative = %d; want %d", domainEntry.GetNegative(), WeightDMARCFailure)
+	if ipEntry.GetNegative() != WeightSPFFailure {
+		t.Errorf("IP Negative = %d; want %d", ipEntry.GetNegative(), WeightSPFFailure)
+	}
+
+	// Verify NO domain entry is created (SPF failure is IP-only because domain is forged)
+	manager.domainMu.RLock()
+	domainCount := len(manager.domains)
+	manager.domainMu.RUnlock()
+
+	if domainCount != 0 {
+		t.Errorf("Expected no domain entries (SPF failure is IP-only), got %d", domainCount)
+	}
+}
+
+// TestManagerSPFFailureAccumulatesForRotatingIPs verifies that multiple SPF failures
+// from the same IP accumulate negative reputation, helping catch rotating spammers.
+func TestManagerSPFFailureAccumulatesForRotatingIPs(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	manager := NewManager(true, 24*time.Hour, "test", false, 1*time.Minute, nil, 0, 0, 0, logger)
+	manager.Start()
+	defer manager.Stop()
+
+	ip := "10.0.0.1"
+
+	// Simulate 5 SPF failures from same IP (e.g., spammer forging different domains)
+	for i := 0; i < 5; i++ {
+		manager.RecordSPFFailure(ip)
+	}
+
+	expectedNegative := int64(WeightSPFFailure * 5) // 3 * 5 = 15
+
+	var ipEntry *IPEntry
+	_ = waitFor(1*time.Second, func() bool {
+		manager.ipMu.RLock()
+		defer manager.ipMu.RUnlock()
+		ipEntry = manager.ips[ip]
+		return ipEntry != nil && ipEntry.GetNegative() == expectedNegative
+	})
+
+	if ipEntry == nil {
+		t.Fatal("IP entry not created")
+	}
+
+	if ipEntry.GetNegative() != expectedNegative {
+		t.Errorf("IP Negative = %d; want %d (5 SPF failures × weight %d)",
+			ipEntry.GetNegative(), expectedNegative, WeightSPFFailure)
 	}
 }
 
@@ -291,9 +297,8 @@ func TestManagerRecordJunkMessage(t *testing.T) {
 	defer manager.Stop()
 
 	ip := "192.168.1.1"
-	domain := "example.com"
 
-	manager.RecordJunkMessage(ip, domain)
+	manager.RecordJunkMessage(ip)
 
 	var ipEntry *IPEntry
 	_ = waitFor(1*time.Second, func() bool {
@@ -306,25 +311,8 @@ func TestManagerRecordJunkMessage(t *testing.T) {
 	if ipEntry == nil {
 		t.Fatal("IP entry not created")
 	}
-
 	if ipEntry.GetNegative() != WeightJunkMessage {
 		t.Errorf("IP Negative = %d; want %d", ipEntry.GetNegative(), WeightJunkMessage)
-	}
-
-	var domainEntry *DomainEntry
-	_ = waitFor(1*time.Second, func() bool {
-		manager.domainMu.RLock()
-		defer manager.domainMu.RUnlock()
-		domainEntry = manager.domains[domain]
-		return domainEntry != nil && domainEntry.GetNegative() == WeightJunkMessage
-	})
-
-	if domainEntry == nil {
-		t.Fatal("Domain entry not created")
-	}
-
-	if domainEntry.GetNegative() != WeightJunkMessage {
-		t.Errorf("Domain Negative = %d; want %d", domainEntry.GetNegative(), WeightJunkMessage)
 	}
 }
 
@@ -335,9 +323,8 @@ func TestManagerRecordHamDelivery(t *testing.T) {
 	defer manager.Stop()
 
 	ip := "192.168.1.1"
-	domain := "example.com"
 
-	manager.RecordHamDelivery(ip, domain, 1)
+	manager.RecordHamDelivery(ip, 1)
 
 	var ipEntry *IPEntry
 	_ = waitFor(1*time.Second, func() bool {
@@ -350,25 +337,8 @@ func TestManagerRecordHamDelivery(t *testing.T) {
 	if ipEntry == nil {
 		t.Fatal("IP entry not created")
 	}
-
 	if ipEntry.GetPositive() != WeightHamDelivery {
 		t.Errorf("IP Positive = %d; want %d", ipEntry.GetPositive(), WeightHamDelivery)
-	}
-
-	var domainEntry *DomainEntry
-	_ = waitFor(1*time.Second, func() bool {
-		manager.domainMu.RLock()
-		defer manager.domainMu.RUnlock()
-		domainEntry = manager.domains[domain]
-		return domainEntry != nil && domainEntry.GetPositive() == WeightHamDelivery
-	})
-
-	if domainEntry == nil {
-		t.Fatal("Domain entry not created")
-	}
-
-	if domainEntry.GetPositive() != WeightHamDelivery {
-		t.Errorf("Domain Positive = %d; want %d", domainEntry.GetPositive(), WeightHamDelivery)
 	}
 }
 
@@ -379,42 +349,24 @@ func TestManagerRecordHamDelivery_MultipleRecipients(t *testing.T) {
 	defer manager.Stop()
 
 	ip := "192.168.1.1"
-	domain := "example.com"
 
 	// Simulate a mailing list sending to 100 recipients
-	manager.RecordHamDelivery(ip, domain, 100)
+	manager.RecordHamDelivery(ip, 100)
 
+	expectedPositive := WeightHamDelivery * int64(100)
 	var ipEntry *IPEntry
 	_ = waitFor(1*time.Second, func() bool {
 		manager.ipMu.RLock()
 		defer manager.ipMu.RUnlock()
 		ipEntry = manager.ips[ip]
-		return ipEntry != nil && ipEntry.GetPositive() == WeightHamDelivery*100
+		return ipEntry != nil && ipEntry.GetPositive() == expectedPositive
 	})
 
 	if ipEntry == nil {
 		t.Fatal("IP entry not created")
 	}
-
-	expectedPositive := WeightHamDelivery * int64(100)
 	if ipEntry.GetPositive() != expectedPositive {
 		t.Errorf("IP Positive = %d; want %d (100 recipients × weight %d)", ipEntry.GetPositive(), expectedPositive, WeightHamDelivery)
-	}
-
-	var domainEntry *DomainEntry
-	_ = waitFor(1*time.Second, func() bool {
-		manager.domainMu.RLock()
-		defer manager.domainMu.RUnlock()
-		domainEntry = manager.domains[domain]
-		return domainEntry != nil && domainEntry.GetPositive() == WeightHamDelivery*100
-	})
-
-	if domainEntry == nil {
-		t.Fatal("Domain entry not created")
-	}
-
-	if domainEntry.GetPositive() != expectedPositive {
-		t.Errorf("Domain Positive = %d; want %d (100 recipients × weight %d)", domainEntry.GetPositive(), expectedPositive, WeightHamDelivery)
 	}
 }
 
@@ -428,11 +380,11 @@ func TestManagerMailingListScenario(t *testing.T) {
 	defer manager.Stop()
 
 	ip := "10.0.0.1"
-	domain := "googlegroups.com"
+	_ = "googlegroups.com"
 
 	// Simulate: mailing list sends to 100 recipients, 1 is invalid
 	// The invalid recipient is caught during RCPT TO (before DATA)
-	manager.RecordInvalidRecipient(ip, domain)
+	manager.RecordInvalidRecipient(ip)
 
 	// Wait for invalid recipient event to be processed
 	_ = waitFor(1*time.Second, func() bool {
@@ -443,7 +395,7 @@ func TestManagerMailingListScenario(t *testing.T) {
 	})
 
 	// The remaining 99 are delivered successfully
-	manager.RecordHamDelivery(ip, domain, 99)
+	manager.RecordHamDelivery(ip, 99)
 
 	// Wait for ham delivery event to be processed
 	_ = waitFor(1*time.Second, func() bool {
@@ -554,13 +506,13 @@ func TestManagerDisabled(t *testing.T) {
 	defer manager.Stop()
 
 	ip := "192.168.1.1"
-	domain := "example.com"
+	_ = "example.com"
 
 	// Operations should be no-ops when disabled
 	manager.RecordConnection(ip, true)
-	manager.RecordMailFrom(domain)
-	manager.RecordInvalidRecipient(ip, domain)
-	manager.RecordHamDelivery(ip, domain, 1)
+	manager.RecordMailFrom()
+	manager.RecordInvalidRecipient(ip)
+	manager.RecordHamDelivery(ip, 1)
 
 	// Give a moment for any potential (unwanted) processing
 	time.Sleep(50 * time.Millisecond)

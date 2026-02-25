@@ -40,7 +40,7 @@ func TestStatsIntegration(t *testing.T) {
 		goodIP := "192.168.1.100"
 		for i := 0; i < 15; i++ {
 			statsMgr.RecordConnection(goodIP, true)
-			statsMgr.RecordMailFrom("good.com")
+			statsMgr.RecordMailFrom()
 			statsMgr.RecordHamDelivery(goodIP, "good.com", 1)
 		}
 
@@ -62,11 +62,11 @@ func TestStatsIntegration(t *testing.T) {
 		statsMgr.RecordConnection(testIP, true)
 		statsMgr.RecordConnection(testIP, false) // No rDNS
 		statsMgr.RecordMailFrom(testDomain)
-		statsMgr.RecordInvalidRecipient(testIP, testDomain)
-		statsMgr.RecordSpoofingAttempt(testIP, testDomain)
+		statsMgr.RecordInvalidRecipient(testIP)
+		statsMgr.RecordSpoofingAttempt(testIP)
 		statsMgr.RecordDMARCFailure(testIP, testDomain)
-		statsMgr.RecordJunkMessage(testIP, testDomain)
-		statsMgr.RecordHamDelivery(testIP, testDomain, 1)
+		statsMgr.RecordJunkMessage(testIP)
+		statsMgr.RecordHamDelivery(testIP, 1)
 
 		// Check that reputation can be queried (may be 0 due to insufficient data, that's okay)
 		_, ipRep := statsMgr.CheckIPReputation(testIP)
@@ -154,7 +154,7 @@ func TestComponentsIntegration(t *testing.T) {
 
 	statsMgr.RecordConnection(testIP, true)
 	statsMgr.RecordMailFrom(testDomain)
-	statsMgr.RecordHamDelivery(testIP, testDomain, 1)
+	statsMgr.RecordHamDelivery(testIP, 1)
 
 	shouldDeny, _ := statsMgr.CheckIPReputation(testIP)
 	if shouldDeny {

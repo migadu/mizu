@@ -73,13 +73,18 @@ func TestLRUEviction_Domains(t *testing.T) {
 		"domain6.com", "domain7.com", "domain8.com", "domain9.com", "domain10.com",
 	}
 
+	// Directly insert domain entries (RecordMailFrom no longer creates domains)
+	m.domainMu.Lock()
 	for _, domain := range domains {
-		m.RecordMailFrom(domain)
+		now := time.Now()
+		m.domains[domain] = &DomainEntry{
+			FirstSeen: now,
+			LastSeen:  now,
+			Messages:  1,
+		}
 		time.Sleep(10 * time.Millisecond) // Ensure different LastSeen times
 	}
-
-	// Wait for events to be processed
-	time.Sleep(200 * time.Millisecond)
+	m.domainMu.Unlock()
 
 	// Trigger cleanup (which should evict 5 oldest domains)
 	m.cleanup()
@@ -203,8 +208,8 @@ func TestEvictLRUDomains_NegativeCount(t *testing.T) {
 	defer m.Stop()
 
 	// Add some domains
-	m.RecordMailFrom("test1.com")
-	m.RecordMailFrom("test2.com")
+	m.RecordMailFrom()
+	m.RecordMailFrom()
 	time.Sleep(100 * time.Millisecond)
 
 	m.domainMu.Lock()
@@ -315,11 +320,15 @@ func TestLRUEviction_BothLimits(t *testing.T) {
 		ip := fmt.Sprintf("192.168.100.%d", i)
 		domain := fmt.Sprintf("example%d.com", i)
 		m.RecordConnection(ip, true)
-		m.RecordMailFrom(domain)
+		// Directly insert domain (RecordMailFrom no longer creates domains)
+		m.domainMu.Lock()
+		now := time.Now()
+		m.domains[domain] = &DomainEntry{FirstSeen: now, LastSeen: now, Messages: 1}
+		m.domainMu.Unlock()
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	// Wait for processing
+	// Wait for IP connection events to be processed
 	time.Sleep(200 * time.Millisecond)
 
 	// Trigger cleanup
@@ -427,14 +436,19 @@ func TestLRUEviction_LargeScale(t *testing.T) {
 	m.Start()
 	defer m.Stop()
 
-	// Add 500 IPs
+	// Add 500 IPs and 500 domains
 	for i := 1; i <= 500; i++ {
 		ip := fmt.Sprintf("10.%d.%d.%d", (i/256)%256, (i/16)%16, i%16)
+		domain := fmt.Sprintf("domain%d.com", i)
 		m.RecordConnection(ip, true)
-		m.RecordMailFrom(fmt.Sprintf("domain%d.com", i))
+		// Directly insert domain (RecordMailFrom no longer creates domains)
+		m.domainMu.Lock()
+		now := time.Now()
+		m.domains[domain] = &DomainEntry{FirstSeen: now, LastSeen: now, Messages: 1}
+		m.domainMu.Unlock()
 	}
 
-	// Wait for processing
+	// Wait for IP connection events to be processed
 	time.Sleep(500 * time.Millisecond)
 
 	// Trigger cleanup
@@ -471,13 +485,13 @@ func TestLRUEviction_ReputationPreserved(t *testing.T) {
 	goodIP := "192.168.1.100"
 	for i := 0; i < 20; i++ {
 		m.RecordConnection(goodIP, true)
-		m.RecordHamDelivery(goodIP, "good.com", 1)
+		m.RecordHamDelivery(goodIP, 1)
 	}
 
 	badIP1 := "192.168.1.101"
 	for i := 0; i < 10; i++ {
 		m.RecordConnection(badIP1, true)
-		m.RecordJunkMessage(badIP1, "bad1.com")
+		m.RecordJunkMessage(badIP1)
 	}
 
 	middleIP := "192.168.1.102"

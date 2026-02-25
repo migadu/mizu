@@ -13,6 +13,7 @@ const (
 	// Negative events
 	WeightJunkMessage      = 1
 	WeightInvalidRecipient = 2
+	WeightSPFFailure       = 3
 	WeightDNSBLHit         = 5
 	WeightSpoofingAttempt  = 10
 	WeightDMARCFailure     = 10
