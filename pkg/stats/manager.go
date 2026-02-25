@@ -101,11 +101,12 @@ type srvDomainCounters struct {
 
 // srvCounters tracks message counters for a single config server name
 type srvCounters struct {
-	total    uint64
-	accepted uint64
-	rejected uint64
-	junk     uint64
-	domains  map[string]*srvDomainCounters
+	total       uint64
+	accepted    uint64
+	rejected    uint64
+	junk        uint64
+	domains     map[string]*srvDomainCounters // Sender (FROM) domains
+	rcptDomains map[string]*srvDomainCounters // Recipient (TO) domains
 }
 
 // ConnectionTracker interface for getting active connection stats
@@ -183,11 +184,11 @@ func (r *ServerRecorder) RecordDeniedConnection(ip string) {
 	r.manager.sendEvent(event{Type: eventDeniedConnection, IP: ip, ServerName: r.serverName})
 }
 
-func (r *ServerRecorder) RecordMailFrom() {
+func (r *ServerRecorder) RecordMailFrom(domain string) {
 	if r.manager == nil || !r.manager.enabled {
 		return
 	}
-	r.manager.sendEvent(event{Type: eventMailFrom, ServerName: r.serverName})
+	r.manager.sendEvent(event{Type: eventMailFrom, Domain: domain, ServerName: r.serverName})
 }
 
 func (r *ServerRecorder) RecordInvalidRecipient(ip string) {
@@ -245,6 +246,38 @@ func (r *ServerRecorder) RecordHamDelivery(ip string, recipientCount int) {
 		recipientCount = 1
 	}
 	r.manager.sendEvent(event{Type: eventHamDelivery, IP: ip, ServerName: r.serverName, Count: recipientCount})
+}
+
+// RecordDeliveryRecipients tracks recipient (TO) domains for observability.
+// This is called after successful delivery to record which recipient domains
+// were involved. For incoming servers these are our hosted domains; for
+// submission servers these are external destination domains.
+// accepted=true for ham deliveries, accepted=false for junk deliveries.
+func (r *ServerRecorder) RecordDeliveryRecipients(recipients []string, accepted bool) {
+	if r.manager == nil || !r.manager.enabled {
+		return
+	}
+	// Extract unique recipient domains
+	rcptDomains := make(map[string]int) // domain → count
+	for _, rcpt := range recipients {
+		domain := ExtractDomainFromEmail(rcpt)
+		if domain != "" {
+			rcptDomains[domain]++
+		}
+	}
+	// Update per-server recipient domain counters directly (observability only)
+	r.manager.srvCountersMu.Lock()
+	sc := r.manager.getOrCreateSrvCounters(r.serverName)
+	for domain, count := range rcptDomains {
+		rd := sc.getOrCreateRcptDomain(domain)
+		rd.messages += int64(count)
+		if accepted {
+			rd.accepted += int64(count)
+		} else {
+			rd.junk += int64(count)
+		}
+	}
+	r.manager.srvCountersMu.Unlock()
 }
 
 func (r *ServerRecorder) CheckIPReputation(ip string) (shouldDeny bool, reputation float64) {
@@ -311,13 +344,16 @@ func (m *Manager) getOrCreateSrvCounters(name string) *srvCounters {
 	}
 	c, ok := m.srvCounters[name]
 	if !ok {
-		c = &srvCounters{domains: make(map[string]*srvDomainCounters)}
+		c = &srvCounters{
+			domains:     make(map[string]*srvDomainCounters),
+			rcptDomains: make(map[string]*srvDomainCounters),
+		}
 		m.srvCounters[name] = c
 	}
 	return c
 }
 
-// getOrCreateSrvDomain returns the per-domain counters for a server, creating if needed.
+// getOrCreateDomain returns the per-sender-domain counters for a server, creating if needed.
 // Caller must hold srvCountersMu write lock.
 func (c *srvCounters) getOrCreateDomain(domain string) *srvDomainCounters {
 	if domain == "" {
@@ -327,6 +363,20 @@ func (c *srvCounters) getOrCreateDomain(domain string) *srvDomainCounters {
 	if !ok {
 		d = &srvDomainCounters{}
 		c.domains[domain] = d
+	}
+	return d
+}
+
+// getOrCreateRcptDomain returns the per-recipient-domain counters for a server, creating if needed.
+// Caller must hold srvCountersMu write lock.
+func (c *srvCounters) getOrCreateRcptDomain(domain string) *srvDomainCounters {
+	if domain == "" {
+		return nil
+	}
+	d, ok := c.rcptDomains[domain]
+	if !ok {
+		d = &srvDomainCounters{}
+		c.rcptDomains[domain] = d
 	}
 	return d
 }
@@ -774,12 +824,14 @@ func (m *Manager) RecordConnection(ip string, hasRDNS bool) {
 	m.sendEvent(event{Type: eventConnection, IP: ip, Domain: rdnsStatus})
 }
 
-// RecordMailFrom records a MAIL FROM command for per-server message counting.
-func (m *Manager) RecordMailFrom() {
+// RecordMailFrom records a MAIL FROM command for per-server message counting
+// and domain observability. The domain is used for stats/monitoring only,
+// NOT for reputation scoring (since MAIL FROM is trivially forged).
+func (m *Manager) RecordMailFrom(domain string) {
 	if !m.enabled {
 		return
 	}
-	m.sendEvent(event{Type: eventMailFrom})
+	m.sendEvent(event{Type: eventMailFrom, Domain: domain})
 }
 
 // RecordInvalidRecipient records an attempt to send to a non-existent address.
@@ -1076,6 +1128,18 @@ func (m *Manager) buildServerSummaries() map[string]*ServerSummary {
 				}
 				m.domainMu.RUnlock()
 				summary.Domains[domain] = sds
+			}
+		}
+		// Include per-server recipient domain breakdown
+		if len(c.rcptDomains) > 0 {
+			summary.RecipientDomains = make(map[string]*ServerDomainStats, len(c.rcptDomains))
+			for domain, dc := range c.rcptDomains {
+				summary.RecipientDomains[domain] = &ServerDomainStats{
+					Messages: dc.messages,
+					Accepted: dc.accepted,
+					Rejected: dc.rejected,
+					Junk:     dc.junk,
+				}
 			}
 		}
 		servers[name] = summary

@@ -873,7 +873,7 @@ func (s *Session) Mail(from string, opts *smtp.MailOptions) error {
 	// Record MAIL FROM for per-server message counting.
 	// Domain is not passed because it is unverified (trivially forged).
 	if s.statsManager != nil {
-		s.statsManager.RecordMailFrom()
+		s.statsManager.RecordMailFrom(s.senderDomain)
 	}
 
 	// Note: Mailbox/domain validation is now handled by the destination HTTP endpoint
@@ -1582,11 +1582,15 @@ func (s *Session) finalizeSuccessfulDelivery() {
 	if s.statsManager != nil {
 		if s.isJunk {
 			s.statsManager.RecordJunkMessage(s.remoteAddr)
+			// Track recipient domains for observability (junk delivery)
+			s.statsManager.RecordDeliveryRecipients(s.to, false)
 		} else {
 			// Award reputation per successful recipient, not per message.
 			// This ensures mailing lists and bulk senders get proportional
 			// positive reputation (e.g., 100 recipients = +100, not +1).
 			s.statsManager.RecordHamDelivery(s.remoteAddr, len(s.to))
+			// Track recipient domains for observability (ham delivery)
+			s.statsManager.RecordDeliveryRecipients(s.to, true)
 		}
 	}
 	s.Logger.Info("Email delivered successfully",

@@ -260,9 +260,10 @@ type ServerSummary struct {
 	AcceptedMessages  int64                         `json:"accepted_messages"`
 	RejectedMessages  int64                         `json:"rejected_messages"`
 	JunkMessages      int64                         `json:"junk_messages"`
-	ActiveConnections int64                         `json:"active_connections"` // Active SMTP connections for this server
+	ActiveConnections int64                         `json:"active_connections"`
 	LastUpdated       time.Time                     `json:"last_updated"`
-	Domains           map[string]*ServerDomainStats `json:"domains,omitempty"`
+	Domains           map[string]*ServerDomainStats `json:"domains,omitempty"`           // Sender (FROM) domains
+	RecipientDomains  map[string]*ServerDomainStats `json:"recipient_domains,omitempty"` // Recipient (TO) domains
 }
 
 func cmdBlockedIPs() {
@@ -380,11 +381,11 @@ func cmdStats() {
 				fmt.Printf("  Last updated:             %s\n", srv.LastUpdated.Format("2006-01-02 15:04:05"))
 			}
 
-			// Per-server top domains
+			// Per-server top sender domains (FROM)
 			if len(srv.Domains) > 0 {
 				fmt.Println()
-				fmt.Printf("  Top Domains\n")
-				fmt.Printf("  ───────────\n")
+				fmt.Printf("  Top Sender Domains (FROM)\n")
+				fmt.Printf("  ─────────────────────────\n")
 
 				type srvDomainEntry struct {
 					domain string
@@ -412,6 +413,41 @@ func cmdStats() {
 						entry.stats.Rejected,
 						entry.stats.Junk,
 						entry.stats.Reputation,
+					)
+				}
+				w.Flush()
+			}
+
+			// Per-server top recipient domains (TO)
+			if len(srv.RecipientDomains) > 0 {
+				fmt.Println()
+				fmt.Printf("  Top Recipient Domains (TO)\n")
+				fmt.Printf("  ──────────────────────────\n")
+
+				type srvDomainEntry struct {
+					domain string
+					stats  *ServerDomainStats
+				}
+				rcptEntries := make([]srvDomainEntry, 0, len(srv.RecipientDomains))
+				for domain, dStats := range srv.RecipientDomains {
+					rcptEntries = append(rcptEntries, srvDomainEntry{domain, dStats})
+				}
+				sort.Slice(rcptEntries, func(i, j int) bool {
+					return rcptEntries[i].stats.Messages > rcptEntries[j].stats.Messages
+				})
+
+				w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+				fmt.Fprintln(w, "  DOMAIN\tRECIPIENTS\tACCEPTED\tJUNK")
+
+				for i, entry := range rcptEntries {
+					if i >= 10 {
+						break
+					}
+					fmt.Fprintf(w, "  %s\t%d\t%d\t%d\n",
+						entry.domain,
+						entry.stats.Messages,
+						entry.stats.Accepted,
+						entry.stats.Junk,
 					)
 				}
 				w.Flush()

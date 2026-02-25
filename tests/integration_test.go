@@ -40,8 +40,8 @@ func TestStatsIntegration(t *testing.T) {
 		goodIP := "192.168.1.100"
 		for i := 0; i < 15; i++ {
 			statsMgr.RecordConnection(goodIP, true)
-			statsMgr.RecordMailFrom()
-			statsMgr.RecordHamDelivery(goodIP, "good.com", 1)
+			statsMgr.RecordMailFrom("good.com")
+			statsMgr.RecordHamDelivery(goodIP, 1)
 		}
 
 		shouldDeny, reputation := statsMgr.CheckIPReputation(goodIP)
@@ -64,7 +64,7 @@ func TestStatsIntegration(t *testing.T) {
 		statsMgr.RecordMailFrom(testDomain)
 		statsMgr.RecordInvalidRecipient(testIP)
 		statsMgr.RecordSpoofingAttempt(testIP)
-		statsMgr.RecordDMARCFailure(testIP, testDomain)
+		statsMgr.RecordDMARCFailure(testIP)
 		statsMgr.RecordJunkMessage(testIP)
 		statsMgr.RecordHamDelivery(testIP, 1)
 

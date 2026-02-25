@@ -107,10 +107,10 @@ func TestManagerRecordMailFrom(t *testing.T) {
 	manager.Start()
 	defer manager.Stop()
 
-	// RecordMailFrom no longer takes a domain (domain is unverified/forged).
-	// It only increments per-server total counters.
-	manager.RecordMailFrom()
-	manager.RecordMailFrom()
+	// RecordMailFrom takes a domain for observability (message counting),
+	// but domain reputation is NOT used for scoring (domain is unverified/forged).
+	manager.RecordMailFrom("example.com")
+	manager.RecordMailFrom("example.com")
 
 	// Give event loop time to process
 	time.Sleep(200 * time.Millisecond)
@@ -123,12 +123,19 @@ func TestManagerRecordMailFrom(t *testing.T) {
 		t.Errorf("Per-server total = %v; want 2", sc)
 	}
 
-	// Verify NO domain entry is created (domain is not passed)
-	manager.domainMu.RLock()
-	domainCount := len(manager.domains)
-	manager.domainMu.RUnlock()
-	if domainCount != 0 {
-		t.Errorf("Expected 0 domain entries, got %d", domainCount)
+	// Verify domain entry is created for observability (message counting)
+	var entry *DomainEntry
+	_ = waitFor(1*time.Second, func() bool {
+		manager.domainMu.RLock()
+		defer manager.domainMu.RUnlock()
+		entry = manager.domains["example.com"]
+		return entry != nil && entry.GetMessages() == 2
+	})
+	if entry == nil {
+		t.Fatal("Domain entry not created for observability")
+	}
+	if entry.GetMessages() != 2 {
+		t.Errorf("Messages = %d; want 2", entry.GetMessages())
 	}
 }
 
@@ -510,7 +517,7 @@ func TestManagerDisabled(t *testing.T) {
 
 	// Operations should be no-ops when disabled
 	manager.RecordConnection(ip, true)
-	manager.RecordMailFrom()
+	manager.RecordMailFrom("example.com")
 	manager.RecordInvalidRecipient(ip)
 	manager.RecordHamDelivery(ip, 1)
 

@@ -420,7 +420,8 @@ type ServerSummary struct {
 	JunkMessages      int64                         `json:"junk_messages"`
 	ActiveConnections int64                         `json:"active_connections"` // Active SMTP connections for this server
 	LastUpdated       time.Time                     `json:"last_updated"`
-	Domains           map[string]*ServerDomainStats `json:"domains,omitempty"`
+	Domains           map[string]*ServerDomainStats `json:"domains,omitempty"`           // Sender (FROM) domains
+	RecipientDomains  map[string]*ServerDomainStats `json:"recipient_domains,omitempty"` // Recipient (TO) domains
 }
 
 // StatsSnapshot is a complete snapshot of stats for API responses

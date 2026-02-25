@@ -18,7 +18,7 @@ func TestEventMetrics_ProcessedCounter(t *testing.T) {
 
 	// Send some events
 	manager.RecordConnection("192.168.1.100", true)
-	manager.RecordMailFrom()
+	manager.RecordMailFrom("example.com")
 	manager.RecordHamDelivery("192.168.1.100", 1)
 
 	// Give time for events to be processed

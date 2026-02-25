@@ -208,8 +208,8 @@ func TestEvictLRUDomains_NegativeCount(t *testing.T) {
 	defer m.Stop()
 
 	// Add some domains
-	m.RecordMailFrom()
-	m.RecordMailFrom()
+	m.RecordMailFrom("test.com")
+	m.RecordMailFrom("test.com")
 	time.Sleep(100 * time.Millisecond)
 
 	m.domainMu.Lock()
