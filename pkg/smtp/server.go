@@ -1255,8 +1255,9 @@ func (s *Session) performPreDeliveryChecks(rawEmail string) error {
 		loopResult := detectMailLoop(rawEmail, s.serverConfig.Hostname, maxHops)
 		if loopResult.IsLoop {
 			if loopResult.LoopHostname != "" {
-				s.Logger.Warn("Mail loop detected - hostname appears in Received headers",
+				s.Logger.Warn("Mail loop detected - hostname appears multiple times in Received headers",
 					"hostname", loopResult.LoopHostname,
+					"hostname_count", loopResult.HostnameCount,
 					"hop_count", loopResult.HopCount,
 					"from", s.from)
 				if s.metrics != nil {
