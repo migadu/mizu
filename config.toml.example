@@ -52,6 +52,8 @@
 # min_domain_score = -0.2                           # Minimum domain reputation score (default: -0.2, range: -1.0 to 1.0) - domains below this are rejected
 # reject_code = 421                                 # SMTP code for reputation rejection (default: 421, common: 421=temp fail, 450=temp fail, 451=local error, 550=perm fail)
 # reject_message = "poor reputation, please try again later"  # Custom rejection message
+# whitelist_ips = ["1.2.3.4", "10.0.0.0/8"]         # IPs/CIDRs to whitelist - bypass reputation checks (e.g., monitoring services)
+# whitelist_hosts = ["hetrixtools.com", "pingdom.com"]  # PTR hostnames to whitelist - suffix match (e.g., "wk9-4.hetrixtools.com" matches "hetrixtools.com")
 #
 # [server.reputation.dnsbl]
 # enabled = false                                   # Enable DNSBL checking that feeds into reputation (default: false)

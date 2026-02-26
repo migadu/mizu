@@ -448,27 +448,60 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 
 			// Check IP reputation if enabled for this server
 			if be.ServerConfig.Reputation.Enabled {
-				if shouldDeny, reputation := be.StatsManager.CheckIPReputation(ipStr); shouldDeny {
-					be.Logger.Info("Rejecting connection - poor IP reputation",
-						"server", be.ServerConfig.Name,
-						"remote_addr", remoteAddr,
-						"remote_host", ptrRecord,
-						"score", reputation)
+				// Check whitelist first - skip reputation check if whitelisted
+				isWhitelisted := false
 
-					// Use configured rejection code and message
-					rejectCode := be.ServerConfig.Reputation.RejectCode
-					if rejectCode == 0 {
-						rejectCode = 421 // Default temporary failure
+				// Check IP whitelist
+				for _, whitelistEntry := range be.ServerConfig.Reputation.WhitelistIPs {
+					if be.matchIPWhitelist(ipStr, whitelistEntry) {
+						be.Logger.Info("IP is whitelisted - skipping reputation check",
+							"server", be.ServerConfig.Name,
+							"remote_addr", remoteAddr,
+							"whitelist_entry", whitelistEntry)
+						isWhitelisted = true
+						break
 					}
-					rejectMessage := be.ServerConfig.Reputation.RejectMessage
-					if rejectMessage == "" {
-						rejectMessage = "poor reputation, please try again later"
-					}
+				}
 
-					return nil, &smtp.SMTPError{
-						Code:         rejectCode,
-						EnhancedCode: smtp.EnhancedCode{4, 7, 1},
-						Message:      rejectMessage,
+				// Check hostname whitelist (PTR suffix match)
+				if !isWhitelisted && ptrRecord != "" {
+					for _, whitelistHost := range be.ServerConfig.Reputation.WhitelistHosts {
+						if be.matchHostWhitelist(ptrRecord, whitelistHost) {
+							be.Logger.Info("Hostname is whitelisted - skipping reputation check",
+								"server", be.ServerConfig.Name,
+								"remote_addr", remoteAddr,
+								"remote_host", ptrRecord,
+								"whitelist_host", whitelistHost)
+							isWhitelisted = true
+							break
+						}
+					}
+				}
+
+				// Only check reputation if not whitelisted
+				if !isWhitelisted {
+					if shouldDeny, reputation := be.StatsManager.CheckIPReputation(ipStr); shouldDeny {
+						be.Logger.Info("Rejecting connection - poor IP reputation",
+							"server", be.ServerConfig.Name,
+							"remote_addr", remoteAddr,
+							"remote_host", ptrRecord,
+							"score", reputation)
+
+						// Use configured rejection code and message
+						rejectCode := be.ServerConfig.Reputation.RejectCode
+						if rejectCode == 0 {
+							rejectCode = 421 // Default temporary failure
+						}
+						rejectMessage := be.ServerConfig.Reputation.RejectMessage
+						if rejectMessage == "" {
+							rejectMessage = "poor reputation, please try again later"
+						}
+
+						return nil, &smtp.SMTPError{
+							Code:         rejectCode,
+							EnhancedCode: smtp.EnhancedCode{4, 7, 1},
+							Message:      rejectMessage,
+						}
 					}
 				}
 			}
@@ -537,6 +570,49 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 
 	sessionCreated = true
 	return session, nil
+}
+
+// matchIPWhitelist checks if an IP matches a whitelist entry (supports CIDR)
+func (be *Backend) matchIPWhitelist(ip string, whitelistEntry string) bool {
+	// Parse the IP
+	ipAddr := net.ParseIP(ip)
+	if ipAddr == nil {
+		return false
+	}
+
+	// Check if whitelist entry is a CIDR
+	if strings.Contains(whitelistEntry, "/") {
+		_, ipNet, err := net.ParseCIDR(whitelistEntry)
+		if err != nil {
+			be.Logger.Warn("Invalid CIDR in whitelist", "entry", whitelistEntry, "error", err)
+			return false
+		}
+		return ipNet.Contains(ipAddr)
+	}
+
+	// Exact IP match
+	whitelistIP := net.ParseIP(whitelistEntry)
+	if whitelistIP == nil {
+		be.Logger.Warn("Invalid IP in whitelist", "entry", whitelistEntry)
+		return false
+	}
+	return ipAddr.Equal(whitelistIP)
+}
+
+// matchHostWhitelist checks if a PTR hostname matches a whitelist entry (suffix match)
+// Example: "wk9-4.hetrixtools.com." matches "hetrixtools.com"
+func (be *Backend) matchHostWhitelist(ptrHost string, whitelistHost string) bool {
+	// Normalize: remove trailing dots and convert to lowercase
+	ptrHost = strings.TrimSuffix(strings.ToLower(ptrHost), ".")
+	whitelistHost = strings.TrimSuffix(strings.ToLower(whitelistHost), ".")
+
+	// Exact match
+	if ptrHost == whitelistHost {
+		return true
+	}
+
+	// Suffix match: "wk9-4.hetrixtools.com" ends with ".hetrixtools.com"
+	return strings.HasSuffix(ptrHost, "."+whitelistHost)
 }
 
 // Session represents an active SMTP session for an incoming email.

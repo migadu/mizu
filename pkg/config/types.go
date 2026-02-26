@@ -109,6 +109,8 @@ type ServerReputationConfig struct {
 	MinDomainScore float64                     `toml:"min_domain_score"` // Minimum domain reputation score (default: -0.2, range: -1.0 to 1.0)
 	RejectCode     int                         `toml:"reject_code"`      // SMTP code for reputation rejection (default: 421, common: 421, 450, 451, 550)
 	RejectMessage  string                      `toml:"reject_message"`   // Message for reputation rejection (default: "poor reputation, please try again later")
+	WhitelistIPs   []string                    `toml:"whitelist_ips"`    // IP addresses/CIDRs to whitelist (e.g., ["1.2.3.4", "10.0.0.0/8"])
+	WhitelistHosts []string                    `toml:"whitelist_hosts"`  // PTR hostnames to whitelist (suffix match, e.g., ["hetrixtools.com", "pingdom.com"])
 	DNSBL          ServerReputationDNSBLConfig `toml:"dnsbl"`            // DNS blacklist checking that feeds into reputation scoring
 }
 
