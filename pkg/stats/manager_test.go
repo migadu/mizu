@@ -112,12 +112,16 @@ func TestManagerRecordMailFrom(t *testing.T) {
 	// Give event loop time to process
 	time.Sleep(200 * time.Millisecond)
 
-	// Verify per-server total counter incremented
+	// Verify per-server domain counter incremented
 	manager.srvCountersMu.RLock()
 	sc := manager.srvCounters["_default"]
 	manager.srvCountersMu.RUnlock()
-	if sc == nil || sc.total != 2 {
-		t.Errorf("Per-server total = %v; want 2", sc)
+	if sc == nil {
+		t.Fatal("Per-server counters not created")
+	}
+	dc := sc.domains["example.com"]
+	if dc == nil || dc.messages != 2 {
+		t.Errorf("Per-server domain messages = %v; want 2", dc)
 	}
 
 }

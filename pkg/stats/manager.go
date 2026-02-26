@@ -98,8 +98,8 @@ type srvDomainCounters struct {
 }
 
 // srvCounters tracks message counters for a single config server name
+// Note: total is computed from (accepted + rejected + junk) to handle multi-recipient messages
 type srvCounters struct {
-	total       uint64
 	accepted    uint64
 	rejected    uint64
 	junk        uint64
@@ -493,10 +493,11 @@ func (m *Manager) handleEvent(e event) {
 		entry.IsDenied = true
 		entry.mu.Unlock()
 	case eventMailFrom:
-		// Track per-server message count
+		// Track per-server sender domain message counts
+		// Note: We don't increment total here because it's computed from outcomes
+		// (accepted + rejected + junk) to handle multi-recipient messages correctly
 		m.srvCountersMu.Lock()
 		c := m.getOrCreateSrvCounters(e.ServerName)
-		c.total++
 		if e.Domain != "" {
 			if d := c.getOrCreateDomain(e.Domain, m.maxSrvDomainEntries); d != nil {
 				d.messages++
@@ -929,9 +930,11 @@ func (m *Manager) buildServerSummaries() map[string]*ServerSummary {
 	// Add per-config-server summaries from local counters
 	m.srvCountersMu.RLock()
 	for name, c := range m.srvCounters {
+		// Total is computed from outcomes to handle multi-recipient messages correctly
+		total := int64(c.accepted + c.rejected + c.junk)
 		summary := &ServerSummary{
 			Hostname:          name,
-			TotalMessages:     int64(c.total),
+			TotalMessages:     total,
 			AcceptedMessages:  int64(c.accepted),
 			RejectedMessages:  int64(c.rejected),
 			JunkMessages:      int64(c.junk),

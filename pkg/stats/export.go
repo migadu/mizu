@@ -87,13 +87,14 @@ func (m *Manager) createExport(hostname string) *StatsExport {
 
 	// Include aggregated local server message counts in export
 	m.srvCountersMu.RLock()
-	var totalMsg, acceptedMsg, rejectedMsg, junkMsg int64
+	var acceptedMsg, rejectedMsg, junkMsg int64
 	for _, c := range m.srvCounters {
-		totalMsg += int64(c.total)
 		acceptedMsg += int64(c.accepted)
 		rejectedMsg += int64(c.rejected)
 		junkMsg += int64(c.junk)
 	}
+	// Total is computed from outcomes to handle multi-recipient messages correctly
+	totalMsg := acceptedMsg + rejectedMsg + junkMsg
 	export.Summary = &ExportSummary{
 		TotalMessages:    totalMsg,
 		AcceptedMessages: acceptedMsg,
