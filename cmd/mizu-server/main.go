@@ -57,14 +57,23 @@ func main() {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
 
-	if err := cfg.Validate(); err != nil {
-		log.Fatalf("Configuration validation failed: %v", err)
-	}
-
 	// Setup logging
 	logger, err := logging.NewLogger(cfg.Logging)
 	if err != nil {
 		log.Fatalf("Failed to setup logging: %v", err)
+	}
+
+	logger.Info("███╗   ███╗██╗███████╗██╗   ██╗")
+	logger.Info("████╗ ████║██║╚══███╔╝██║   ██║")
+	logger.Info("██╔████╔██║██║  ███╔╝ ██║   ██║")
+	logger.Info("██║╚██╔╝██║██║ ███╔╝  ██║   ██║")
+	logger.Info("██║ ╚═╝ ██║██║███████╗╚██████╔╝")
+	logger.Info("╚═╝     ╚═╝╚═╝╚══════╝ ╚═════╝ ")
+	logger.Info("mizu smtp2http server starting", "version", version, "commit", commit, "built", date)
+	logger.Info("Logging configuration", "format", cfg.Logging.Format, "level", cfg.Logging.Level)
+
+	if err := cfg.Validate(); err != nil {
+		log.Fatalf("Configuration validation failed: %v", err)
 	}
 
 	// Create context for graceful shutdown
