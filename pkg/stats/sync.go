@@ -46,7 +46,8 @@ func (m *Manager) SyncFromS3(ctx context.Context, s3Client *s3.Client, bucket, p
 
 // syncFromServer syncs stats from a single server
 func (m *Manager) syncFromServer(ctx context.Context, s3Client *s3.Client, bucket, prefix, serverHostname string) (int, error) {
-	objectName := path.Join(prefix, "stats", fmt.Sprintf("%s.json.gz", serverHostname))
+	// prefix already includes the "stats/" subdirectory
+	objectName := path.Join(prefix, fmt.Sprintf("%s.json.gz", serverHostname))
 
 	// Check if we've already synced this version
 	m.lastSyncMu.RLock()

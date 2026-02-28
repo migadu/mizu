@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,6 +14,7 @@ import (
 	"migadu/mizu/pkg/health"
 	"net"
 	"path"
+	"strings"
 	"sync"
 	"time"
 
@@ -70,6 +73,9 @@ type DistributedTracker struct {
 	snapshotMu         sync.Mutex
 	lastConnGeneration uint64
 	lastConnMap        map[string]int
+
+	// S3 export change detection to avoid writing unchanged data
+	lastExportHash string
 
 	// Control
 	ctx    context.Context
@@ -692,7 +698,9 @@ func (dt *DistributedTracker) syncWithS3() {
 	}
 }
 
-// exportToS3 exports current connection state to S3
+// exportToS3 exports current connection state to S3.
+// Uses hash-based change detection to avoid writing unchanged data,
+// which prevents accumulating S3 object versions when state hasn't changed.
 func (dt *DistributedTracker) exportToS3() error {
 	if dt.s3Client == nil {
 		return fmt.Errorf("S3 client not initialized")
@@ -700,10 +708,22 @@ func (dt *DistributedTracker) exportToS3() error {
 
 	snapshot := dt.createSnapshot()
 
-	// Marshal to JSON
+	// Marshal to JSON (deterministic - same data produces same JSON since maps are sorted by encoding/json)
 	data, err := json.Marshal(snapshot)
 	if err != nil {
 		return fmt.Errorf("failed to marshal snapshot: %w", err)
+	}
+
+	// Hash the JSON data (pre-compression) to detect changes.
+	// We hash the uncompressed JSON because gzip output can vary
+	// even for identical input (timestamps in gzip header).
+	h := sha256.Sum256(data)
+	currentHash := hex.EncodeToString(h[:])
+
+	// Skip upload if data hasn't changed since last export
+	if currentHash == dt.lastExportHash {
+		dt.logger.Debug("Skipping S3 export - connection state unchanged")
+		return nil
 	}
 
 	// Compress
@@ -716,8 +736,8 @@ func (dt *DistributedTracker) exportToS3() error {
 		return fmt.Errorf("failed to close gzip: %w", err)
 	}
 
-	// Upload to S3
-	objectName := path.Join(dt.s3Prefix, "connections", fmt.Sprintf("%s.json.gz", dt.hostname))
+	// Upload to S3 (s3Prefix already includes the "connections/" subdirectory)
+	objectName := path.Join(dt.s3Prefix, fmt.Sprintf("%s.json.gz", dt.hostname))
 	_, err = dt.s3Client.PutObject(context.Background(), &s3.PutObjectInput{
 		Bucket:      aws.String(dt.s3Bucket),
 		Key:         aws.String(objectName),
@@ -727,6 +747,9 @@ func (dt *DistributedTracker) exportToS3() error {
 	if err != nil {
 		return fmt.Errorf("failed to upload to S3: %w", err)
 	}
+
+	// Update last export hash on successful upload
+	dt.lastExportHash = currentHash
 
 	dt.logger.Debug("Exported connection state to S3",
 		"object", objectName,
@@ -741,7 +764,11 @@ func (dt *DistributedTracker) importFromS3() error {
 		return fmt.Errorf("S3 client not initialized")
 	}
 
-	prefix := path.Join(dt.s3Prefix, "connections") + "/"
+	// s3Prefix already includes the "connections/" subdirectory
+	prefix := dt.s3Prefix
+	if !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
 
 	// List all connection files
 	paginator := s3.NewListObjectsV2Paginator(dt.s3Client, &s3.ListObjectsV2Input{

@@ -532,8 +532,12 @@ func initTLS(cfg *config.Config, clusterMgr *cluster.Cluster, logger *slog.Logge
 			syncInterval = 5 * time.Minute
 		}
 
-		// Build storage prefix for certificates (append "certs/" to base prefix)
+		// Build storage prefix for certificates (append "certs/" to base prefix).
+		// Guard against duplication if s3_prefix already ends with "certs/".
 		certStoragePrefix := cfg.Storage.S3Prefix + "certs/"
+		if strings.HasSuffix(cfg.Storage.S3Prefix, "certs/") {
+			certStoragePrefix = cfg.Storage.S3Prefix
+		}
 
 		// Create TLS manager with autocert using storage backend abstraction
 		tlsMgr, err = tlsmgr.NewManager(tlsmgr.Config{
@@ -750,8 +754,12 @@ func startStatsLoops(ctx context.Context, statsMgr *stats.Manager, s3Client *s3.
 		}
 	}
 
-	// Start export loop (use stats/ subdirectory)
+	// Start export loop (use stats/ subdirectory).
+	// Guard against duplication if s3_prefix already ends with "stats/".
 	statsPrefix := cfg.Storage.S3Prefix + "stats/"
+	if strings.HasSuffix(cfg.Storage.S3Prefix, "stats/") {
+		statsPrefix = cfg.Storage.S3Prefix
+	}
 	concurrency.SafeGo(logger, "stats-export-loop", func() {
 		statsMgr.StartExportLoop(ctx, s3Client, cfg.Storage.S3Bucket, statsPrefix,
 			hostname, time.Duration(cfg.Stats.SyncIntervalSeconds)*time.Second)
@@ -813,8 +821,12 @@ func createServerBackend(
 			}
 		}
 
-		// Use connections/ subdirectory for distributed tracking
+		// Use connections/ subdirectory for distributed tracking.
+		// Guard against duplication if s3_prefix already ends with "connections/".
 		connectionsPrefix := globalCfg.Storage.S3Prefix + "connections/"
+		if strings.HasSuffix(globalCfg.Storage.S3Prefix, "connections/") {
+			connectionsPrefix = globalCfg.Storage.S3Prefix
+		}
 		distTracker = smtp.NewDistributedTracker(
 			connTracker,
 			s3Client,

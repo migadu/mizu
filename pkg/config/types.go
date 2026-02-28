@@ -487,7 +487,7 @@ func DefaultConfig() Config {
 			FilesystemPath: "/var/lib/mizu/storage", // Default filesystem path
 			S3Endpoint:     "s3.amazonaws.com",
 			S3Bucket:       "email-mx-certs",
-			S3Prefix:       "", // Base prefix (subdirectories added automatically: certs/, stats/, connections/)
+			S3Prefix:       "", // Base prefix for all S3 keys. Subdirectories are appended automatically: certs/, stats/, connections/. Do NOT set this to "certs/" or similar — that would cause doubled paths like certs/certs/.
 			S3Region:       "us-east-1",
 		},
 		TLS: TLSConfig{

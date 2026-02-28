@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -14,7 +16,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
-// ExportToS3 exports the current stats to S3 as a compressed JSON file
+// ExportToS3 exports the current stats to S3 as a compressed JSON file.
+// Uses hash-based change detection to avoid writing unchanged data,
+// which prevents accumulating S3 object versions when stats haven't changed.
 func (m *Manager) ExportToS3(ctx context.Context, s3Client *s3.Client, bucket, prefix, hostname string) error {
 	if !m.enabled || !m.syncEnabled {
 		return nil
@@ -29,6 +33,18 @@ func (m *Manager) ExportToS3(ctx context.Context, s3Client *s3.Client, bucket, p
 		return fmt.Errorf("failed to marshal stats: %w", err)
 	}
 
+	// Hash the JSON data (pre-compression) to detect changes.
+	// We hash the uncompressed JSON because gzip output can vary
+	// even for identical input (timestamps in gzip header).
+	h := sha256.Sum256(jsonData)
+	currentHash := hex.EncodeToString(h[:])
+
+	// Skip upload if data hasn't changed since last export
+	if currentHash == m.lastExportHash {
+		m.logger.Debug("Skipping S3 stats export - data unchanged")
+		return nil
+	}
+
 	// Compress the JSON
 	var buf bytes.Buffer
 	gw := gzip.NewWriter(&buf)
@@ -39,8 +55,8 @@ func (m *Manager) ExportToS3(ctx context.Context, s3Client *s3.Client, bucket, p
 		return fmt.Errorf("failed to close gzip writer: %w", err)
 	}
 
-	// Upload to S3
-	objectName := path.Join(prefix, "stats", fmt.Sprintf("%s.json.gz", hostname))
+	// Upload to S3 (prefix already includes the "stats/" subdirectory)
+	objectName := path.Join(prefix, fmt.Sprintf("%s.json.gz", hostname))
 	_, err = s3Client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:          aws.String(bucket),
 		Key:             aws.String(objectName),
@@ -51,6 +67,9 @@ func (m *Manager) ExportToS3(ctx context.Context, s3Client *s3.Client, bucket, p
 	if err != nil {
 		return fmt.Errorf("failed to upload stats to S3: %w", err)
 	}
+
+	// Update last export hash on successful upload
+	m.lastExportHash = currentHash
 
 	m.logger.Debug("Exported stats to S3",
 		"hostname", hostname,

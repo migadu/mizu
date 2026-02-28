@@ -137,6 +137,8 @@ backend = "s3"
 filesystem_path = "/var/lib/mizu/storage"
 s3_endpoint = "https://s3.amazonaws.com"  # Full URL including https://
 s3_bucket = "email-mx-certs"
+# Base prefix for all S3 keys (e.g., "myapp/" → myapp/certs/, myapp/stats/, myapp/connections/).
+# Subdirectories are appended automatically. Do NOT use "certs/" here — it would create "certs/certs/".
 s3_prefix = ""
 s3_access_key = ""
 s3_secret_key = ""

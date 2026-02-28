@@ -66,38 +66,41 @@ func (c *StorageCache) verifyStorageAccess(ctx context.Context) error {
 func (c *StorageCache) Get(ctx context.Context, key string) ([]byte, error) {
 	storageKey := c.prefix + hashKey(key)
 
-	c.logger.Info("Storage-Cache: Getting certificate", "key", key, "storage_key", storageKey)
+	c.logger.Debug("Storage-Cache: Getting certificate", "key", key, "storage_key", storageKey)
 
 	// Get object from storage
 	obj, err := c.backend.GetObject(ctx, storageKey)
 	if err != nil {
 		// Check if error indicates object not found
 		if isNotFoundError(err) {
-			c.logger.Info("Storage-Cache: Certificate not found (cache miss)", "key", key, "storage_key", storageKey)
+			c.logger.Debug("Storage-Cache: Certificate not found (cache miss)", "key", key, "storage_key", storageKey)
 			return nil, autocert.ErrCacheMiss
 		}
+		// Return the actual error for transient S3 failures (timeout, network, etc.).
+		// Returning ErrCacheMiss here would cause autocert to provision a new certificate
+		// and callers like SyncAllToS3 to re-upload certs on every cycle.
 		c.logger.Error("Storage-Cache: Failed to get object from storage",
 			"key", key,
 			"storage_key", storageKey,
 			"error", err,
 			"error_type", fmt.Sprintf("%T", err))
-		return nil, autocert.ErrCacheMiss
+		return nil, fmt.Errorf("storage get failed for %s: %w", key, err)
 	}
 	defer obj.Close()
 
 	// Read object data
 	data, err := io.ReadAll(obj)
 	if err != nil {
-		// If we can't read the object data, treat it as a cache miss
-		// This allows autocert to provision a new certificate
-		c.logger.Error("Storage-Cache: Failed to read object data - treating as cache miss",
+		// Return actual error - transient read failures should not trigger
+		// certificate re-provisioning or unnecessary S3 re-uploads.
+		c.logger.Error("Storage-Cache: Failed to read object data",
 			"key", key,
 			"storage_key", storageKey,
 			"error", err)
-		return nil, autocert.ErrCacheMiss
+		return nil, fmt.Errorf("storage read failed for %s: %w", key, err)
 	}
 
-	c.logger.Info("Storage-Cache: Successfully retrieved certificate", "key", key, "storage_key", storageKey, "bytes", len(data))
+	c.logger.Debug("Storage-Cache: Successfully retrieved certificate", "key", key, "storage_key", storageKey, "bytes", len(data))
 	return data, nil
 }
 
@@ -105,7 +108,7 @@ func (c *StorageCache) Get(ctx context.Context, key string) ([]byte, error) {
 func (c *StorageCache) Put(ctx context.Context, key string, data []byte) error {
 	storageKey := c.prefix + hashKey(key)
 
-	c.logger.Info("Storage-Cache: Putting certificate", "key", key, "storage_key", storageKey, "bytes", len(data))
+	c.logger.Debug("Storage-Cache: Putting certificate", "key", key, "storage_key", storageKey, "bytes", len(data))
 
 	// Upload to storage
 	err := c.backend.PutObject(
@@ -126,7 +129,7 @@ func (c *StorageCache) Put(ctx context.Context, key string, data []byte) error {
 		return fmt.Errorf("failed to upload to storage: %w", err)
 	}
 
-	c.logger.Info("Storage-Cache: Successfully stored certificate", "key", key, "storage_key", storageKey)
+	c.logger.Debug("Storage-Cache: Successfully stored certificate", "key", key, "storage_key", storageKey)
 	return nil
 }
 

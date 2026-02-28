@@ -20,6 +20,12 @@ func (m *Manager) startCertificateSyncWorker(syncInterval time.Duration) {
 			select {
 			case <-ticker.C:
 				if fallbackCache, ok := m.autocertManager.Cache.(*FallbackCache); ok {
+					// Only sync when there are local-only certs that need to be pushed to S3.
+					// This avoids downloading all certs from S3 on every tick just to compare them.
+					if !fallbackCache.NeedsSync() {
+						m.logger.Debug("Certificate sync worker: no sync needed, skipping")
+						continue
+					}
 					ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 					if err := fallbackCache.SyncAllToS3(ctx); err != nil {
 						m.logger.Debug("Certificate sync worker: some certificates failed to sync", "error", err)

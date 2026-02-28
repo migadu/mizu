@@ -22,6 +22,7 @@ type FallbackCache struct {
 	fallback      autocert.Cache // Local directory cache
 	fallbackDir   string
 	s3Available   bool
+	needsSync     bool // True when certs were written to fallback only and need S3 sync
 	lastS3Check   time.Time
 	checkInterval time.Duration // How often to retry S3 after failure
 	logger        *slog.Logger
@@ -174,8 +175,12 @@ func (fc *FallbackCache) Put(ctx context.Context, name string, data []byte) erro
 		fc.markS3Unavailable()
 	}
 
-	// Use fallback cache
-	fc.logger.Info("Storing certificate in fallback cache", "name", name)
+	// Use fallback cache — mark that we need S3 sync later
+	fc.mu.Lock()
+	fc.needsSync = true
+	fc.mu.Unlock()
+
+	fc.logger.Info("Storing certificate in fallback cache (needs S3 sync)", "name", name)
 	if err := fc.fallback.Put(ctx, name, data); err != nil {
 		// Both failed - return the original S3 error if we have one
 		if s3Err != nil {
@@ -239,6 +244,15 @@ func (fc *FallbackCache) GetFallbackDir() string {
 	return fc.fallbackDir
 }
 
+// NeedsSync returns true if there are certificates in the local fallback cache
+// that haven't been synced to S3 yet (due to a previous S3 outage).
+// The cert sync worker uses this to avoid unnecessary S3 downloads every cycle.
+func (fc *FallbackCache) NeedsSync() bool {
+	fc.mu.RLock()
+	defer fc.mu.RUnlock()
+	return fc.needsSync
+}
+
 // SyncAllToS3 attempts to sync all certificates from fallback cache to S3.
 // This can be called after S3 becomes available again to ensure consistency.
 // Only syncs certificates that are missing or different in S3 to avoid unnecessary writes.
@@ -281,9 +295,14 @@ func (fc *FallbackCache) SyncAllToS3(ctx context.Context) error {
 			// Different certificate - need to sync
 			fc.logger.Debug("Certificate differs in S3, syncing", "name", name)
 		} else if err != autocert.ErrCacheMiss {
-			// S3 error (not just missing) - log and try to sync anyway
-			fc.logger.Warn("Failed to check S3 certificate (will try to sync)", "name", name, "error", err)
+			// Transient S3 error (timeout, network, etc.) - skip this cert.
+			// Do NOT re-upload: we can't confirm the cert is missing vs S3 being unreachable.
+			// Re-uploading on transient errors causes massive S3 object accumulation.
+			fc.logger.Warn("Transient S3 error checking certificate - skipping sync", "name", name, "error", err)
+			skipped++
+			continue
 		}
+		// If err == autocert.ErrCacheMiss, cert is genuinely missing from S3 - sync it
 
 		// Write to S3 (either missing or different)
 		if err := fc.primary.Put(ctx, name, data); err != nil {
@@ -303,6 +322,11 @@ func (fc *FallbackCache) SyncAllToS3(ctx context.Context) error {
 	if failed > 0 {
 		return fmt.Errorf("failed to sync %d certificates to S3", failed)
 	}
+
+	// All certs synced successfully — clear the needsSync flag
+	fc.mu.Lock()
+	fc.needsSync = false
+	fc.mu.Unlock()
 
 	return nil
 }

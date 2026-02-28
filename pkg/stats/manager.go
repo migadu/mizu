@@ -76,6 +76,9 @@ type Manager struct {
 	eventsDropped   uint64 // Total events dropped due to full channel
 	metricsMu       sync.RWMutex
 
+	// S3 export change detection to avoid writing unchanged data
+	lastExportHash string
+
 	// Per-config-server message counters (e.g., "mx-primary", "mx-submission")
 	srvCounters   map[string]*srvCounters
 	srvCountersMu sync.RWMutex
