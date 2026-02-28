@@ -76,11 +76,15 @@ func main() {
 		log.Fatalf("Configuration validation failed: %v", err)
 	}
 
-	// Normalize S3 prefix: ensure it ends with "/" if non-empty.
-	// This prevents "inbound" + "connections/" = "inboundconnections/" instead of "inbound/connections/".
-	if cfg.Storage.S3Prefix != "" && !strings.HasSuffix(cfg.Storage.S3Prefix, "/") {
-		cfg.Storage.S3Prefix += "/"
-		logger.Info("Normalized s3_prefix (added trailing slash)", "s3_prefix", cfg.Storage.S3Prefix)
+	// Normalize S3 prefix: strip leading "/" and ensure trailing "/" if non-empty.
+	// Leading "/" creates objects under an empty-named directory in S3.
+	// Missing trailing "/" causes "inbound" + "connections/" = "inboundconnections/".
+	if cfg.Storage.S3Prefix != "" {
+		cfg.Storage.S3Prefix = strings.TrimLeft(cfg.Storage.S3Prefix, "/")
+		if cfg.Storage.S3Prefix != "" && !strings.HasSuffix(cfg.Storage.S3Prefix, "/") {
+			cfg.Storage.S3Prefix += "/"
+		}
+		logger.Info("S3 prefix configured", "s3_prefix", cfg.Storage.S3Prefix)
 	}
 
 	// Create context for graceful shutdown
