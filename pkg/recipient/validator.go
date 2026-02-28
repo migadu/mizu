@@ -11,8 +11,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hashicorp/golang-lru/v2/expirable"
 	"log/slog"
+
+	"github.com/hashicorp/golang-lru/v2/expirable"
 )
 
 // Validator handles recipient validation with caching
@@ -126,8 +127,12 @@ func (v *Validator) buildURL(clientIP, ptr, helo, from, to string) string {
 	result = strings.ReplaceAll(result, "$ip", url.QueryEscape(clientIP))
 	result = strings.ReplaceAll(result, "$ptr", url.QueryEscape(ptr))
 	result = strings.ReplaceAll(result, "$helo", url.QueryEscape(helo))
-	result = strings.ReplaceAll(result, "$from", url.QueryEscape(from))
-	result = strings.ReplaceAll(result, "$email", url.QueryEscape(to))
+	// Normalize email addresses to lowercase before URL encoding.
+	// Email local parts are case-insensitive per RFC 5321, and uppercase
+	// percent-encoded characters (e.g. MARINA%40MAROUN.COM) can trigger
+	// Cloudflare WAF rules or URL-normalization redirects that cause timeouts.
+	result = strings.ReplaceAll(result, "$from", url.QueryEscape(strings.ToLower(from)))
+	result = strings.ReplaceAll(result, "$email", url.QueryEscape(strings.ToLower(to)))
 	return result
 }
 
@@ -248,8 +253,8 @@ func (v *Validator) queryEndpoint(ctx context.Context, clientIP, ptr, helo, from
 
 // buildCacheKey creates a cache key from request parameters
 func (v *Validator) buildCacheKey(clientIP, ptr, helo, from, to string) string {
-	// Include all parameters in cache key for granular caching
-	return fmt.Sprintf("%s:%s:%s:%s:%s", clientIP, ptr, helo, from, to)
+	// Normalize email addresses to lowercase for consistent cache hits.
+	return fmt.Sprintf("%s:%s:%s:%s:%s", clientIP, ptr, helo, strings.ToLower(from), strings.ToLower(to))
 }
 
 // GetStats returns cache statistics
