@@ -104,9 +104,6 @@ func (v *Validator) ValidateWithContext(ctx context.Context, clientIP, ptr, helo
 
 	resp, err := v.queryEndpoint(ctx, clientIP, ptr, helo, from, to)
 	if err != nil {
-		v.logger.Warn("Recipient validation failed",
-			"to", to,
-			"error", err)
 		return nil, err
 	}
 

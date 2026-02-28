@@ -11,8 +11,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hashicorp/golang-lru/v2/expirable"
 	"log/slog"
+
+	"github.com/hashicorp/golang-lru/v2/expirable"
 )
 
 // Validator handles sender validation with caching
@@ -103,9 +104,6 @@ func (v *Validator) ValidateWithContext(ctx context.Context, clientIP, ptr, helo
 
 	resp, err := v.queryEndpoint(ctx, clientIP, ptr, helo, from, authenticatedUser)
 	if err != nil {
-		v.logger.Warn("Sender validation failed",
-			"from", from,
-			"error", err)
 		return nil, err
 	}
 
