@@ -506,6 +506,165 @@ func TestRecipientCache_CleanupExpiredEntries(t *testing.T) {
 	t.Log("✓ Cleanup successfully removed expired entries")
 }
 
+// TestRecipientCache_ClearAfterValidation tests that ClearRecipientCache removes stale entries
+// This prevents the bug where a recipient passes RCPT TO validation but is then
+// rejected during DATA by a stale cached 404/403 from a previous delivery attempt.
+func TestRecipientCache_ClearAfterValidation(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	local := NewConnectionTracker(100, 10, 0, nil)
+	dt := NewDistributedTracker(
+		local,
+		nil,
+		"",
+		"",
+		DistributedConfig{
+			Hostname:          "server1",
+			Cluster:           newMockCluster(),
+			GossipInterval:    1 * time.Hour,
+			S3SyncInterval:    1 * time.Hour,
+			GlobalMaxPerIP:    20,
+			RecipientCacheTTL: 5 * time.Minute,
+		},
+		logger,
+	)
+
+	// Simulate a previous delivery returning 404 — recipient gets cached as "not found"
+	dt.CacheRecipientNotFound("user@example.com")
+
+	// Verify it's cached
+	found, _, _ := dt.IsRecipientCached("user@example.com")
+	if !found {
+		t.Fatal("Expected recipient to be cached as not found")
+	}
+
+	// Now simulate recipient validation passing (recipient exists again)
+	// This should clear the stale cache entry
+	dt.ClearRecipientCache("user@example.com")
+
+	// The cache entry should be gone
+	found, _, _ = dt.IsRecipientCached("user@example.com")
+	if found {
+		t.Fatal("Expected recipient cache to be cleared after successful validation")
+	}
+}
+
+// TestRecipientCache_ClearBlockedAfterValidation tests clearing a blocked entry
+func TestRecipientCache_ClearBlockedAfterValidation(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	local := NewConnectionTracker(100, 10, 0, nil)
+	dt := NewDistributedTracker(
+		local,
+		nil,
+		"",
+		"",
+		DistributedConfig{
+			Hostname:          "server1",
+			Cluster:           newMockCluster(),
+			GossipInterval:    1 * time.Hour,
+			S3SyncInterval:    1 * time.Hour,
+			GlobalMaxPerIP:    20,
+			RecipientCacheTTL: 5 * time.Minute,
+		},
+		logger,
+	)
+
+	// Simulate a previous delivery returning 403 — recipient gets cached as "blocked"
+	dt.CacheRecipientBlocked("user@example.com")
+
+	found, isBlocked, _ := dt.IsRecipientCached("user@example.com")
+	if !found || !isBlocked {
+		t.Fatal("Expected recipient to be cached as blocked")
+	}
+
+	// Clear after validation passes
+	dt.ClearRecipientCache("user@example.com")
+
+	found, _, _ = dt.IsRecipientCached("user@example.com")
+	if found {
+		t.Fatal("Expected blocked cache to be cleared after successful validation")
+	}
+}
+
+// TestRecipientCache_ClearNonExistent tests that clearing a non-cached recipient is a no-op
+func TestRecipientCache_ClearNonExistent(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	local := NewConnectionTracker(100, 10, 0, nil)
+	dt := NewDistributedTracker(
+		local,
+		nil,
+		"",
+		"",
+		DistributedConfig{
+			Hostname:          "server1",
+			Cluster:           newMockCluster(),
+			GossipInterval:    1 * time.Hour,
+			S3SyncInterval:    1 * time.Hour,
+			GlobalMaxPerIP:    20,
+			RecipientCacheTTL: 5 * time.Minute,
+		},
+		logger,
+	)
+
+	// Clearing a non-existent entry should not panic or error
+	dt.ClearRecipientCache("nonexistent@example.com")
+
+	// Other entries should be unaffected
+	dt.CacheRecipientNotFound("other@example.com")
+	found, _, _ := dt.IsRecipientCached("other@example.com")
+	if !found {
+		t.Fatal("Expected other recipient to still be cached")
+	}
+}
+
+// TestRecipientCache_ClearDoesNotAffectOtherEntries tests selective clearing
+func TestRecipientCache_ClearDoesNotAffectOtherEntries(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	local := NewConnectionTracker(100, 10, 0, nil)
+	dt := NewDistributedTracker(
+		local,
+		nil,
+		"",
+		"",
+		DistributedConfig{
+			Hostname:          "server1",
+			Cluster:           newMockCluster(),
+			GossipInterval:    1 * time.Hour,
+			S3SyncInterval:    1 * time.Hour,
+			GlobalMaxPerIP:    20,
+			RecipientCacheTTL: 5 * time.Minute,
+		},
+		logger,
+	)
+
+	// Cache multiple recipients
+	dt.CacheRecipientNotFound("user1@example.com")
+	dt.CacheRecipientNotFound("user2@example.com")
+	dt.CacheRecipientBlocked("user3@example.com")
+
+	// Clear only user1
+	dt.ClearRecipientCache("user1@example.com")
+
+	// user1 should be gone
+	found, _, _ := dt.IsRecipientCached("user1@example.com")
+	if found {
+		t.Fatal("Expected user1 to be cleared")
+	}
+
+	// user2 and user3 should still be cached
+	found, _, _ = dt.IsRecipientCached("user2@example.com")
+	if !found {
+		t.Fatal("Expected user2 to still be cached")
+	}
+	found, isBlocked, _ := dt.IsRecipientCached("user3@example.com")
+	if !found || !isBlocked {
+		t.Fatal("Expected user3 to still be cached as blocked")
+	}
+}
+
 // TestRecipientCache_ConcurrentAccess tests thread safety
 func TestRecipientCache_ConcurrentAccess(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))

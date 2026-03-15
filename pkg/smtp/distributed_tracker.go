@@ -351,6 +351,27 @@ func (dt *DistributedTracker) CacheRecipientBlocked(email string) {
 		"expiry", expiry)
 }
 
+// ClearRecipientCache removes a recipient from both the "not found" and "blocked" caches.
+// This should be called when a fresh recipient validation confirms the recipient exists,
+// to prevent stale cached 404/403 responses from overriding the validation result.
+func (dt *DistributedTracker) ClearRecipientCache(email string) {
+	dt.recipientMu.Lock()
+	defer dt.recipientMu.Unlock()
+
+	_, hadNotFound := dt.recipientNotFound[email]
+	_, hadBlocked := dt.recipientBlocked[email]
+
+	delete(dt.recipientNotFound, email)
+	delete(dt.recipientBlocked, email)
+
+	if hadNotFound || hadBlocked {
+		dt.logger.Info("Cleared stale recipient cache entry after successful validation",
+			"email", email,
+			"was_not_found", hadNotFound,
+			"was_blocked", hadBlocked)
+	}
+}
+
 // IsRecipientCached checks if a recipient is in the cache and returns the status
 // Returns (found, isBlocked, reason)
 func (dt *DistributedTracker) IsRecipientCached(email string) (bool, bool, string) {

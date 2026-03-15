@@ -1215,6 +1215,15 @@ func (s *Session) Rcpt(to string, opts *smtp.RcptOptions) error {
 		}
 
 		s.Logger.Info("Recipient validation passed", "to", to)
+
+		// Clear any stale delivery cache entry for this recipient.
+		// The delivery recipient cache (distTracker) caches 404/403 responses from
+		// the delivery endpoint. If the recipient validation endpoint just confirmed
+		// the recipient exists, any cached 404/403 is stale and must be removed to
+		// prevent deliverSynchronous() from rejecting the message based on outdated data.
+		if s.distTracker != nil {
+			s.distTracker.ClearRecipientCache(to)
+		}
 	}
 
 	// Reset to idle timeout to wait for the next command
