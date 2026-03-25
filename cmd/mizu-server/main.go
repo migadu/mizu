@@ -123,11 +123,12 @@ func main() {
 	var tlsConfig *tls.Config
 	var s3Client *s3.Client
 	var tlsMgr *tlsmgr.Manager
+	var fileCertProvider *tlsmgr.FileCertProvider
 	if cfg.Local {
 		logger.Info("Running in LOCAL mode - TLS disabled, messages will be dumped to terminal")
 	} else {
 		logger.Info("Initializing TLS subsystem", "enabled", cfg.TLS.Enabled, "provider", cfg.TLS.Provider)
-		tlsConfig, s3Client, tlsMgr, err = initTLS(cfg, clusterMgr, logger)
+		tlsConfig, s3Client, tlsMgr, fileCertProvider, err = initTLS(cfg, clusterMgr, logger)
 		if err != nil {
 			logger.Error(fmt.Sprintf("Failed to initialize TLS: %v", err))
 			os.Exit(1)
@@ -163,6 +164,28 @@ func main() {
 				"tls_provider", cfg.TLS.Provider,
 				"cluster_enabled", cfg.Cluster.Enabled)
 		}
+	}
+
+	// Handle SIGHUP for certificate reload (file-based TLS only)
+	if fileCertProvider != nil {
+		hupChan := make(chan os.Signal, 1)
+		signal.Notify(hupChan, syscall.SIGHUP)
+		concurrency.SafeGo(logger, "sighup-handler", func() {
+			defer signal.Stop(hupChan)
+			for {
+				select {
+				case <-hupChan:
+					logger.Info("Received SIGHUP, reloading TLS certificates...")
+					if err := fileCertProvider.Reload(); err != nil {
+						logger.Error("TLS certificate reload failed, keeping previous certificate", "error", err)
+					} else {
+						logger.Info("TLS certificates reloaded successfully")
+					}
+				case <-ctx.Done():
+					return
+				}
+			}
+		})
 	}
 
 	// Initialize and start health check server (before starting SMTP servers)
@@ -497,16 +520,16 @@ func initStorageBackend(cfg *config.Config, logger *slog.Logger) (storage.Backen
 }
 
 // initTLS sets up the storage backend and TLS certificate management using autocert.
-func initTLS(cfg *config.Config, clusterMgr *cluster.Cluster, logger *slog.Logger) (*tls.Config, *s3.Client, *tlsmgr.Manager, error) {
+func initTLS(cfg *config.Config, clusterMgr *cluster.Cluster, logger *slog.Logger) (*tls.Config, *s3.Client, *tlsmgr.Manager, *tlsmgr.FileCertProvider, error) {
 	// Check if TLS is enabled
 	if !cfg.TLS.Enabled {
 		logger.Info("TLS management disabled in configuration")
-		return nil, nil, nil, nil
+		return nil, nil, nil, nil, nil
 	}
 
 	storageBackend, s3Client, err := initStorageBackend(cfg, logger)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 
 	var tlsConfig *tls.Config
@@ -515,20 +538,19 @@ func initTLS(cfg *config.Config, clusterMgr *cluster.Cluster, logger *slog.Logge
 	// Handle different TLS providers
 	switch cfg.TLS.Provider {
 	case "file":
-		// Load certificates from files
+		// Load certificates from files via FileCertProvider (supports SIGHUP reload)
 		if cfg.TLS.File.CertFile == "" || cfg.TLS.File.KeyFile == "" {
-			return nil, nil, nil, fmt.Errorf("tls.file.cert_file and tls.file.key_file are required when provider=file")
+			return nil, nil, nil, nil, fmt.Errorf("tls.file.cert_file and tls.file.key_file are required when provider=file")
 		}
-		cert, err := tls.LoadX509KeyPair(cfg.TLS.File.CertFile, cfg.TLS.File.KeyFile)
+		fileCertProvider, err := tlsmgr.NewFileCertProvider(cfg.TLS.File.CertFile, cfg.TLS.File.KeyFile, logger)
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("failed to load TLS certificate: %w", err)
+			return nil, nil, nil, nil, fmt.Errorf("failed to load TLS certificate: %w", err)
 		}
 		tlsConfig = &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			MinVersion:   tls.VersionTLS12,
+			GetCertificate: fileCertProvider.GetCertificate,
+			MinVersion:     tls.VersionTLS12,
 		}
-		logger.Info("File-based TLS certificates loaded", "cert_file", cfg.TLS.File.CertFile, "key_file", cfg.TLS.File.KeyFile)
-		return tlsConfig, s3Client, nil, nil
+		return tlsConfig, s3Client, nil, fileCertProvider, nil
 
 	case "letsencrypt":
 		// Get leader function from cluster
@@ -578,12 +600,12 @@ func initTLS(cfg *config.Config, clusterMgr *cluster.Cluster, logger *slog.Logge
 			SyncInterval:   syncInterval,
 		}, logger)
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("failed to create TLS manager: %w", err)
+			return nil, nil, nil, nil, fmt.Errorf("failed to create TLS manager: %w", err)
 		}
 
 		tlsConfig = tlsMgr.TLSConfig()
 		if tlsConfig == nil {
-			return nil, nil, nil, fmt.Errorf("TLS manager returned nil config")
+			return nil, nil, nil, nil, fmt.Errorf("TLS manager returned nil config")
 		}
 
 		logger.Info(fmt.Sprintf("Autocert initialized for domains: %v", cfg.TLS.LetsEncrypt.Domains))
@@ -610,10 +632,10 @@ func initTLS(cfg *config.Config, clusterMgr *cluster.Cluster, logger *slog.Logge
 
 		logger.Info("Default TLS configuration ready (per-server min version can be set in [server.tls])")
 
-		return tlsConfig, s3Client, tlsMgr, nil
+		return tlsConfig, s3Client, tlsMgr, nil, nil
 
 	default:
-		return nil, nil, nil, fmt.Errorf("unknown TLS provider: %s (must be 'file' or 'letsencrypt')", cfg.TLS.Provider)
+		return nil, nil, nil, nil, fmt.Errorf("unknown TLS provider: %s (must be 'file' or 'letsencrypt')", cfg.TLS.Provider)
 	}
 }
 
