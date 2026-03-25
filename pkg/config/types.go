@@ -429,6 +429,7 @@ type HealthConfig struct {
 // MetricsConfig holds configuration for Prometheus metrics endpoint
 type MetricsConfig struct {
 	Enabled  bool   `toml:"enabled"`  // Enable Prometheus metrics endpoint
+	Bind     string `toml:"bind"`     // Bind address for metrics server (default: ":9091")
 	Path     string `toml:"path"`     // Metrics endpoint path (default: "/metrics")
 	Username string `toml:"username"` // HTTP Basic Auth username (optional, empty = no auth)
 	Password string `toml:"password"` // HTTP Basic Auth password
@@ -527,6 +528,7 @@ func DefaultConfig() Config {
 		},
 		Metrics: MetricsConfig{
 			Enabled:  true,
+			Bind:     ":9091",
 			Path:     "/metrics",
 			Username: "",
 			Password: "",

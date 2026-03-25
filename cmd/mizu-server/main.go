@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/base64"
 	"errors"
@@ -38,6 +39,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	gosmtp "github.com/emersion/go-smtp"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // Version information, injected at build time
@@ -166,6 +168,9 @@ func main() {
 	// Initialize and start health check server (before starting SMTP servers)
 	// Note: Connection trackers are registered later via AddChecker after server backends are created
 	healthServer := startHealthServer(cfg, logger, statsManager, nil, nil, s3Client)
+
+	// Start separate metrics server
+	metricsServer := startMetricsServer(cfg, logger)
 
 	// Set ACME handler on health server if autocert is enabled
 	if healthServer != nil && tlsMgr != nil {
@@ -327,7 +332,15 @@ func main() {
 		statsManager.Stop()
 	}
 
-	// Phase 4: Stop health server
+	// Phase 4: Stop metrics server
+	if metricsServer != nil {
+		logger.Info("Stopping metrics server...")
+		if err := metricsServer.Shutdown(context.Background()); err != nil {
+			logger.Error("metrics server shutdown error", "error", err)
+		}
+	}
+
+	// Phase 5: Stop health server
 	if healthServer != nil {
 		logger.Info("Stopping health server...")
 		healthServer.Stop(context.Background())
@@ -710,12 +723,6 @@ func startHealthServer(cfg *config.Config, logger *slog.Logger, statsManager *st
 		}
 	}
 
-	// Only start health server if at least one feature is enabled
-	if !cfg.Health.Enabled && !cfg.Metrics.Enabled {
-		logger.Info("Health and metrics endpoints disabled")
-		return nil
-	}
-
 	healthServer := health.NewServer(cfg.Health.ListenAddr, logger, checkers...)
 
 	// Configure health endpoint (only if enabled)
@@ -728,16 +735,6 @@ func startHealthServer(cfg *config.Config, logger *slog.Logger, statsManager *st
 		logger.Info("Health endpoint enabled", "listen_addr", cfg.Health.ListenAddr, "auth_enabled", cfg.Health.Username != "")
 	}
 
-	// Configure Prometheus metrics endpoint (only if enabled)
-	if cfg.Metrics.Enabled {
-		healthServer.SetMetricsConfig(
-			cfg.Metrics.Enabled,
-			cfg.Metrics.Path,
-			cfg.Metrics.Username,
-			cfg.Metrics.Password,
-		)
-	}
-
 	// Set stats provider
 	healthServer.SetStatsProvider(statsManager)
 
@@ -748,6 +745,68 @@ func startHealthServer(cfg *config.Config, logger *slog.Logger, statsManager *st
 
 	healthServer.Start()
 	return healthServer
+}
+
+// basicAuthMiddlewareHandler wraps an http.Handler with HTTP Basic Auth.
+func basicAuthMiddlewareHandler(next http.Handler, username, password, realm string, logger *slog.Logger) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqUser, reqPass, ok := r.BasicAuth()
+		if !ok ||
+			subtle.ConstantTimeCompare([]byte(reqUser), []byte(username)) != 1 ||
+			subtle.ConstantTimeCompare([]byte(reqPass), []byte(password)) != 1 {
+			w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Basic realm="%s"`, realm))
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			if ok {
+				logger.Warn("metrics auth failed", "remote_addr", r.RemoteAddr)
+			}
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// startMetricsServer creates a separate HTTP server for Prometheus metrics.
+func startMetricsServer(cfg *config.Config, logger *slog.Logger) *http.Server {
+	if !cfg.Metrics.Enabled {
+		return nil
+	}
+
+	mux := http.NewServeMux()
+
+	var metricsHandler http.Handler = promhttp.Handler()
+
+	// Optional basic auth for metrics
+	if cfg.Metrics.Username != "" {
+		metricsHandler = basicAuthMiddlewareHandler(metricsHandler, cfg.Metrics.Username, cfg.Metrics.Password, "Metrics", logger)
+	}
+
+	metricsPath := cfg.Metrics.Path
+	if metricsPath == "" {
+		metricsPath = "/metrics"
+	}
+	mux.Handle(metricsPath, metricsHandler)
+
+	bind := cfg.Metrics.Bind
+	if bind == "" {
+		bind = ":9091"
+	}
+
+	server := &http.Server{
+		Addr:         bind,
+		Handler:      mux,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  30 * time.Second,
+	}
+
+	concurrency.SafeGo(logger, "metrics-server", func() {
+		logger.Info("metrics server starting", "addr", bind, "path", metricsPath, "auth_enabled", cfg.Metrics.Username != "")
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Error("metrics server failed", "error", err)
+		}
+	})
+
+	return server
 }
 
 // startStatsLoops starts the background loops for exporting and syncing stats data.
