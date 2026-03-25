@@ -47,36 +47,19 @@ const MaxDKIMSignatureAge = 7 * 24 * time.Hour // 7 days
 // lookupTXTWithTimeout is a function variable for DNS TXT lookups with timeout (can be mocked in tests)
 var lookupTXTWithTimeout = defaultLookupTXTWithTimeout
 
-// defaultLookupTXTWithTimeout performs a DNS TXT lookup with a timeout
+// defaultLookupTXTWithTimeout performs a DNS TXT lookup with a timeout.
+// Uses net.Resolver with context for proper timeout propagation to the
+// underlying DNS query, preventing goroutine leaks on timeout.
 func defaultLookupTXTWithTimeout(domain string) ([]string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), DNSLookupTimeout)
 	defer cancel()
 
-	// Create a channel to receive the result
-	type result struct {
-		records []string
-		err     error
+	resolver := &net.Resolver{}
+	records, err := resolver.LookupTXT(ctx, domain)
+	if err != nil {
+		return nil, err
 	}
-	resultChan := make(chan result, 1)
-
-	// Perform lookup in a goroutine with panic recovery
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				resultChan <- result{records: nil, err: fmt.Errorf("panic in DNS lookup: %v", r)}
-			}
-		}()
-		records, err := net.LookupTXT(domain)
-		resultChan <- result{records: records, err: err}
-	}()
-
-	// Wait for either the result or timeout
-	select {
-	case res := <-resultChan:
-		return res.records, res.err
-	case <-ctx.Done():
-		return nil, fmt.Errorf("DNS TXT lookup timeout for %s: %w", domain, ctx.Err())
-	}
+	return records, nil
 }
 
 // CheckDMARC performs DMARC validation on an email
