@@ -9,6 +9,18 @@ import (
 	"github.com/spf13/pflag"
 )
 
+func defaultConfigPath() string {
+	for _, p := range []string{
+		"/etc/mizu/config.toml",
+		"/usr/local/etc/mizu/config.toml",
+	} {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return "config.toml"
+}
+
 // LoadConfig loads configuration from file and command line flags
 func LoadConfig(args []string) (*Config, error) {
 	// Start with default configuration
@@ -19,7 +31,7 @@ func LoadConfig(args []string) (*Config, error) {
 	fs := pflag.NewFlagSet("mizu-server", pflag.ContinueOnError)
 
 	// Config file flag
-	configFile := fs.StringP("config", "c", "config.toml", "Path to configuration file")
+	configFile := fs.StringP("config", "c", defaultConfigPath(), "Path to configuration file")
 
 	// Local development mode flag
 	fs.BoolVar(&cfg.Local, "local", false, "Run in local development mode (no TLS, dump emails to terminal)")
@@ -134,8 +146,9 @@ func LoadFromFile(filename string) (*Config, error) {
 
 // GetConfigPath returns the configuration file path, checking common locations
 func GetConfigPath() (string, error) {
-	// Check in order: current directory, /etc/mizu, ~/.config/mizu
+	// Check in order: /usr/local/etc/mizu, current directory, /etc/mizu, ~/.config/mizu
 	locations := []string{
+		"/usr/local/etc/mizu/config.toml",
 		"config.toml",
 		"/etc/mizu/config.toml",
 		filepath.Join(os.Getenv("HOME"), ".config", "mizu", "config.toml"),

@@ -40,10 +40,22 @@ var (
 	showVersion bool
 )
 
+func defaultMizuConfigPath() string {
+	for _, p := range []string{
+		"/etc/mizu/config.toml",
+		"/usr/local/etc/mizu/config.toml",
+	} {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return "config.toml"
+}
+
 func init() {
 	flag.StringVar(&serverURL, "server", "http://localhost:8080", "Mizu server URL")
 	flag.DurationVar(&timeout, "timeout", 10*time.Second, "Request timeout")
-	flag.StringVar(&configFile, "config", "config.toml", "Path to config file for auth credentials")
+	flag.StringVar(&configFile, "config", defaultMizuConfigPath(), "Path to config file for auth credentials")
 	flag.BoolVar(&showVersion, "version", false, "Show version information")
 }
 
