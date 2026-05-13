@@ -89,11 +89,11 @@ func TestRecipientValidation_TemporaryFailure(t *testing.T) {
 		t.Errorf("Expected enhanced code 4.x.x, got %v", smtpErr.EnhancedCode)
 	}
 
-	if smtpErr.Message != "Mailbox temporarily unavailable" {
-		t.Errorf("Expected custom message, got: %s", smtpErr.Message)
+	if smtpErr.Message != "temporary failure, please try again later" {
+		t.Errorf("Expected generic temporary message, got: %s", smtpErr.Message)
 	}
 
-	t.Log("✓ Temporary rejection returns SMTP 450 with custom message")
+	t.Log("✓ Temporary rejection returns SMTP 450 with generic message")
 }
 
 // TestRecipientValidation_PermanentFailure tests SMTP 550 response for permanent failures
@@ -154,11 +154,11 @@ func TestRecipientValidation_PermanentFailure(t *testing.T) {
 		t.Errorf("Expected enhanced code 5.x.x, got %v", smtpErr.EnhancedCode)
 	}
 
-	if smtpErr.Message != "User unknown" {
-		t.Errorf("Expected 'User unknown', got: %s", smtpErr.Message)
+	if smtpErr.Message != "mailbox unavailable" {
+		t.Errorf("Expected generic permanent message, got: %s", smtpErr.Message)
 	}
 
-	t.Log("✓ Permanent rejection returns SMTP 550 with custom message")
+	t.Log("✓ Permanent rejection returns SMTP 550 with generic message")
 }
 
 // TestRecipientValidation_Accepted tests successful recipient validation
@@ -263,11 +263,11 @@ func TestRecipientValidation_TemporaryWithPlainText(t *testing.T) {
 		t.Errorf("Expected SMTP code 450, got %d", smtpErr.Code)
 	}
 
-	if smtpErr.Message != "Mailbox is being migrated" {
-		t.Errorf("Expected plain text message, got: %s", smtpErr.Message)
+	if smtpErr.Message != "temporary failure, please try again later" {
+		t.Errorf("Expected generic temporary message, got: %s", smtpErr.Message)
 	}
 
-	t.Log("✓ Temporary rejection with plain text message works correctly")
+	t.Log("✓ Temporary rejection with plain text returns generic message")
 }
 
 // TestRecipientValidation_TemporaryDefault tests temporary rejection with empty message (default)

@@ -958,17 +958,12 @@ func (s *Session) Mail(from string, opts *smtp.MailOptions) error {
 				"from", from,
 				"client_ip", s.remoteAddr,
 				"authenticated_user", s.authenticatedUser,
-				"message", result.Message)
-
-			message := result.Message
-			if message == "" {
-				message = "sender address rejected"
-			}
+				"backend_message", result.Message)
 
 			return &smtp.SMTPError{
 				Code:         550,
 				EnhancedCode: smtp.EnhancedCode{5, 7, 1},
-				Message:      message,
+				Message:      "sender address rejected",
 			}
 		}
 
@@ -1222,34 +1217,24 @@ func (s *Session) Rcpt(to string, opts *smtp.RcptOptions) error {
 
 		// Check if recipient is accepted
 		if !result.Accepted {
-			// Use custom message if provided, otherwise use default
-			message := result.Message
-			if message == "" {
-				if result.Temporary {
-					message = "temporary failure, please try again later"
-				} else {
-					message = "mailbox unavailable"
-				}
-			}
-
 			if result.Temporary {
 				s.Logger.Info("Recipient temporarily rejected by validation",
 					"to", to,
-					"message", message)
+					"backend_message", result.Message)
 				return &smtp.SMTPError{
 					Code:         450,
 					EnhancedCode: smtp.EnhancedCode{4, 2, 1},
-					Message:      message,
+					Message:      "temporary failure, please try again later",
 				}
 			}
 
 			s.Logger.Info("Recipient rejected by validation",
 				"to", to,
-				"message", message)
+				"backend_message", result.Message)
 			return &smtp.SMTPError{
 				Code:         550,
 				EnhancedCode: smtp.EnhancedCode{5, 1, 1},
-				Message:      message,
+				Message:      "mailbox unavailable",
 			}
 		}
 

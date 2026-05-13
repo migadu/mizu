@@ -162,8 +162,8 @@ func TestMail_SenderValidation_Reject(t *testing.T) {
 		t.Errorf("Expected SMTP code 550, got %d", smtpErr.Code)
 	}
 
-	if smtpErr.Message != "Sender not authorized" {
-		t.Errorf("Expected message 'Sender not authorized', got '%s'", smtpErr.Message)
+	if smtpErr.Message != "sender address rejected" {
+		t.Errorf("Expected generic message 'sender address rejected', got '%s'", smtpErr.Message)
 	}
 
 	expectedEnhancedCode := smtp.EnhancedCode{5, 7, 1}
