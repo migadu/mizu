@@ -47,6 +47,9 @@ func InjectMizuHeaders(rawEmail, domain, remoteAddr, heloHostname, traceID strin
 // buildReceivedHeader creates a standard Received header for email tracing
 // Format follows RFC 5321 section 4.4 (Trace Information)
 func buildReceivedHeader(domain, remoteAddr, heloHostname, traceID, tlsVersion string) string {
+	// Sanitize heloHostname: strip any control characters to prevent header injection
+	heloHostname = sanitizeHeaderValue(heloHostname)
+
 	// Extract IP and port from remoteAddr
 	host, _, err := net.SplitHostPort(remoteAddr)
 	if err != nil {
@@ -82,6 +85,17 @@ func buildReceivedHeader(domain, remoteAddr, heloHostname, traceID, tlsVersion s
 	sb.WriteString("\r\n")
 
 	return sb.String()
+}
+
+// sanitizeHeaderValue removes control characters (CR, LF, NUL) from a string
+// to prevent header injection when interpolating untrusted values into email headers.
+func sanitizeHeaderValue(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 && r != '\t' {
+			return -1 // drop control chars except tab (valid in header folding)
+		}
+		return r
+	}, s)
 }
 
 // buildMizuHeaders creates custom X-Mizu-* headers for debugging and analysis
