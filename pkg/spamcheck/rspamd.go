@@ -130,7 +130,7 @@ func (c *Client) Check(ctx context.Context, message, clientIP, from string, rcpt
 
 	// Check HTTP status
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return nil, fmt.Errorf("rspamd returned status %d: %s", resp.StatusCode, string(body))
 	}
 

@@ -156,8 +156,8 @@ func (v *Validator) queryEndpoint(ctx context.Context, clientIP, ptr, helo, from
 	}
 	defer httpResp.Body.Close()
 
-	// Read response body
-	respBody, err := io.ReadAll(httpResp.Body)
+	// Read response body (limit to 64KB to prevent memory exhaustion)
+	respBody, err := io.ReadAll(io.LimitReader(httpResp.Body, 64*1024))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}

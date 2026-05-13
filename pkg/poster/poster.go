@@ -172,7 +172,7 @@ func postEmailAttemptWithContext(ctx context.Context, rawEmail string, destinati
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
-		bodyBytes, _ := io.ReadAll(resp.Body)
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return NewHTTPStatusError(resp.StatusCode, string(bodyBytes))
 	}
 

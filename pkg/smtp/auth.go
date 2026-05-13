@@ -211,7 +211,7 @@ func (a *HTTPAuthenticator) fetchCredentials(username, remoteIP string) (*AuthRe
 
 	// 404 means user not found - this is not an error, just auth failure
 	if resp.StatusCode == http.StatusNotFound {
-		body, err := io.ReadAll(resp.Body)
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		if err != nil {
 			a.logger.Warn("failed to read auth 404 response body", "username", username, "error", err)
 		}
@@ -224,7 +224,7 @@ func (a *HTTPAuthenticator) fetchCredentials(username, remoteIP string) (*AuthRe
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		body, err := io.ReadAll(resp.Body)
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		if err != nil {
 			a.logger.Warn("failed to read auth error response body", "username", username, "error", err)
 		}
