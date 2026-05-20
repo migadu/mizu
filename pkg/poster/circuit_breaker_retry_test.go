@@ -57,6 +57,7 @@ func TestCircuitBreaker_RetriesContinueWhenOpen(t *testing.T) {
 		cb,
 		httpClient,
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		nil,
 	)
 
 	// Should succeed even though circuit opened during retries
@@ -114,6 +115,7 @@ func TestCircuitBreaker_AllRetriesFailWithCircuitOpen(t *testing.T) {
 		cb,
 		httpClient,
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		nil,
 	)
 
 	// Should fail after all retries exhausted
@@ -176,6 +178,7 @@ func TestCircuitBreaker_OpensButRecoversInRetryWindow(t *testing.T) {
 		cb,
 		httpClient,
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		nil,
 	)
 	elapsed := time.Since(start)
 

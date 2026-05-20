@@ -1711,6 +1711,7 @@ func (s *Session) deliverToRecipient(signedEmail string, recipient string) error
 		s.circuitBreaker,
 		s.httpClient,
 		s.Logger,
+		s.backend.Metrics,
 	)
 
 	if err != nil {
