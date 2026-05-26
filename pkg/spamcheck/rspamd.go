@@ -57,10 +57,28 @@ type rspamdMilter struct {
 	RemoveHeaders map[string]int          `json:"remove_headers,omitempty"`
 }
 
-// rspamdHeader represents a header to add (with order)
+// rspamdHeader represents a header to add. Rspamd may return either
+// a string value or an object {"value": "...", "order": 0}.
 type rspamdHeader struct {
 	Value string `json:"value"`
 	Order int    `json:"order"`
+}
+
+func (h *rspamdHeader) UnmarshalJSON(data []byte) error {
+	// Try string first
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		h.Value = s
+		return nil
+	}
+	// Fall back to object
+	type alias rspamdHeader
+	var obj alias
+	if err := json.Unmarshal(data, &obj); err != nil {
+		return err
+	}
+	*h = rspamdHeader(obj)
+	return nil
 }
 
 // NewClient creates a new rspamd spam check client
@@ -130,15 +148,26 @@ func (c *Client) Check(ctx context.Context, message, clientIP, from string, rcpt
 	}
 	defer resp.Body.Close()
 
-	// Check HTTP status
+	// Read full response body once for both status-check and decode paths.
+	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1 MiB cap
+	if err != nil {
+		return nil, fmt.Errorf("failed to read rspamd response: %w", err)
+	}
+
+	// Rspamd may return 504 when autolearn/statistics fails even though the
+	// scan itself succeeded. The body contains a JSON error (not a scan result),
+	// so we log and return a nil result rather than an error — fail open.
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("rspamd returned status %d: %s", resp.StatusCode, string(body))
+		if resp.StatusCode == http.StatusGatewayTimeout && isStatisticsError(bodyBytes) {
+			c.Logger.Debug("Ignoring rspamd statistics error (autolearn failure)", "body", string(bodyBytes))
+			return &CheckResult{AddHeaders: map[string]string{}, Symbols: map[string]float64{}}, nil
+		}
+		return nil, fmt.Errorf("rspamd returned status %d: %s", resp.StatusCode, string(bodyBytes))
 	}
 
 	// Parse JSON response
 	var rspamdResp rspamdResponse
-	if err := json.NewDecoder(resp.Body).Decode(&rspamdResp); err != nil {
+	if err := json.Unmarshal(bodyBytes, &rspamdResp); err != nil {
 		return nil, fmt.Errorf("failed to parse rspamd response: %w", err)
 	}
 
@@ -175,6 +204,16 @@ func (c *Client) Check(ctx context.Context, message, clientIP, from string, rcpt
 		"symbols_count", len(result.Symbols))
 
 	return result, nil
+}
+
+// isStatisticsError returns true when the body is an rspamd JSON error whose
+// error_domain is "rspamd-statistics" — i.e., autolearn failed but the scan
+// itself completed successfully.
+func isStatisticsError(body []byte) bool {
+	var errResp struct {
+		ErrorDomain string `json:"error_domain"`
+	}
+	return json.Unmarshal(body, &errResp) == nil && errResp.ErrorDomain == "rspamd-statistics"
 }
 
 // Ping checks if the rspamd server is reachable by sending a HEAD request.
