@@ -2,6 +2,7 @@ package validation
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -17,7 +18,11 @@ import (
 )
 
 // dmarcLookup is a function variable that can be replaced in tests for mocking.
-var dmarcLookup = dmarc.Lookup
+// The lookupTXT argument is used to perform the underlying DNS TXT query so the
+// caller's configured DNS resolver is honored.
+var dmarcLookup = func(domain string, lookupTXT func(string) ([]string, error)) (*dmarc.Record, error) {
+	return dmarc.LookupWithOptions(domain, &dmarc.LookupOptions{LookupTXT: lookupTXT})
+}
 
 // DMARCResult represents the result of DMARC validation
 // DMARC (Domain-based Message Authentication, Reporting & Conformance) helps prevent email spoofing
@@ -37,19 +42,30 @@ type SPFResult struct {
 	Result authres.SPFResult
 }
 
-// DNS lookup timeout for DKIM and DMARC queries
+// DNSLookupTimeout is the default per-TXT-lookup deadline used when callers
+// pass a zero timeout. Production callers should pass globalConfig.DNS.TimeoutSeconds
+// so DKIM/DMARC honor the same configurable timeout as MX/SPF.
 const DNSLookupTimeout = 5 * time.Second
 
 // Maximum age for DKIM signatures (reject signatures older than this)
 // RFC 6376 recommends rejecting signatures older than a few days to prevent replay attacks
 const MaxDKIMSignatureAge = 7 * 24 * time.Hour // 7 days
 
-// lookupTXTWithTimeout is a function variable for DNS TXT lookups with timeout (can be mocked in tests)
+// TXTResolver is the minimal interface CheckDMARC needs to perform TXT lookups
+// for both the DMARC policy record and DKIM key records.
+//
+// Both *net.Resolver and *dns.CachingWrapper satisfy this — production callers
+// should pass the caching wrapper so DKIM key lookups benefit from caching.
+type TXTResolver interface {
+	LookupTXT(ctx context.Context, name string) ([]string, error)
+}
+
+// lookupTXTWithTimeout is a test-only fallback for when CheckDMARC is invoked
+// without a TXTResolver. It uses the system resolver and is mockable in tests.
+// Production code must pass a non-nil TXTResolver to CheckDMARC.
 var lookupTXTWithTimeout = defaultLookupTXTWithTimeout
 
-// defaultLookupTXTWithTimeout performs a DNS TXT lookup with a timeout.
-// Uses net.Resolver with context for proper timeout propagation to the
-// underlying DNS query, preventing goroutine leaks on timeout.
+// defaultLookupTXTWithTimeout performs a DNS TXT lookup with a timeout using the system resolver.
 func defaultLookupTXTWithTimeout(domain string) ([]string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), DNSLookupTimeout)
 	defer cancel()
@@ -62,9 +78,19 @@ func defaultLookupTXTWithTimeout(domain string) ([]string, error) {
 	return records, nil
 }
 
-// CheckDMARC performs DMARC validation on an email
-// It validates DKIM signatures and checks DMARC policy compliance
-func CheckDMARC(ctx context.Context, rawEmail string, spfResult *SPFResult, quarantinePolicyAction string, logger *slog.Logger) (*DMARCResult, error) {
+// CheckDMARC performs DMARC validation on an email.
+// It validates DKIM signatures and checks DMARC policy compliance.
+//
+// txtResolver is used for both the DMARC policy TXT lookup and DKIM key TXT lookups,
+// so the caller's configured DNS resolver (and any caching layer) is honored. Pass
+// the cluster's *dns.CachingWrapper to get cached TXT lookups. Pass nil only in tests
+// — production callers must supply a resolver.
+//
+// lookupTimeout bounds each TXT query. A zero value falls back to DNSLookupTimeout.
+//
+// The parent ctx propagates into each lookup, so cancellation of the SMTP session
+// cancels in-flight DNS queries.
+func CheckDMARC(ctx context.Context, rawEmail string, spfResult *SPFResult, quarantinePolicyAction string, txtResolver TXTResolver, lookupTimeout time.Duration, logger *slog.Logger) (*DMARCResult, error) {
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
@@ -111,8 +137,41 @@ func CheckDMARC(ctx context.Context, rawEmail string, spfResult *SPFResult, quar
 		Policy:         "none",
 	}
 
+	if lookupTimeout <= 0 {
+		lookupTimeout = DNSLookupTimeout
+	}
+
+	// Build a TXT lookup closure that propagates the parent ctx and applies the
+	// per-lookup timeout. dkim.VerifyOptions and dmarc.LookupWithOptions both
+	// expect a func(string)([]string, error) signature without a ctx parameter,
+	// so the closure bridges the two.
+	var lookupTXT func(string) ([]string, error)
+	if txtResolver != nil {
+		lookupTXT = func(name string) ([]string, error) {
+			lookupCtx, cancel := context.WithTimeout(ctx, lookupTimeout)
+			defer cancel()
+			txts, err := txtResolver.LookupTXT(lookupCtx, name)
+			// Strip the misleading Server field from net.DNSError. With a custom
+			// Dial, Go reports the resolv.conf nameserver here, not the upstream
+			// our Dial actually connected to.
+			var dnsErr *net.DNSError
+			if errors.As(err, &dnsErr) && dnsErr.Server != "" {
+				cleaned := *dnsErr
+				cleaned.Server = ""
+				return txts, &cleaned
+			}
+			return txts, err
+		}
+	} else {
+		// Test-only fallback: re-read the package-level mockable variable on
+		// each invocation so swaps mid-lookup are observed.
+		lookupTXT = func(name string) ([]string, error) {
+			return lookupTXTWithTimeout(name)
+		}
+	}
+
 	// Look up DMARC policy via DNS TXT record (_dmarc.domain.com)
-	record, err := dmarcLookup(fromDomain)
+	record, err := dmarcLookup(fromDomain, lookupTXT)
 	noDMARCRecord := false
 	if err != nil {
 		logger.Debug("DMARC lookup failed", "domain", fromDomain, "error", err)
@@ -125,10 +184,10 @@ func CheckDMARC(ctx context.Context, rawEmail string, spfResult *SPFResult, quar
 		result.Policy = string(record.Policy)
 	}
 
-	// Verify DKIM signatures with DNS timeout
+	// Verify DKIM signatures using the same resolver-aware TXT lookup
 	reader := strings.NewReader(rawEmail)
 	verifyOpts := &dkim.VerifyOptions{
-		LookupTXT: lookupTXTWithTimeout,
+		LookupTXT: lookupTXT,
 	}
 	verifications, err := dkim.VerifyWithOptions(reader, verifyOpts)
 	if err != nil && err != io.EOF {

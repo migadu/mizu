@@ -118,6 +118,7 @@ type Backend struct {
 	HTTPClient     *net_http.Client       // HTTP client for posting emails to destination
 	Logger         *slog.Logger           // Structured logger for debugging and monitoring
 	DNSResolver    *net.Resolver          // Custom DNS resolver (uses config.DNS.Servers or system default)
+	DNSCache       *dns.CachingWrapper    // Caching wrapper around DNSResolver; preferred for TXT/MX lookups
 	Metrics        *metrics.Metrics       // Prometheus metrics for observability
 
 	// Connection tracking for graceful shutdown and DoS protection
@@ -560,6 +561,7 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 		circuitBreaker:     be.CircuitBreaker,
 		httpClient:         be.HTTPClient,
 		dnsResolver:        be.DNSResolver,
+		dnsCache:           be.DNSCache,
 		connTracker:        be.ConnTracker,
 		distTracker:        be.DistTracker,
 		rateLimiter:        be.RateLimiter,
@@ -651,6 +653,7 @@ type Session struct {
 	circuitBreaker *poster.CircuitBreaker // Circuit breaker for HTTP destination
 	httpClient     *net_http.Client       // HTTP client for posting emails to destination
 	dnsResolver    *net.Resolver          // DNS resolver (custom or system default)
+	dnsCache       *dns.CachingWrapper    // Caching wrapper around dnsResolver (preferred for TXT/MX lookups)
 	connTracker    *ConnectionTracker     // Connection tracker for DoS protection
 	distTracker    *DistributedTracker    // Distributed connection tracker (optional, for cluster-wide limits)
 	rateLimiter    *RateLimiter           // Multi-dimensional rate limiter
@@ -1412,7 +1415,16 @@ func (s *Session) performPreDeliveryChecks(rawEmail string) error {
 		if quarantineAction == "" {
 			quarantineAction = "junk" // Default to junk for quarantine
 		}
-		dmarcResult, err = validation.CheckDMARC(context.Background(), rawEmail, s.spfResult, quarantineAction, s.Logger)
+		// Prefer the cache wrapper so DKIM key + DMARC TXT lookups are cached.
+		// Fall back to the raw resolver if no cache is wired.
+		var txtResolver validation.TXTResolver
+		if s.dnsCache != nil {
+			txtResolver = s.dnsCache
+		} else if s.dnsResolver != nil {
+			txtResolver = s.dnsResolver
+		}
+		lookupTimeout := time.Duration(s.globalConfig.DNS.TimeoutSeconds) * time.Second
+		dmarcResult, err = validation.CheckDMARC(s.ctx, rawEmail, s.spfResult, quarantineAction, txtResolver, lookupTimeout, s.Logger)
 	}
 	s.dmarcResult = dmarcResult
 	if err != nil {

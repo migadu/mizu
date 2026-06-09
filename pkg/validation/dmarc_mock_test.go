@@ -24,12 +24,12 @@ func init() {
 	// Save the original lookup function to fall back to it.
 	originalDmarcLookup := dmarcLookup
 	// Replace our package's dmarcLookup variable with a mock implementation for tests.
-	dmarcLookup = func(domain string) (*dmarc.Record, error) {
+	dmarcLookup = func(domain string, lookupTXT func(string) ([]string, error)) (*dmarc.Record, error) {
 		if record, ok := dmarcRecords[domain]; ok {
 			return record, nil
 		}
 		// If not in our mock map, fall back to the real lookup.
 		// This is useful for TestCheckDMARC_NoDMARCRecord.
-		return originalDmarcLookup(domain)
+		return originalDmarcLookup(domain, lookupTXT)
 	}
 }

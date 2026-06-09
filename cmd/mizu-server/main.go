@@ -23,6 +23,7 @@ import (
 	"migadu/mizu/pkg/cluster"
 	"migadu/mizu/pkg/concurrency"
 	"migadu/mizu/pkg/config"
+	"migadu/mizu/pkg/dns"
 	"migadu/mizu/pkg/health"
 	"migadu/mizu/pkg/logging"
 	"migadu/mizu/pkg/metrics"
@@ -264,6 +265,7 @@ func main() {
 			cfg,
 			serverRecorder,
 			dnsResolver,
+			dnsCache,
 			metricsInstance,
 			senderValidator,
 			recipientValidator,
@@ -863,6 +865,7 @@ func createServerBackend(
 	globalCfg *config.Config,
 	statsRecorder *stats.ServerRecorder,
 	dnsResolver *net.Resolver,
+	dnsCache *dns.CachingWrapper,
 	metricsInstance *metrics.Metrics,
 	senderValidator smtp.SenderValidator,
 	recipientValidator smtp.RecipientValidator,
@@ -1088,6 +1091,7 @@ func createServerBackend(
 		CircuitBreaker:     serverCircuitBreaker,
 		HTTPClient:         serverHTTPClient,
 		DNSResolver:        dnsResolver,
+		DNSCache:           dnsCache,
 		Metrics:            metricsInstance,
 		Logger:             serverLogger,
 		ActiveSessionsWg:   &activeSessionsWg,
