@@ -71,7 +71,7 @@
 # enabled = false                                   # Enable external spam checking via rspamd (default: false)
 # url = "http://rspamd:11333/checkv2"               # Rspamd HTTP endpoint (protocol v2)
 # password = ""                                     # HTTPCrypt password for rspamd authentication (optional)
-# http_timeout_seconds = 5                          # HTTP request timeout (default: 5)
+# http_timeout_seconds = 15                         # HTTP request timeout (default: 15)
 # spam_header = "X-Junk"                            # Header name to add when spam detected (default: "X-Junk")
 # spam_header_value = "yes"                         # Header value for spam messages (default: "yes")
 # ham_header_value = ""                             # Header value for ham/not spam (default: "", empty = don't add header for ham)

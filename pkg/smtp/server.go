@@ -1530,10 +1530,7 @@ func (s *Session) performPreDeliveryChecks(rawEmail string) error {
 
 	// External spam checking (rspamd)
 	if s.spamChecker != nil {
-		spamCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		result, err := s.spamChecker.Check(spamCtx, rawEmail, s.remoteAddr, s.from, s.to, s.helo)
+		result, err := s.spamChecker.Check(context.Background(), rawEmail, s.remoteAddr, s.from, s.to, s.helo)
 		if err != nil {
 			s.Logger.Warn("Spam check failed", "error", err)
 			if s.metrics != nil {

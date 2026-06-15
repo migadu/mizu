@@ -224,7 +224,7 @@ type ServerSpamCheckConfig struct {
 	Enabled            bool   `toml:"enabled"`              // Enable external spam checking (default: false)
 	URL                string `toml:"url"`                  // Rspamd HTTP endpoint (e.g., "http://rspamd:11333/checkv2")
 	Password           string `toml:"password"`             // HTTPCrypt password for rspamd authentication (optional)
-	HTTPTimeoutSeconds int    `toml:"http_timeout_seconds"` // HTTP client timeout in seconds (default: 5)
+	HTTPTimeoutSeconds int    `toml:"http_timeout_seconds"` // HTTP client timeout in seconds (default: 15)
 	SpamHeader         string `toml:"spam_header"`          // Header name to add when spam detected (default: "X-Junk")
 	SpamHeaderValue    string `toml:"spam_header_value"`    // Header value for spam (default: "yes")
 	HamHeaderValue     string `toml:"ham_header_value"`     // Header value for ham/not spam (default: "", empty = don't add header for ham)
@@ -282,6 +282,9 @@ func (s *ServerConfig) ApplyDefaults(defaults DefaultsConfig) {
 	}
 	if s.Limits.MaxConnections == 0 {
 		s.Limits.MaxConnections = defaults.MaxConnections
+	}
+	if s.MaxRecipientsPerMessage == 0 {
+		s.MaxRecipientsPerMessage = 100
 	}
 
 	// Apply validation defaults
