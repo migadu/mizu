@@ -286,9 +286,10 @@ func main() {
 				healthServer.AddChecker(backend.ConnTracker)
 			}
 
-			// Register auth rate limiter as additional IP unblocker so /api/unblock-ip
-			// also clears auth blocks and broadcasts to the cluster
+			// Register auth rate limiter as health checker and IP unblocker
 			if backend.AuthRateLimiter != nil {
+				backend.AuthRateLimiter.SetName("auth_rate_limiter:" + serverCfg.Name)
+				healthServer.AddChecker(backend.AuthRateLimiter)
 				healthServer.AddIPUnblocker(backend.AuthRateLimiter)
 			}
 		}
