@@ -111,6 +111,35 @@ func (s *Server) SetIPUnblocker(unblocker IPUnblocker) {
 	s.ipUnblocker = unblocker
 }
 
+// AddIPUnblocker adds an additional IP unblocker. Calls to RemoveIP will be
+// dispatched to all registered unblockers. Returns true if any removed the IP.
+func (s *Server) AddIPUnblocker(unblocker IPUnblocker) {
+	if s.ipUnblocker == nil {
+		s.ipUnblocker = unblocker
+		return
+	}
+	if c, ok := s.ipUnblocker.(*compositeUnblocker); ok {
+		c.unblockers = append(c.unblockers, unblocker)
+		return
+	}
+	s.ipUnblocker = &compositeUnblocker{unblockers: []IPUnblocker{s.ipUnblocker, unblocker}}
+}
+
+// compositeUnblocker dispatches RemoveIP to multiple unblockers.
+type compositeUnblocker struct {
+	unblockers []IPUnblocker
+}
+
+func (c *compositeUnblocker) RemoveIP(ip string) bool {
+	removed := false
+	for _, u := range c.unblockers {
+		if u.RemoveIP(ip) {
+			removed = true
+		}
+	}
+	return removed
+}
+
 // SetACMEHandler registers an HTTP handler for the ACME challenge
 func (s *Server) SetACMEHandler(handler http.Handler) {
 	s.acmeHandler = handler

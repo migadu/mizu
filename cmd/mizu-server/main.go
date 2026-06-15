@@ -285,6 +285,12 @@ func main() {
 				backend.ConnTracker.SetName("connection_tracker:" + serverCfg.Name)
 				healthServer.AddChecker(backend.ConnTracker)
 			}
+
+			// Register auth rate limiter as additional IP unblocker so /api/unblock-ip
+			// also clears auth blocks and broadcasts to the cluster
+			if backend.AuthRateLimiter != nil {
+				healthServer.AddIPUnblocker(backend.AuthRateLimiter)
+			}
 		}
 
 		// Create server-specific context
@@ -1056,7 +1062,7 @@ func createServerBackend(
 			os.Exit(1)
 		}
 
-		timeout := 5 * time.Second
+		timeout := 15 * time.Second
 		if serverCfg.SpamCheck.HTTPTimeoutSeconds > 0 {
 			timeout = time.Duration(serverCfg.SpamCheck.HTTPTimeoutSeconds) * time.Second
 		}

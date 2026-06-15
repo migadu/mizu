@@ -183,7 +183,7 @@ func (c *ClusterAuthRateLimiter) HandleClusterEvent(data []byte) {
 		c.limiter.ApplyBlockIP(event.IP, event.BlockedUntil, event.FailureCount, event.FirstFailure)
 
 	case AuthRateLimitEventUnblockIP:
-		// Not implemented yet - could clear blocks if needed
+		c.limiter.ApplyUnblockIP(event.IP)
 
 	case AuthRateLimitEventFailureCount:
 		c.limiter.ApplyFailureCount(event.IP, event.FailureCount, event.LastDelay, event.FirstFailure)

@@ -694,6 +694,42 @@ func (a *AuthRateLimiter) cleanup() {
 	a.usernameMu.Unlock()
 }
 
+// RemoveIP removes an IP from the blocked list and failure tracking, and broadcasts to the cluster.
+// Implements health.IPUnblocker interface.
+func (a *AuthRateLimiter) RemoveIP(ip string) bool {
+	removed := a.ApplyUnblockIP(ip)
+
+	// Broadcast to cluster if available
+	if removed && a.clusterLimiter != nil {
+		a.clusterLimiter.BroadcastUnblockIP(ip)
+	}
+
+	return removed
+}
+
+// ApplyUnblockIP removes an IP from the blocked list and failure tracking (local only, no broadcast).
+// Used by cluster event handler to apply unblocks from other nodes.
+func (a *AuthRateLimiter) ApplyUnblockIP(ip string) bool {
+	a.ipMu.Lock()
+	defer a.ipMu.Unlock()
+
+	_, blockedExists := a.blockedIPs[ip]
+	_, failureExists := a.ipFailureCounts[ip]
+	removed := blockedExists || failureExists
+
+	delete(a.blockedIPs, ip)
+	delete(a.ipFailureCounts, ip)
+
+	if removed {
+		a.logger.Info("IP unblocked",
+			"ip", ip,
+			"was_blocked", blockedExists,
+			"had_failures", failureExists)
+	}
+
+	return removed
+}
+
 // ApplyBlockIP applies a block from cluster sync
 func (a *AuthRateLimiter) ApplyBlockIP(ip string, blockedUntil time.Time, failureCount int, firstFailure time.Time) {
 	a.ipMu.Lock()
