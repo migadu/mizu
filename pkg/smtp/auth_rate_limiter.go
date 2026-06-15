@@ -10,12 +10,14 @@ import (
 
 	"migadu/mizu/pkg/concurrency"
 	"migadu/mizu/pkg/config"
+	"migadu/mizu/pkg/health"
 	"migadu/mizu/pkg/metrics"
 )
 
 // AuthRateLimiter implements two-tier authentication rate limiting
 // to protect against brute-force attacks
 type AuthRateLimiter struct {
+	name    string // for health checker identification
 	config  config.ServerAuthRateLimitConfig
 	logger  *slog.Logger
 	metrics *metrics.Metrics
@@ -791,6 +793,27 @@ func (a *AuthRateLimiter) GetStats() map[string]interface{} {
 		"blocked_ips":               blockedIPCount,
 		"ip_failure_tracking":       ipFailureCount,
 		"username_failure_tracking": usernameFailureCount,
+	}
+}
+
+// SetName sets the health checker name for this rate limiter.
+func (a *AuthRateLimiter) SetName(name string) {
+	a.name = name
+}
+
+// Name returns the health checker name. Implements health.Checker.
+func (a *AuthRateLimiter) Name() string {
+	return a.name
+}
+
+// CheckHealth reports auth rate limiter status. Implements health.Checker.
+func (a *AuthRateLimiter) CheckHealth() health.ComponentStatus {
+	stats := a.GetStats()
+	stats["cluster_sync"] = a.clusterLimiter != nil
+
+	return health.ComponentStatus{
+		Status:  "healthy",
+		Details: stats,
 	}
 }
 

@@ -295,6 +295,12 @@ func main() {
 				backend.ConnTracker.SetName("connection_tracker:" + serverCfg.Name)
 				healthServer.AddChecker(backend.ConnTracker)
 			}
+
+			// Register auth rate limiter as health checker
+			if backend.AuthRateLimiter != nil {
+				backend.AuthRateLimiter.SetName("auth_rate_limiter:" + serverCfg.Name)
+				healthServer.AddChecker(backend.AuthRateLimiter)
+			}
 		}
 
 		// Create server-specific context
