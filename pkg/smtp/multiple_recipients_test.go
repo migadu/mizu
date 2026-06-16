@@ -57,17 +57,17 @@ func TestMultipleRecipients_DeliveryToBackend(t *testing.T) {
 	defer statsManager.Stop()
 
 	session := &Session{
-		ctx:            context.Background(),
-		helo:           "sender.example.com",
-		from:           "alice@sender.com",
-		to:             []string{"bob@example.com", "charlie@example.com", "dave@example.com"},
-		serverConfig:   &cfg.Servers[0],
-		globalConfig:   cfg,
-		statsManager:   stats.NewServerRecorder(statsManager, "test", 0, 0),
-		httpClient:     &http.Client{},
-		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
-		remoteAddr:     "192.0.2.1:12345",
-		traceID:        "test-trace-123",
+		ctx:          context.Background(),
+		helo:         "sender.example.com",
+		from:         "alice@sender.com",
+		to:           []string{"bob@example.com", "charlie@example.com", "dave@example.com"},
+		serverConfig: &cfg.Servers[0],
+		globalConfig: cfg,
+		statsManager: stats.NewServerRecorder(statsManager, "test", 0, 0),
+		httpClient:   &http.Client{},
+		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		remoteAddr:   "192.0.2.1:12345",
+		traceID:      "test-trace-123",
 	}
 
 	emailContent := "Subject: Test Email\r\n\r\nThis is a test email for multiple recipients."
@@ -119,17 +119,17 @@ func TestMultipleRecipients_SingleRecipientStillWorks(t *testing.T) {
 	defer statsManager.Stop()
 
 	session := &Session{
-		ctx:            context.Background(),
-		helo:           "sender.example.com",
-		from:           "alice@sender.com",
-		to:             []string{"bob@example.com"},
-		serverConfig:   &cfg.Servers[0],
-		globalConfig:   cfg,
-		statsManager:   stats.NewServerRecorder(statsManager, "test", 0, 0),
-		httpClient:     &http.Client{},
-		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
-		remoteAddr:     "192.0.2.1:12345",
-		traceID:        "test-trace-single",
+		ctx:          context.Background(),
+		helo:         "sender.example.com",
+		from:         "alice@sender.com",
+		to:           []string{"bob@example.com"},
+		serverConfig: &cfg.Servers[0],
+		globalConfig: cfg,
+		statsManager: stats.NewServerRecorder(statsManager, "test", 0, 0),
+		httpClient:   &http.Client{},
+		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		remoteAddr:   "192.0.2.1:12345",
+		traceID:      "test-trace-single",
 	}
 
 	err := session.deliverSynchronous("Subject: Test\r\n\r\nTest")
@@ -177,17 +177,17 @@ func TestMultipleRecipients_SecondRecipientFails(t *testing.T) {
 	defer statsManager.Stop()
 
 	session := &Session{
-		ctx:            context.Background(),
-		helo:           "sender.example.com",
-		from:           "alice@sender.com",
-		to:             []string{"bob@example.com", "charlie@example.com", "dave@example.com"},
-		serverConfig:   &cfg.Servers[0],
-		globalConfig:   cfg,
-		statsManager:   stats.NewServerRecorder(statsManager, "test", 0, 0),
-		httpClient:     &http.Client{},
-		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
-		remoteAddr:     "192.0.2.1:12345",
-		traceID:        "test-trace-fail",
+		ctx:          context.Background(),
+		helo:         "sender.example.com",
+		from:         "alice@sender.com",
+		to:           []string{"bob@example.com", "charlie@example.com", "dave@example.com"},
+		serverConfig: &cfg.Servers[0],
+		globalConfig: cfg,
+		statsManager: stats.NewServerRecorder(statsManager, "test", 0, 0),
+		httpClient:   &http.Client{},
+		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		remoteAddr:   "192.0.2.1:12345",
+		traceID:      "test-trace-fail",
 	}
 
 	err := session.deliverSynchronous("Subject: Test\r\n\r\nTest")

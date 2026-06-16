@@ -36,8 +36,8 @@ type ServerConfig struct {
 	Type string `toml:"type"` // "relay" (MX server) or "submission" (MSA server)
 
 	// === Network ===
-	ListenAddr    string `toml:"listen_addr"`    // Address to bind (e.g., ":25", ":465", ":587", "127.0.0.1:2525")
-	Hostname      string `toml:"hostname"`       // Server hostname/FQDN (overrides defaults.hostname if set)
+	ListenAddr           string   `toml:"listen_addr"`            // Address to bind (e.g., ":25", ":465", ":587", "127.0.0.1:2525")
+	Hostname             string   `toml:"hostname"`               // Server hostname/FQDN (overrides defaults.hostname if set)
 	ProxyProtocol        bool     `toml:"proxy_protocol"`         // Enable HAProxy PROXY protocol v1/v2 (real client IP from PROXY header)
 	ProxyProtocolTrusted []string `toml:"proxy_protocol_trusted"` // CIDRs/IPs allowed to send PROXY headers (required when proxy_protocol=true)
 

@@ -449,7 +449,7 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 				return nil, &smtp.SMTPError{
 					Code:         450,
 					EnhancedCode: smtp.EnhancedCode{4, 7, 25},
-                    Message:      fmt.Sprintf("no reverse DNS record for IP address %s", ipStr),
+					Message:      fmt.Sprintf("no reverse DNS record for IP address %s", ipStr),
 				}
 			}
 			// Allow connection even without rDNS when not required
