@@ -233,12 +233,10 @@ type ServerSpamCheckConfig struct {
 
 // ServerTLSConfig holds TLS configuration for a server
 type ServerTLSConfig struct {
-	Enabled              bool   `toml:"enabled"`                // Enable TLS for this server
-	Mode                 string `toml:"mode"`                   // TLS mode: "starttls" or "implicit"
-	Required             bool   `toml:"required"`               // Enforce TLS (reject unencrypted connections)
-	MinTLSVersion        string `toml:"min_tls_version"`        // Minimum TLS version: "1.2" or "1.3"
-	DeferredHandshake    bool   `toml:"deferred_handshake"`     // Defer TLS handshake to prevent head-of-line blocking (implicit TLS only)
-	HandshakeTimeoutSecs int    `toml:"handshake_timeout_secs"` // Timeout for TLS handshake in seconds (default: 10, 0 = no timeout)
+	Enabled       bool   `toml:"enabled"`         // Enable TLS for this server
+	Mode          string `toml:"mode"`            // TLS mode: "starttls" or "implicit"
+	Required      bool   `toml:"required"`        // Enforce TLS (reject unencrypted connections)
+	MinTLSVersion string `toml:"min_tls_version"` // Minimum TLS version: "1.2" or "1.3"
 }
 
 // IsRelay returns true if this is a relay (MX) server
@@ -450,26 +448,36 @@ type LoggingConfig struct {
 // TLSConfig holds TLS/certificate configuration
 type TLSConfig struct {
 	Enabled     bool                 `toml:"enabled"`     // Enable TLS certificate management
-	Provider    string               `toml:"provider"`    // TLS provider: "file" or "letsencrypt" (default: "file")
+	Provider    string               `toml:"provider"`    // "file" or "letsencrypt" (default: "file")
 	File        TLSFileConfig        `toml:"file"`        // File-based certificate configuration
 	LetsEncrypt TLSLetsEncryptConfig `toml:"letsencrypt"` // Let's Encrypt configuration
 }
 
 // TLSFileConfig holds configuration for file-based TLS certificates
 type TLSFileConfig struct {
-	CertFile string `toml:"cert_file"` // Path to certificate file
-	KeyFile  string `toml:"key_file"`  // Path to private key file
+	CertFile string `toml:"cert_file"` // Path to certificate file (PEM)
+	KeyFile  string `toml:"key_file"`  // Path to private key file (PEM)
 }
 
 // TLSLetsEncryptConfig holds Let's Encrypt automatic certificate configuration
 type TLSLetsEncryptConfig struct {
-	Email               string   `toml:"email"`                 // Email for Let's Encrypt notifications
-	Domains             []string `toml:"domains"`               // Domains to obtain certificates for
-	DefaultDomain       string   `toml:"default_domain"`        // Default domain for SNI-less connections (optional, defaults to first domain)
-	Staging             bool     `toml:"staging"`               // Use Let's Encrypt staging environment (for testing)
-	RenewBeforeDays     int      `toml:"renew_before_days"`     // Days before expiry to renew (default: 30)
-	FallbackCacheDir    string   `toml:"fallback_cache_dir"`    // Local fallback directory for certificates (optional, empty = no fallback)
-	SyncIntervalMinutes int      `toml:"sync_interval_minutes"` // How often to sync certificates in minutes (default: 5, 0 = no sync)
+	Email               string      `toml:"email"`                 // Email for Let's Encrypt notifications
+	Domains             []string    `toml:"domains"`               // Domains to obtain certificates for
+	DefaultDomain       string      `toml:"default_domain"`        // Default domain for SNI-less connections (defaults to first domain)
+	StorageProvider     string      `toml:"storage_provider"`      // "s3" or "file" (default: "s3")
+	CacheDir            string      `toml:"cache_dir"`             // Local cache dir (file mode) or fallback dir (s3 mode)
+	SyncIntervalMinutes int         `toml:"sync_interval_minutes"` // Local→S3 sync interval (default: 5 minutes; only applies when storage_provider="s3")
+	S3                  TLSS3Config `toml:"s3"`                    // S3 credentials and bucket for certificate storage
+}
+
+// TLSS3Config holds S3 credentials for Let's Encrypt certificate storage.
+type TLSS3Config struct {
+	Bucket    string `toml:"bucket"`
+	Region    string `toml:"region"`
+	Endpoint  string `toml:"endpoint"` // Custom S3 endpoint (e.g., Backblaze B2, MinIO); empty = AWS default
+	Prefix    string `toml:"prefix"`
+	AccessKey string `toml:"access_key"`
+	SecretKey string `toml:"secret_key"`
 }
 
 // StatsConfig holds configuration for IP and domain reputation tracking
@@ -512,16 +520,11 @@ func DefaultConfig() Config {
 		TLS: TLSConfig{
 			Enabled:  false,
 			Provider: "file",
-			File: TLSFileConfig{
-				CertFile: "",
-				KeyFile:  "",
-			},
 			LetsEncrypt: TLSLetsEncryptConfig{
 				Email:               "admin@example.com",
 				Domains:             []string{},
-				Staging:             false,
-				RenewBeforeDays:     30,
-				FallbackCacheDir:    "",
+				StorageProvider:     "s3",
+				CacheDir:            "",
 				SyncIntervalMinutes: 5,
 			},
 		},
