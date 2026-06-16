@@ -31,7 +31,7 @@ This is a test email that should pass DMARC via SPF alignment.
 		Result: authres.SPFResult{Value: authres.ResultPass},
 	}
 
-	result, err := CheckDMARC(context.Background(), rawEmail, spfResult, "junk", nil)
+	result, err := CheckDMARC(context.Background(), rawEmail, spfResult, "junk", nil, 0, nil)
 	if err != nil {
 		t.Fatalf("CheckDMARC failed: %v", err)
 	}
@@ -65,7 +65,7 @@ This is a test email that should be rejected by DMARC.
 		Result: authres.SPFResult{Value: authres.ResultFail},
 	}
 
-	result, err := CheckDMARC(context.Background(), rawEmail, spfResult, "junk", nil)
+	result, err := CheckDMARC(context.Background(), rawEmail, spfResult, "junk", nil, 0, nil)
 	if err != nil {
 		t.Fatalf("CheckDMARC failed: %v", err)
 	}
@@ -98,7 +98,7 @@ This is a test email that should be quarantined by DMARC.
 
 	// Test case 1: Quarantine is treated as junk
 	t.Run("QuarantineAsJunk", func(t *testing.T) {
-		result, err := CheckDMARC(context.Background(), rawEmail, spfResult, "junk", nil)
+		result, err := CheckDMARC(context.Background(), rawEmail, spfResult, "junk", nil, 0, nil)
 		if err != nil {
 			t.Fatalf("CheckDMARC failed: %v", err)
 		}
@@ -116,7 +116,7 @@ This is a test email that should be quarantined by DMARC.
 
 	// Test case 2: Quarantine is not treated as junk
 	t.Run("QuarantineNotAsJunk", func(t *testing.T) {
-		result, err := CheckDMARC(context.Background(), rawEmail, spfResult, "none", nil)
+		result, err := CheckDMARC(context.Background(), rawEmail, spfResult, "none", nil, 0, nil)
 		if err != nil {
 			t.Fatalf("CheckDMARC failed: %v", err)
 		}
@@ -148,7 +148,7 @@ This is a test email from a domain with no DMARC record.
 		Result: authres.SPFResult{Value: authres.ResultFail},
 	}
 
-	result, err := CheckDMARC(context.Background(), rawEmail, spfResult, "junk", nil)
+	result, err := CheckDMARC(context.Background(), rawEmail, spfResult, "junk", nil, 0, nil)
 	if err != nil {
 		t.Fatalf("CheckDMARC failed: %v", err)
 	}
@@ -171,7 +171,7 @@ Subject: No From Header
 
 Test.
 `
-	result, err := CheckDMARC(context.Background(), rawEmail, nil, "junk", nil)
+	result, err := CheckDMARC(context.Background(), rawEmail, nil, "junk", nil, 0, nil)
 	if err != nil {
 		t.Fatalf("CheckDMARC failed: %v", err)
 	}
@@ -216,16 +216,18 @@ Test email with invalid DKIM signature that will trigger DNS lookup.
 
 	// This should complete within reasonable time despite DNS timeout
 	start := time.Now()
-	result, err := CheckDMARC(context.Background(), rawEmail, nil, "junk", nil)
+	result, err := CheckDMARC(context.Background(), rawEmail, nil, "junk", nil, 0, nil)
 	duration := time.Since(start)
 
 	if err != nil {
 		t.Fatalf("CheckDMARC failed: %v", err)
 	}
 
-	// Should complete in roughly DNSLookupTimeout, not 10 seconds
-	if duration > 8*time.Second {
-		t.Errorf("CheckDMARC took too long: %v (expected ~5 seconds)", duration)
+	// DMARC TXT and DKIM key lookups both go through the same resolver-aware
+	// LookupTXT, so each hits the 5s timeout sequentially. Allow up to ~2x
+	// DNSLookupTimeout plus headroom.
+	if duration > 2*DNSLookupTimeout+3*time.Second {
+		t.Errorf("CheckDMARC took too long: %v (expected ~%v)", duration, 2*DNSLookupTimeout)
 	}
 
 	// Should not pass due to DKIM failure

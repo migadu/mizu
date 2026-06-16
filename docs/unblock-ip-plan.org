@@ -1,0 +1,640 @@
+#+TITLE: Unblock Individual IPs via Admin API
+#+DATE: 2026-06-15
+
+* Overview
+
+Add an HTTP endpoint and admin CLI command to remove individual IPs from
+Mizu's reputation tracker, allowing surgical unblocking without flushing
+all caches. Expose the action in Fernrohr's blacklist UI as an "unblock"
+button per row.
+
+* Scope of "unblocking"
+
+Removing an IP from the stats manager's =ips= map clears its reputation
+score and =IsDenied= flag. This is sufficient to unblock the IP because:
+
+- *Reputation checks* (=CheckIPReputation=) return neutral (0) for
+  unknown IPs, so the IP is allowed through.
+- *Rate limiting* (=RateLimiter=) uses sliding windows keyed on IP and
+  is independent of reputation. Rate limit state is NOT cleared by this
+  operation. If an IP is also rate-limited, that will expire naturally
+  via the sliding window.
+- *Connection tracking* (=ConnectionTracker= / =DistributedTracker=)
+  counts active TCP connections and is independent of reputation. Not
+  affected.
+
+The admin CLI help text and API docs should clarify that =unblock-ip=
+removes reputation state only. Rate limit windows and connection counts
+are unaffected and expire independently.
+
+* Buffered event re-creation
+
+The stats manager processes events asynchronously via a buffered channel.
+After =RemoveIP=, events already queued for that IP will call
+=getOrCreateIP= and recreate the entry with a fresh slate. This means:
+
+- The IP may briefly reappear in the tracker moments after unblocking.
+- It starts with neutral reputation (0), so it will NOT be re-blocked
+  unless it immediately generates new negative signals.
+- This is acceptable behavior. The plan documents it here and in the API
+  response message so operators are not surprised.
+
+* Prerequisite: Normalize IPv6 on ingress
+
+IPv6 addresses have multiple string representations. =net.SplitHostPort=
+returns the raw string from the TCP connection, so the map key may be
+non-canonical (e.g. =2001:0db8:85a3:0000:0000:8a2e:0370:7334= instead
+of =2001:db8:85a3::8a2e:370:7334=).
+
+Normalize once at the point IPs enter the system so all downstream
+lookups, stats, and the new unblock endpoint work with consistent keys.
+
+** Shared helper
+
+Extract a =NormalizeIP= function used by both ingress and =RemoveIP=.
+Returns =(string, bool)= so callers can distinguish invalid input from
+a valid IP — this avoids the semantic split where =NormalizeIP= would
+silently pass through garbage while =RemoveIP= rejects it.
+
+#+begin_src go
+// In pkg/stats/normalize.go (or similar shared location)
+
+// NormalizeIP returns the canonical string form of an IP address and true,
+// or ("", false) if the input is not a valid IP.
+// For IPv6 this compresses zeros and lowercases hex digits.
+func NormalizeIP(ip string) (string, bool) {
+    parsed := net.ParseIP(ip)
+    if parsed == nil {
+        return "", false
+    }
+    return parsed.String(), true
+}
+#+end_src
+
+** Changes
+
+*** =pkg/smtp/server.go= ~NewSession~
+After =net.SplitHostPort=, normalize using the shared helper:
+
+#+begin_src go
+if normalized, ok := stats.NormalizeIP(host); ok {
+    remoteAddr = normalized
+} else {
+    remoteAddr = host
+}
+#+end_src
+
+*** =pkg/stats/manager.go= ~RemoveIP~
+Uses the same =NormalizeIP= (see below).
+
+* Stats manager: add =RemoveIP= method
+
+** File: =pkg/stats/manager.go=
+
+Add a public method that deletes a single IP entry from the reputation
+map. Uses =NormalizeIP= so the caller doesn't need to worry about IPv6
+format.
+
+#+begin_src go
+// RemoveIP removes an IP entry from the reputation tracker, effectively unblocking it.
+// Returns true if the IP was found and removed, false if it was not tracked.
+// Note: buffered events already in the channel may recreate the entry with a clean
+// slate shortly after removal. This is harmless as the new entry starts with neutral
+// reputation.
+func (m *Manager) RemoveIP(ip string) bool {
+    key, ok := NormalizeIP(ip)
+    if !ok {
+        return false
+    }
+
+    m.ipMu.Lock()
+    defer m.ipMu.Unlock()
+    _, exists := m.ips[key]
+    if exists {
+        delete(m.ips, key)
+    }
+    return exists
+}
+#+end_src
+
+Thread safety: the event loop uses =getOrCreateIP= which also acquires
+=ipMu=, so there is no data race. See "Buffered event re-creation"
+above for the behavioral note on in-flight events.
+
+* Health server: add =/api/unblock-ip= endpoint
+
+** File: =pkg/health/server.go=
+
+*** New interface
+
+#+begin_src go
+type IPUnblocker interface {
+    RemoveIP(ip string) bool
+}
+#+end_src
+
+*** Server struct
+
+Add field:
+#+begin_src go
+ipUnblocker IPUnblocker
+#+end_src
+
+*** Setter
+
+#+begin_src go
+func (s *Server) SetIPUnblocker(unblocker IPUnblocker) {
+    s.ipUnblocker = unblocker
+}
+#+end_src
+
+*** Route registration (in =setupRoutes=)
+
+#+begin_src go
+s.mux.HandleFunc("/api/unblock-ip", s.basicAuthMiddleware(s.unblockIPHandler))
+#+end_src
+
+*** Handler
+
+- =POST= only
+- Accept IP from query param (precedence) or JSON body (={"ip": "..."}=)
+- Validate with =net.ParseIP= to reject garbage
+- Return JSON with =removed= boolean for script-friendly consumption
+- Log the action at INFO level (security-relevant admin operation)
+- No additional rate limiting beyond basic auth (acceptable for v1)
+- Requires =net= import (=fmt=, =io=, =json= already imported)
+
+#+begin_src go
+func (s *Server) unblockIPHandler(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodPost {
+        http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+        return
+    }
+    if s.ipUnblocker == nil {
+        w.Header().Set("Content-Type", "application/json")
+        w.WriteHeader(http.StatusNotImplemented)
+        json.NewEncoder(w).Encode(map[string]any{
+            "status": "error",
+            "error":  "IP unblocking not configured",
+        })
+        return
+    }
+
+    // Parse IP from query param or JSON body
+    ip := r.URL.Query().Get("ip")
+    if ip == "" {
+        var body struct {
+            IP string `json:"ip"`
+        }
+        if r.Body != nil {
+            if err := json.NewDecoder(io.LimitReader(r.Body, 1024)).Decode(&body); err != nil {
+                w.Header().Set("Content-Type", "application/json")
+                w.WriteHeader(http.StatusBadRequest)
+                json.NewEncoder(w).Encode(map[string]any{
+                    "status": "error",
+                    "error":  "malformed request body",
+                })
+                return
+            }
+            ip = body.IP
+        }
+    }
+    if ip == "" || net.ParseIP(ip) == nil {
+        w.Header().Set("Content-Type", "application/json")
+        w.WriteHeader(http.StatusBadRequest)
+        json.NewEncoder(w).Encode(map[string]any{
+            "status": "error",
+            "error":  "valid ip parameter is required",
+        })
+        return
+    }
+
+    removed := s.ipUnblocker.RemoveIP(ip)
+
+    // Log the admin action
+    s.logger.Info("IP unblock requested",
+        "ip", ip,
+        "removed", removed,
+        "remote_addr", r.RemoteAddr,
+    )
+
+    w.Header().Set("Content-Type", "application/json")
+    msg := fmt.Sprintf("IP %s removed from reputation tracker", ip)
+    if !removed {
+        msg = fmt.Sprintf("IP %s was not tracked", ip)
+    }
+    json.NewEncoder(w).Encode(map[string]any{
+        "status":  "success",
+        "removed": removed,
+        "message": msg,
+    })
+}
+#+end_src
+
+Always returns =200= for a valid request. The =removed= boolean
+distinguishes "found and removed" from "was not tracked". This keeps it
+simple for clients: =httpPost= in mizu-admin rejects non-2xx, so a 404
+for "not tracked" would cause a =fatal()= error — wrong behavior for a
+valid operation. Scripts check the =removed= field instead.
+
+Response semantics:
+- =200= + =removed: true= — IP was found and removed
+- =200= + =removed: false= — IP was not in the tracker
+- =400= — invalid or missing IP / malformed body
+- =405= — wrong HTTP method
+- =501= — unblocker not configured
+
+* Wire up in server bootstrap
+
+** File: =cmd/mizu-server/main.go=
+
+Call =SetIPUnblocker= near the existing =SetStatsProvider= /
+=SetCacheFlusher= calls, *before* =healthServer.Start()= (which calls
+=setupRoutes= and registers the endpoint). The route is registered
+unconditionally; the handler checks for =nil= at runtime — consistent
+with how =flushCacheHandler= and =renewCertHandler= work.
+
+#+begin_src go
+healthServer.SetIPUnblocker(statsManager)
+#+end_src
+
+=stats.Manager= satisfies =health.IPUnblocker= via the =RemoveIP= method.
+
+* Admin CLI: add =unblock-ip= command
+
+** File: =cmd/mizu-admin/main.go=
+
+*** Command dispatch (in =switch command=)
+
+#+begin_src go
+case "unblock-ip":
+    cmdUnblockIP()
+#+end_src
+
+*** Handler
+
+#+begin_src go
+func cmdUnblockIP() {
+    if flag.NArg() < 2 {
+        fmt.Fprintf(os.Stderr, "Usage: mizu-admin unblock-ip <ip-address>\n")
+        os.Exit(1)
+    }
+    ip := flag.Arg(1)
+    if net.ParseIP(ip) == nil {
+        fatal("Invalid IP address: %s", ip)
+    }
+
+    bodyJSON, _ := json.Marshal(map[string]string{"ip": ip})
+    resp, err := httpPost("/api/unblock-ip", bytes.NewReader(bodyJSON))
+    if err != nil {
+        fatal("Failed to unblock IP: %v", err)
+    }
+
+    var result map[string]any
+    if err := json.Unmarshal(resp, &result); err != nil {
+        fatal("Failed to parse response: %v", err)
+    }
+
+    removed, _ := result["removed"].(bool)
+    msg, _ := result["message"].(string)
+    if removed {
+        fmt.Printf("OK: %s\n", msg)
+    } else {
+        fmt.Printf("Not found: %s\n", msg)
+    }
+}
+#+end_src
+
+*** Usage text
+
+Add to the =usage()= function:
+
+#+begin_example
+  unblock-ip         Remove a specific IP from the reputation tracker
+#+end_example
+
+* Fernrohr: unblock button in blacklist UI
+
+Fernrohr is the web dashboard that displays Mizu's blocked IP list. Add
+an "unblock" action per row so operators can remove IPs directly from the
+UI without SSH access.
+
+** MizuClient: add =UnblockIP= method
+
+*** File: =fernrohr/internal/client/mizu.go=
+
+#+begin_src go
+// UnblockIP removes an IP from the Mizu reputation tracker.
+func (c *MizuClient) UnblockIP(ctx context.Context, ip string) (bool, error) {
+    bodyJSON, _ := json.Marshal(map[string]string{"ip": ip})
+    req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+        c.baseURL+"/api/unblock-ip", bytes.NewReader(bodyJSON))
+    if err != nil {
+        return false, err
+    }
+    req.Header.Set("Content-Type", "application/json")
+    if c.username != "" {
+        req.SetBasicAuth(c.username, c.password)
+    }
+    resp, err := c.http.Do(req)
+    if err != nil {
+        return false, err
+    }
+    defer resp.Body.Close()
+
+    var result struct {
+        Removed bool   `json:"removed"`
+        Message string `json:"message"`
+    }
+    if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+        return false, fmt.Errorf("decode: %w", err)
+    }
+    return result.Removed, nil
+}
+#+end_src
+
+** BlacklistHandler: add POST handler for unblock action
+
+*** File: =fernrohr/internal/handler/blacklist.go=
+
+Add an =UnblockHandler= that the blacklist page's unblock buttons POST
+to. It tries all Mizu nodes in the cluster (since reputation is
+per-node) and reports results.
+
+#+begin_src go
+func (h *BlacklistHandler) UnblockHandler() http.HandlerFunc {
+    return func(w http.ResponseWriter, r *http.Request) {
+        if r.Method != http.MethodPost {
+            http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+            return
+        }
+
+        ip := r.FormValue("ip")
+        if net.ParseIP(ip) == nil {
+            http.Error(w, "Invalid IP", http.StatusBadRequest)
+            return
+        }
+
+        cl := ActiveCluster(h.clusters, r)
+        ctx, cancel := context.WithTimeout(r.Context(), blacklistTimeout)
+        defer cancel()
+
+        // Unblock on ALL Mizu nodes (reputation is per-node)
+        var removed int
+        var errs []string
+        for _, mc := range cl.Mizus {
+            ok, err := mc.UnblockIP(ctx, ip)
+            if err != nil {
+                h.logger.Warn("unblock: mizu node failed", "ip", ip, "error", err)
+                errs = append(errs, err.Error())
+                continue
+            }
+            if ok {
+                removed++
+            }
+        }
+
+        h.logger.Info("IP unblock via UI",
+            "ip", ip,
+            "cluster", cl.Name,
+            "nodes_removed", removed,
+            "nodes_failed", len(errs),
+        )
+
+        // Build redirect with flash message via query param
+        dest := "/blacklist?"
+        if q := r.URL.Query().Get("cluster"); q != "" {
+            dest += "cluster=" + url.QueryEscape(q) + "&"
+        }
+        if len(errs) > 0 {
+            dest += "msg=" + url.QueryEscape(
+                fmt.Sprintf("Unblocked %s on %d node(s), %d failed", ip, removed, len(errs)))
+        } else if removed > 0 {
+            dest += "msg=" + url.QueryEscape(
+                fmt.Sprintf("Unblocked %s on %d node(s)", ip, removed))
+        } else {
+            dest += "msg=" + url.QueryEscape(
+                fmt.Sprintf("%s was not tracked", ip))
+        }
+        http.Redirect(w, r, dest, http.StatusSeeOther)
+    }
+}
+#+end_src
+
+The =msg= query parameter is displayed as a flash banner at the top of
+the blacklist page. Add to the template (after the error div):
+
+#+begin_src html
+{{if .FlashMessage}}
+<div class="flash">{{.FlashMessage}}</div>
+{{end}}
+#+end_src
+
+With styling:
+
+#+begin_src css
+.flash { background: #f0fdf4; border: 1px solid #86efac; border-radius: 4px;
+         padding: 0.5rem 0.75rem; margin-bottom: 1rem; font-size: 0.85rem;
+         color: #166534; }
+#+end_src
+
+The =BlacklistHandler.ServeHTTP= method reads the =msg= query param and
+passes it as =FlashMessage= in =BlacklistData=:
+
+#+begin_src go
+// Add to BlacklistData struct
+FlashMessage string
+
+// In ServeHTTP, before render:
+data.FlashMessage = r.URL.Query().Get("msg")
+#+end_src
+
+** Route registration
+
+*** File: =fernrohr/cmd/fernrohr/main.go=
+
+#+begin_src go
+mux.Handle("POST /blacklist/unblock",
+    auth.BasicAuth(blacklistHandler.UnblockHandler(), cfg.HTTP.Username, cfg.HTTP.PasswordHash))
+#+end_src
+
+** Template: add unblock button per row
+
+*** File: =fernrohr/cmd/fernrohr/templates/blacklist.html=
+
+Add an "Actions" column to the table header and an unblock form per row:
+
+The =clusterParam= template function already exists in Fernrohr — it
+takes the active cluster name string and returns a URL fragment like
+=cluster=name&=. Usage: =clusterParam $.ActiveCluster= (using =$= to
+reach the top-level =PageContext=, since we're inside =range .BlockedIPs=).
+
+#+begin_src html
+<!-- New column header (after Servers) -->
+<th>Actions</th>
+
+<!-- New column cell (after Servers cell, inside {{range .BlockedIPs}}) -->
+<td>
+  <form method="POST" action="/blacklist/unblock?{{clusterParam $.ActiveCluster}}"
+        style="margin:0" onsubmit="return confirm('Unblock {{.IP}}?')">
+    <input type="hidden" name="ip" value="{{.IP}}">
+    <button type="submit" class="unblock"
+            title="Remove from reputation tracker">unblock</button>
+  </form>
+</td>
+#+end_src
+
+The form POSTs to =/blacklist/unblock= which fans out to all Mizu nodes
+in the cluster, then redirects back to the blacklist page. The
+=confirm()= dialog prevents accidental clicks.
+
+** Styling
+
+Add to the =<style>= block:
+
+#+begin_src css
+button.unblock {
+  font-size: 0.75rem; padding: 0.15rem 0.4rem; cursor: pointer;
+  background: #fff; border: 1px solid #ddd; border-radius: 3px;
+}
+button.unblock:hover { background: #f0fdf4; border-color: #86efac; }
+#+end_src
+
+* Cluster considerations
+
+Each Mizu node tracks IP reputation independently. The =mizu-admin
+unblock-ip= command only affects the node receiving the API call.
+
+For clustered deployments:
+- *Fernrohr* handles this automatically: =UnblockHandler= iterates all
+  Mizu nodes in the cluster and calls =/api/unblock-ip= on each.
+- *CLI users* must call =unblock-ip= on each node, or accept that the
+  IP ages out of peer data via the S3 sync/retention cycle.
+
+A cluster-wide unblock broadcast via memberlist gossip could be added
+later but is not needed for v1.
+
+* Testing
+
+** Unit test for =RemoveIP=
+
+- Insert IP via =getOrCreateIP=, verify =RemoveIP= returns =true=
+- Call =RemoveIP= again, verify returns =false=
+- Verify =CheckIPReputation= returns neutral (0) after removal
+- Test with equivalent IPv6 representations (=::1= vs =0:0:0:0:0:0:0:1=)
+
+** Buffered event re-creation test
+
+- Emit negative events for an IP (fill the event buffer)
+- Call =RemoveIP= before events are processed
+- Process the buffered events
+- Verify the IP reappears with a clean slate (neutral reputation), not
+  with the pre-removal negative score
+
+** Unit test for =unblockIPHandler=
+
+- POST with valid tracked IP returns 200 + =removed: true=
+- POST with valid untracked IP returns 200 + =removed: false=
+- POST with invalid IP returns 400
+- POST with malformed JSON body returns 400 ("malformed request body")
+- POST with query param IP (=?ip=1.2.3.4=) works, takes precedence over body
+- GET returns 405
+- POST when =ipUnblocker= is nil returns 501
+
+** Integration test for IPv6 normalization
+
+- Connect with expanded IPv6 address
+- Verify stats map key uses canonical form
+- Unblock using compressed form, verify removal succeeds
+
+** Fernrohr: =MizuClient.UnblockIP= test
+
+- Mock HTTP server returning 200 + ={"removed": true}=, verify client
+  returns =(true, nil)=
+- Mock returning 200 + ={"removed": false}=, verify =(false, nil)=
+- Mock returning 500, verify error
+
+* Design notes
+
+** Input precedence
+
+The =/api/unblock-ip= handler accepts IP from both query parameter and
+JSON body. Query parameter takes precedence — if =?ip=1.2.3.4= is set,
+the body is not read. This matches the pattern in =renewCertHandler=.
+
+** =NormalizeIP= returns =(string, bool)=
+
+Unlike a pass-through helper that returns the input unchanged on
+failure, =NormalizeIP= returns =("", false)= for invalid IPs. This
+ensures callers cannot accidentally use un-normalized garbage as a map
+key. Both ingress (=server.go=) and =RemoveIP= use the same function,
+keeping normalization behavior consistent.
+
+** Always 200 for valid unblock requests
+
+Returning 404 for "IP not tracked" was considered but rejected:
+- The =httpPost= helper in =mizu-admin= treats non-2xx as fatal errors
+- "Not tracked" is a valid outcome, not an error condition
+- Scripts check the =removed= boolean field instead of HTTP status
+
+** Existing =httpPost= sets Content-Type
+
+The =httpPost= helper in =cmd/mizu-admin/main.go= already sets
+=Content-Type: application/json= (line 1248). No change needed.
+
+** Fernrohr =auth.BasicAuth= accepts =http.Handler=
+
+=auth.BasicAuth(next http.Handler, ...)= takes =http.Handler=.
+=http.HandlerFunc= satisfies =http.Handler=, so passing the result of
+=UnblockHandler()= (which returns =http.HandlerFunc=) works. This is the
+same pattern used for =RDNSHandler()= at line 190 of =main.go=.
+
+** =ActiveCluster= is a real helper
+
+Defined in =handler/cluster.go:40=:
+=func ActiveCluster(clusters []Cluster, r *http.Request) *Cluster=.
+Already used by the existing =BlacklistHandler.ServeHTTP= (line 66).
+
+** =clusterParam= is an existing template function
+
+Registered in =cmd/fernrohr/main.go:80= as a template =FuncMap= entry.
+Takes a string (active cluster name), returns =template.URL= like
+=cluster=name&=. Used throughout all Fernrohr templates (nav, dashboard,
+trace, log, queue, resolve). The blacklist template currently has no
+links needing it, but the new unblock form action URL requires it.
+
+** Wiring order: =SetIPUnblocker= before =Start()=
+
+=setupRoutes= is called inside =Start()= and registers =/api/unblock-ip=
+unconditionally. The handler checks =s.ipUnblocker == nil= at runtime.
+=SetIPUnblocker= must be called before =Start()= — same as
+=SetStatsProvider= (line 755) and =SetCacheFlusher=, both called inside
+=startHealthServer= before =Start()= at line 762.
+
+** IPs in =confirm()= dialog are safe
+
+IP addresses contain only digits, hex chars, dots, and colons — no
+single quotes or HTML-special characters. The =confirm('Unblock {{.IP}}?')=
+template expression is safe without additional escaping.
+
+** No rate limiting beyond basic auth (v1)
+
+The unblock endpoint is protected by HTTP Basic Auth. No per-endpoint
+rate limiting is added for v1. The blast radius is limited: worst case,
+an attacker with valid admin credentials can flush reputation entries,
+which is equivalent to the existing =flush-cache= command. If audit
+requirements grow, add request logging to a structured audit log.
+
+* Files changed (summary)
+
+| File                                            | Change                                 |
+|-------------------------------------------------+----------------------------------------|
+| =mizu/pkg/smtp/server.go=                      | Normalize IP after =SplitHostPort=     |
+| =mizu/pkg/stats/manager.go= (or normalize.go)  | Add =NormalizeIP= + =RemoveIP= method |
+| =mizu/pkg/health/server.go=                    | Add =IPUnblocker= interface, endpoint  |
+| =mizu/cmd/mizu-server/main.go=                 | Wire =SetIPUnblocker=                  |
+| =mizu/cmd/mizu-admin/main.go=                  | Add =unblock-ip= command               |
+| =fernrohr/internal/client/mizu.go=             | Add =UnblockIP= method                 |
+| =fernrohr/internal/handler/blacklist.go=        | Add =UnblockHandler=                   |
+| =fernrohr/cmd/fernrohr/main.go=                | Register =POST /blacklist/unblock=     |
+| =fernrohr/cmd/fernrohr/templates/blacklist.html= | Add unblock button per row           |

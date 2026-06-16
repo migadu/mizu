@@ -21,6 +21,7 @@ type Manager struct {
 	logger          *slog.Logger
 	stopCertSync    chan struct{} // Signal to stop certificate sync worker
 	tlsConfig       *tls.Config   // Cached TLS config with wrapped GetCertificate
+	isLeaderF       func() bool   // Cluster leader check function
 }
 
 // Config holds configuration for TLS manager
@@ -114,20 +115,23 @@ func NewManager(cfg Config, logger *slog.Logger) (*Manager, error) {
 		logger.Info("TLS manager using Let's Encrypt staging environment")
 	}
 
-	// Create TLS config with autocert and logging wrapper
-	// IMPORTANT: We must create this BEFORE the Manager struct so we can store it
-	baseTLSConfig := autocertMgr.TLSConfig()
+	// Force HTTP-01 only by calling HTTPHandler, which sets tryHTTP01=true
+	// on the autocert manager. We do NOT use autocertMgr.TLSConfig() because
+	// that registers TLS-ALPN-01 support, which requires port 443 — Mizu
+	// listens on port 465 (SMTP), so ALPN challenges can't be fulfilled.
+	autocertMgr.HTTPHandler(nil)
 
 	m := &Manager{
 		autocertManager: autocertMgr,
 		logger:          logger,
 		stopCertSync:    make(chan struct{}),
 		tlsConfig:       nil, // Will be set below after wrapping GetCertificate
+		isLeaderF:       cfg.IsLeaderF,
 	}
 
-	// Wrap GetCertificate with enhanced logging and SNI handling
-	originalGetCert := baseTLSConfig.GetCertificate
-	baseTLSConfig.GetCertificate = func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	// Build TLS config manually (not via autocertMgr.TLSConfig which adds ALPN)
+	originalGetCert := autocertMgr.GetCertificate
+	wrappedGetCert := func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 		serverName := hello.ServerName
 
 		// Handle missing SNI by using default domain
@@ -214,8 +218,11 @@ func NewManager(cfg Config, logger *slog.Logger) (*Manager, error) {
 
 	logger.Info("Certificates will be stored using storage backend", "prefix", cfg.StoragePrefix)
 
-	// Store the wrapped TLS config in the manager
-	m.tlsConfig = baseTLSConfig
+	// Store the manually-built TLS config (HTTP-01 only, no ALPN)
+	m.tlsConfig = &tls.Config{
+		GetCertificate: wrappedGetCert,
+		MinVersion:     tls.VersionTLS12,
+	}
 
 	// Start certificate sync worker if configured
 	if cfg.SyncInterval > 0 {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/x509"
 	"encoding/json"
@@ -10,6 +11,7 @@ import (
 	"io"
 	"migadu/mizu/pkg/config"
 	"migadu/mizu/pkg/storage"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -102,6 +104,8 @@ func main() {
 		cmdRenewCert()
 	case "flush-cache":
 		cmdFlushCache()
+	case "unblock-ip":
+		cmdUnblockIP()
 	case "version", "-version", "--version":
 		cmdVersion()
 	default:
@@ -124,8 +128,9 @@ Commands:
   connections        Show connection tracker state used for limiting decisions
   certs              Show TLS certificate status and expiry (from health endpoint)
   tls                Manage TLS certificates (list, delete, clean, sync)
-  renew-cert         Force certificate renewal (requires server support)
+  renew-cert         Force certificate renewal for a domain
   flush-cache        Flush recipient and IP block caches
+  unblock-ip         Remove a specific IP from the reputation tracker
   version            Show version information
 
 Flags:
@@ -148,6 +153,7 @@ Examples:
   mizu-admin tls delete example.com
   mizu-admin tls clean
   mizu-admin tls sync
+  mizu-admin renew-cert relay.example.com
   mizu-admin flush-cache
 
 `)
@@ -668,15 +674,31 @@ func cmdCerts() {
 }
 
 func cmdRenewCert() {
-	fmt.Println("Forcing certificate renewal...")
-	fmt.Println("Note: This requires server-side support for /api/renew-cert endpoint")
-	fmt.Println()
+	// Support both: renew-cert relay.example.com
+	//           and: renew-cert --domain relay.example.com
+	fs := flag.NewFlagSet("renew-cert", flag.ExitOnError)
+	domainFlag := fs.String("domain", "", "domain to renew")
+	fs.Parse(flag.Args()[1:])
 
-	resp, err := httpPost("/api/renew-cert", nil)
+	domain := *domainFlag
+	if domain == "" && fs.NArg() > 0 {
+		domain = fs.Arg(0)
+	}
+	if domain == "" {
+		fmt.Fprintf(os.Stderr, "Usage: mizu-admin renew-cert <domain>\n")
+		fmt.Fprintf(os.Stderr, "\nExample: mizu-admin renew-cert relay.example.com\n")
+		os.Exit(1)
+	}
+
+	fmt.Printf("Forcing certificate renewal for %s...\n", domain)
+
+	bodyJSON, _ := json.Marshal(map[string]string{"domain": domain})
+	body := strings.NewReader(string(bodyJSON))
+	resp, err := httpPost("/api/renew-cert", body)
 	if err != nil {
 		if strings.Contains(err.Error(), "404") {
-			fmt.Println("✗ Certificate renewal endpoint not implemented on server")
-			fmt.Println("  This feature requires server-side support")
+			fmt.Println("✗ Certificate renewal endpoint not available")
+			fmt.Println("  Ensure mizu-server is running with TLS (letsencrypt) enabled")
 			os.Exit(1)
 		}
 		fatal("Failed to renew certificate: %v", err)
@@ -688,10 +710,12 @@ func cmdRenewCert() {
 	}
 
 	if status, ok := result["status"].(string); ok && status == "success" {
-		fmt.Println("✓ Certificate renewal initiated successfully")
+		fmt.Println("✓ Certificate cache cleared successfully")
 		if msg, ok := result["message"].(string); ok {
 			fmt.Printf("  %s\n", msg)
 		}
+		fmt.Println("  The next TLS connection will trigger a fresh ACME certificate request.")
+		fmt.Printf("  Trigger with: openssl s_client -connect %s:465 -servername %s </dev/null\n", domain, domain)
 	} else {
 		fmt.Println("✗ Certificate renewal failed")
 		if msg, ok := result["error"].(string); ok {
@@ -732,6 +756,36 @@ func cmdFlushCache() {
 		if msg, ok := result["error"].(string); ok {
 			fmt.Printf("  Error: %s\n", msg)
 		}
+	}
+}
+
+func cmdUnblockIP() {
+	if flag.NArg() < 2 {
+		fmt.Fprintf(os.Stderr, "Usage: mizu-admin unblock-ip <ip-address>\n")
+		os.Exit(1)
+	}
+	ip := flag.Arg(1)
+	if net.ParseIP(ip) == nil {
+		fatal("Invalid IP address: %s", ip)
+	}
+
+	bodyJSON, _ := json.Marshal(map[string]string{"ip": ip})
+	resp, err := httpPost("/api/unblock-ip", bytes.NewReader(bodyJSON))
+	if err != nil {
+		fatal("Failed to unblock IP: %v", err)
+	}
+
+	var result map[string]any
+	if err := json.Unmarshal(resp, &result); err != nil {
+		fatal("Failed to parse response: %v", err)
+	}
+
+	removed, _ := result["removed"].(bool)
+	msg, _ := result["message"].(string)
+	if removed {
+		fmt.Printf("OK: %s\n", msg)
+	} else {
+		fmt.Printf("Not found: %s\n", msg)
 	}
 }
 

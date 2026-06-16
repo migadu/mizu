@@ -23,6 +23,7 @@ import (
 	"migadu/mizu/pkg/cluster"
 	"migadu/mizu/pkg/concurrency"
 	"migadu/mizu/pkg/config"
+	"migadu/mizu/pkg/dns"
 	"migadu/mizu/pkg/health"
 	"migadu/mizu/pkg/logging"
 	"migadu/mizu/pkg/metrics"
@@ -30,6 +31,7 @@ import (
 	"migadu/mizu/pkg/recipient"
 	"migadu/mizu/pkg/sender"
 	"migadu/mizu/pkg/smtp"
+	"migadu/mizu/pkg/spamcheck"
 	"migadu/mizu/pkg/stats"
 	"migadu/mizu/pkg/storage"
 	tlsmgr "migadu/mizu/pkg/tls"
@@ -137,23 +139,9 @@ func main() {
 		}
 		logger.Info("initTLS completed", "tlsMgr_nil", tlsMgr == nil, "tlsConfig_nil", tlsConfig == nil)
 
-		// Start ACME challenge servers (only for Let's Encrypt)
+		// Start ACME HTTP-01 challenge server (only for Let's Encrypt)
 		if tlsMgr != nil {
-			logger.Info("TLS manager initialized successfully - starting ACME challenge servers")
-			// Start HTTPS server on port 443 for TLS-ALPN-01 challenges (primary method)
-			concurrency.SafeGo(logger, "acme-tls-alpn-server", func() {
-				logger.Info("Starting HTTPS server for ACME TLS-ALPN-01 challenges on :443")
-				server := &http.Server{
-					Addr:      ":443",
-					TLSConfig: tlsMgr.TLSConfig(),
-				}
-				// Empty cert/key files - TLSConfig.GetCertificate handles everything
-				if err := server.ListenAndServeTLS("", ""); err != nil {
-					logger.Error("TLS-ALPN-01 challenge server failed", "error", err)
-				}
-			})
-
-			// Start HTTP server on port 80 for HTTP-01 challenges (fallback)
+			logger.Info("TLS manager initialized successfully - starting ACME challenge server")
 			concurrency.SafeGo(logger, "acme-http-server", func() {
 				logger.Info("Starting HTTP server for ACME HTTP-01 challenges on :80")
 				if err := http.ListenAndServe(":80", tlsMgr.HTTPHandler()); err != nil {
@@ -201,9 +189,10 @@ func main() {
 	// Start separate metrics server
 	metricsServer := startMetricsServer(cfg, logger)
 
-	// Set ACME handler on health server if autocert is enabled
+	// Set ACME handler and cert renewer on health server if autocert is enabled
 	if healthServer != nil && tlsMgr != nil {
 		healthServer.SetACMEHandler(tlsMgr.HTTPHandler())
+		healthServer.SetCertRenewer(tlsMgr)
 	}
 
 	// Start stats manager and sync/export loops
@@ -277,6 +266,7 @@ func main() {
 			cfg,
 			serverRecorder,
 			dnsResolver,
+			dnsCache,
 			metricsInstance,
 			senderValidator,
 			recipientValidator,
@@ -766,6 +756,9 @@ func startHealthServer(cfg *config.Config, logger *slog.Logger, statsManager *st
 	// Set stats provider
 	healthServer.SetStatsProvider(statsManager)
 
+	// Set IP unblocker for /api/unblock-ip endpoint
+	healthServer.SetIPUnblocker(statsManager)
+
 	// Set cache flusher (if distributed tracker exists)
 	if distTracker != nil {
 		healthServer.SetCacheFlusher(distTracker)
@@ -876,6 +869,7 @@ func createServerBackend(
 	globalCfg *config.Config,
 	statsRecorder *stats.ServerRecorder,
 	dnsResolver *net.Resolver,
+	dnsCache *dns.CachingWrapper,
 	metricsInstance *metrics.Metrics,
 	senderValidator smtp.SenderValidator,
 	recipientValidator smtp.RecipientValidator,
@@ -1054,6 +1048,41 @@ func createServerBackend(
 		"max_idle_conns_per_host", serverCfg.Delivery.MaxIdleConnsPerHost,
 		"max_conns_per_host", serverCfg.Delivery.MaxConnsPerHost)
 
+	// Initialize spam checker if configured
+	var spamChecker smtp.SpamChecker
+	if serverCfg.SpamCheck.Enabled {
+		if serverCfg.SpamCheck.URL == "" {
+			serverLogger.Error("Spam check enabled but no URL configured")
+			os.Exit(1)
+		}
+
+		timeout := 5 * time.Second
+		if serverCfg.SpamCheck.HTTPTimeoutSeconds > 0 {
+			timeout = time.Duration(serverCfg.SpamCheck.HTTPTimeoutSeconds) * time.Second
+		}
+
+		client := spamcheck.NewClient(serverCfg.SpamCheck.URL, serverCfg.SpamCheck.Password, timeout, serverLogger)
+		adapter := spamcheck.NewAdapter(
+			client,
+			serverCfg.SpamCheck.SpamHeader,
+			serverCfg.SpamCheck.SpamHeaderValue,
+			serverCfg.SpamCheck.HamHeaderValue,
+			serverCfg.SpamCheck.RejectOnAction,
+		)
+		spamChecker = adapter
+
+		// Start periodic health check for rspamd
+		if metricsInstance != nil {
+			logging.SafeGo(serverLogger, "spam-check-health", func() {
+				client.StartHealthCheck(context.Background(), metricsInstance.SpamCheckUp, 30*time.Second)
+			})
+		}
+
+		serverLogger.Info("Spam checker enabled",
+			"url", serverCfg.SpamCheck.URL,
+			"reject_on_action", serverCfg.SpamCheck.RejectOnAction)
+	}
+
 	// Create Backend
 	var activeSessionsWg sync.WaitGroup
 	var activeSessionCount atomic.Int64
@@ -1066,6 +1095,7 @@ func createServerBackend(
 		CircuitBreaker:     serverCircuitBreaker,
 		HTTPClient:         serverHTTPClient,
 		DNSResolver:        dnsResolver,
+		DNSCache:           dnsCache,
 		Metrics:            metricsInstance,
 		Logger:             serverLogger,
 		ActiveSessionsWg:   &activeSessionsWg,
@@ -1078,6 +1108,7 @@ func createServerBackend(
 		AuthRateLimiter:    authRateLimiter,
 		SenderValidator:    senderValidator,
 		RecipientValidator: recipientValidator,
+		SpamChecker:        spamChecker,
 	}
 }
 
@@ -1243,6 +1274,7 @@ func runSMTPServerInstance(ctx context.Context, serverCfg *config.ServerConfig, 
 	server.WriteTimeout = time.Duration(serverCfg.TimeoutSeconds) * time.Second
 	server.MaxMessageBytes = int64(serverCfg.MaxMessageSize)
 	server.EnableSMTPUTF8 = true
+	server.MaxRecipients = serverCfg.MaxRecipientsPerMessage
 
 	// Enable debug logging if configured
 	if serverCfg.Debug {

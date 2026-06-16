@@ -327,6 +327,139 @@ func TestAdapter_Check_RejectOnAction(t *testing.T) {
 	}
 }
 
+func TestRspamdHeader_UnmarshalJSON(t *testing.T) {
+	tests := []struct {
+		name     string
+		json     string
+		expected rspamdHeader
+	}{
+		{
+			name:     "object format",
+			json:     `{"value": "Yes", "order": 1}`,
+			expected: rspamdHeader{Value: "Yes", Order: 1},
+		},
+		{
+			name:     "string format",
+			json:     `"Yes"`,
+			expected: rspamdHeader{Value: "Yes", Order: 0},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var h rspamdHeader
+			if err := json.Unmarshal([]byte(tt.json), &h); err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+			if h.Value != tt.expected.Value {
+				t.Errorf("Value = %q, want %q", h.Value, tt.expected.Value)
+			}
+			if h.Order != tt.expected.Order {
+				t.Errorf("Order = %d, want %d", h.Order, tt.expected.Order)
+			}
+		})
+	}
+}
+
+func TestClient_Check_StringHeaders(t *testing.T) {
+	// Mock rspamd server returning add_headers as plain strings (not objects)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{
+			"action": "add header",
+			"score": 8.0,
+			"required_score": 5.0,
+			"symbols": {},
+			"milter": {
+				"add_headers": {
+					"X-Spam": "Yes",
+					"X-Spam-Score": "8.0"
+				}
+			}
+		}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "", 5*time.Second, slog.Default())
+	result, err := client.Check(
+		context.Background(),
+		"Subject: Test\r\n\r\nBody",
+		"1.2.3.4",
+		"sender@example.com",
+		[]string{"recipient@example.com"},
+		"mail.example.com",
+	)
+
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+
+	if result.AddHeaders["X-Spam"] != "Yes" {
+		t.Errorf("Expected X-Spam header 'Yes', got %q", result.AddHeaders["X-Spam"])
+	}
+	if result.AddHeaders["X-Spam-Score"] != "8.0" {
+		t.Errorf("Expected X-Spam-Score header '8.0', got %q", result.AddHeaders["X-Spam-Score"])
+	}
+}
+
+func TestClient_Check_StatisticsError504(t *testing.T) {
+	// Rspamd returns 504 when autolearn/statistics fails. The scan result is
+	// lost, but we should fail open (no error, empty result).
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusGatewayTimeout)
+		w.Write([]byte(`{"error":"all learn conditions denied learning ham in default classifier","error_domain":"rspamd-statistics"}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "", 5*time.Second, slog.Default())
+	result, err := client.Check(
+		context.Background(),
+		"Subject: Test\r\n\r\nBody",
+		"1.2.3.4",
+		"sender@example.com",
+		[]string{"recipient@example.com"},
+		"mail.example.com",
+	)
+
+	if err != nil {
+		t.Fatalf("Expected no error for statistics 504, got: %v", err)
+	}
+	if result.IsSpam {
+		t.Error("Expected IsSpam=false for statistics error fallback")
+	}
+	if result.Action != "" {
+		t.Errorf("Expected empty action, got %q", result.Action)
+	}
+}
+
+func TestClient_Check_Non_Statistics504(t *testing.T) {
+	// A 504 without error_domain "rspamd-statistics" should still be an error.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusGatewayTimeout)
+		w.Write([]byte(`{"error":"backend timeout","error_domain":"rspamd-proxy"}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "", 5*time.Second, slog.Default())
+	_, err := client.Check(
+		context.Background(),
+		"Subject: Test\r\n\r\nBody",
+		"1.2.3.4",
+		"sender@example.com",
+		[]string{"recipient@example.com"},
+		"mail.example.com",
+	)
+
+	if err == nil {
+		t.Fatal("Expected error for non-statistics 504, got nil")
+	}
+	if !strings.Contains(err.Error(), "504") {
+		t.Errorf("Expected error to mention status 504, got: %v", err)
+	}
+}
+
 // isHex checks if a string is valid hexadecimal
 func isHex(s string) bool {
 	s = strings.ToLower(s)

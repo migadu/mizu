@@ -592,6 +592,59 @@ func TestManagerCleanup(t *testing.T) {
 	manager.ipMu.RUnlock()
 }
 
+func TestRemoveIP(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	m := NewManager(true, time.Hour, "test", false, 0, nil, 1000, 100, 1000, logger)
+	m.Start()
+	defer m.Stop()
+
+	// Insert an IP directly
+	entry := m.getOrCreateIP("1.2.3.4")
+	entry.AddNegative(100)
+
+	// RemoveIP should find and remove it
+	if !m.RemoveIP("1.2.3.4") {
+		t.Error("RemoveIP returned false for existing IP")
+	}
+
+	// Second call should return false
+	if m.RemoveIP("1.2.3.4") {
+		t.Error("RemoveIP returned true for already-removed IP")
+	}
+
+	// Reputation should be neutral after removal
+	denied, rep := m.CheckIPReputation("1.2.3.4")
+	if denied {
+		t.Error("IP should not be denied after removal")
+	}
+	if rep != 0 {
+		t.Errorf("reputation should be 0 after removal, got %f", rep)
+	}
+}
+
+func TestRemoveIP_IPv6Normalization(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	m := NewManager(true, time.Hour, "test", false, 0, nil, 1000, 100, 1000, logger)
+
+	// Insert with compressed form
+	m.getOrCreateIP("2001:db8::1")
+
+	// Remove with expanded representation — should still work because
+	// NormalizeIP canonicalizes both forms to the same string
+	if !m.RemoveIP("2001:0db8:0000:0000:0000:0000:0000:0001") {
+		t.Error("RemoveIP should find IPv6 address regardless of representation")
+	}
+}
+
+func TestRemoveIP_InvalidIP(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	m := NewManager(true, time.Hour, "test", false, 0, nil, 1000, 100, 1000, logger)
+
+	if m.RemoveIP("not-an-ip") {
+		t.Error("RemoveIP should return false for invalid IP")
+	}
+}
+
 // waitFor polls a condition until it's true or a timeout is reached.
 func waitFor(timeout time.Duration, condition func() bool) error {
 	deadline := time.Now().Add(timeout)

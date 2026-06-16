@@ -851,6 +851,26 @@ func ExtractDomainFromEmail(email string) string {
 	return ""
 }
 
+// RemoveIP removes an IP entry from the reputation tracker, effectively unblocking it.
+// Returns true if the IP was found and removed, false if it was not tracked.
+// Note: buffered events already in the channel may recreate the entry with a clean
+// slate shortly after removal. This is harmless as the new entry starts with neutral
+// reputation.
+func (m *Manager) RemoveIP(ip string) bool {
+	key, ok := NormalizeIP(ip)
+	if !ok {
+		return false
+	}
+
+	m.ipMu.Lock()
+	defer m.ipMu.Unlock()
+	_, exists := m.ips[key]
+	if exists {
+		delete(m.ips, key)
+	}
+	return exists
+}
+
 // GetIPForTest is a helper function for integration tests to access an IP entry.
 // This should only be used in tests.
 func (m *Manager) GetIPForTest(ip string) *IPEntry {

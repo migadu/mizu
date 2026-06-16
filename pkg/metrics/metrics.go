@@ -68,6 +68,9 @@ type Metrics struct {
 	AuthRateLimitEvictions        *prometheus.CounterVec   // Labels: type (ip, ip_username, username, blocked_ips)
 	AuthRateLimitCacheSize        *prometheus.GaugeVec     // Labels: type
 
+	// Spam check metrics
+	SpamCheckUp prometheus.Gauge // 1 = rspamd reachable, 0 = unreachable
+
 	// DNS cache metrics
 	DNSCacheHits      *prometheus.CounterVec // Labels: record_type
 	DNSCacheMisses    *prometheus.CounterVec // Labels: record_type
@@ -354,6 +357,14 @@ func New(namespace string) *Metrics {
 			Name:      "cache_size",
 			Help:      "Current size of auth rate limit caches",
 		}, []string{"type"}),
+
+		// Spam check metrics
+		SpamCheckUp: promauto.NewGauge(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Subsystem: "spam_check",
+			Name:      "up",
+			Help:      "Whether the spam check server (rspamd) is reachable (1 = up, 0 = down)",
+		}),
 
 		// DNS cache metrics
 		DNSCacheHits: promauto.NewCounterVec(prometheus.CounterOpts{

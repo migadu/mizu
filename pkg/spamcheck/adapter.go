@@ -3,24 +3,17 @@ package spamcheck
 import (
 	"context"
 	"strings"
+
+	"migadu/mizu/pkg/smtp"
 )
 
-// Adapter wraps rspamd Client to implement the SMTP SpamChecker interface
+// Adapter wraps rspamd Client to implement the smtp.SpamChecker interface
 type Adapter struct {
 	client          *Client
 	spamHeader      string // Header name to add when spam detected (e.g., "X-Junk")
 	spamHeaderValue string // Header value for spam (e.g., "yes")
 	hamHeaderValue  string // Header value for ham (empty = don't add for ham)
 	rejectOnAction  string // Reject if rspamd action matches this (e.g., "reject")
-}
-
-// SpamCheckResult represents the spam check result for SMTP session
-type SpamCheckResult struct {
-	IsSpam       bool              // True if message should be treated as spam
-	Action       string            // Rspamd action (e.g., "add header", "reject")
-	Score        float64           // Spam score
-	AddHeaders   map[string]string // Headers to add (from rspamd milter OR configured spam header)
-	ShouldReject bool              // True if message should be rejected based on action
 }
 
 // NewAdapter creates a new spam checker adapter
@@ -43,15 +36,15 @@ func NewAdapter(client *Client, spamHeader, spamHeaderValue, hamHeaderValue, rej
 }
 
 // Check performs spam checking and returns result
-func (a *Adapter) Check(ctx context.Context, message, clientIP, from string, rcpt []string, helo string) (SpamCheckResult, error) {
+func (a *Adapter) Check(ctx context.Context, message, clientIP, from string, rcpt []string, helo string) (smtp.SpamCheckResult, error) {
 	// Call rspamd
 	result, err := a.client.Check(ctx, message, clientIP, from, rcpt, helo)
 	if err != nil {
-		return SpamCheckResult{}, err
+		return smtp.SpamCheckResult{}, err
 	}
 
 	// Build adapter result
-	adapterResult := SpamCheckResult{
+	adapterResult := smtp.SpamCheckResult{
 		IsSpam:     result.IsSpam,
 		Action:     result.Action,
 		Score:      result.Score,

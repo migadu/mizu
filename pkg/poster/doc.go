@@ -73,7 +73,7 @@
 //	Authorization: Bearer secret-key
 //	X-Trace-ID: unique-trace-id
 //	X-Mail-From: sender@example.com
-//	X-Mail-To: recipient1@example.com, recipient2@example.com
+//	X-Mail-To: recipient@example.com
 //	X-Junk: yes  # Only present if spam detected
 //
 //	[Raw RFC 822 email content]
@@ -125,7 +125,7 @@
 //	    3,  // max retry attempts
 //	    false,  // is_junk
 //	    "sender@example.com",
-//	    []string{"recipient@example.com"},
+//	    "recipient@example.com",
 //	    "trace-id-123",
 //	    circuitBreaker,
 //	    httpClient,

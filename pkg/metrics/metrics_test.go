@@ -70,8 +70,8 @@ func TestMetrics_HTTPMetrics(t *testing.T) {
 	m := New("test_http")
 
 	// Test counter vec
-	m.HTTPRequestsTotal.WithLabelValues("200").Inc()
-	m.HTTPRequestsTotal.WithLabelValues("500").Inc()
+	m.HTTPRequestsTotal.WithLabelValues("2xx").Inc()
+	m.HTTPRequestsTotal.WithLabelValues("5xx").Inc()
 
 	// Test histograms
 	m.HTTPRequestDuration.Observe(0.5)

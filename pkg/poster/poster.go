@@ -11,7 +11,26 @@ import (
 	"time"
 
 	"log/slog"
+
+	"migadu/mizu/pkg/metrics"
 )
+
+// statusCodeBucket maps an HTTP status code to a bucket label (e.g. "2xx", "4xx", "5xx")
+// to avoid unbounded label cardinality in Prometheus metrics.
+func statusCodeBucket(code int) string {
+	switch {
+	case code >= 200 && code < 300:
+		return "2xx"
+	case code >= 300 && code < 400:
+		return "3xx"
+	case code >= 400 && code < 500:
+		return "4xx"
+	case code >= 500 && code < 600:
+		return "5xx"
+	default:
+		return "other"
+	}
+}
 
 // NewHTTPClient creates a new HTTP client with the specified timeout and connection pool settings.
 // The timeout controls the maximum time for the entire request/response cycle.
@@ -49,12 +68,12 @@ func NewHTTPClient(timeout time.Duration, maxIdleConnsPerHost, maxConnsPerHost i
 // The authenticatedUser parameter is added as X-Auth-User header when the message was sent via authenticated submission.
 // The circuitBreaker parameter is optional - if provided, each retry attempt will be protected by the circuit breaker.
 // The httpClient parameter specifies the HTTP client to use for requests (with configured timeout).
-func PostEmailToDestinationWithContext(ctx context.Context, rawEmail string, destinationURL, apiKey string, maxRetryAttempts int, isJunk bool, mailFrom string, mailTo []string, traceID string, authenticatedUser string, circuitBreaker *CircuitBreaker, httpClient *http.Client, logger *slog.Logger) error {
-	return postEmailWithRetries(ctx, rawEmail, destinationURL, apiKey, maxRetryAttempts, isJunk, mailFrom, mailTo, traceID, authenticatedUser, circuitBreaker, httpClient, logger)
+func PostEmailToDestinationWithContext(ctx context.Context, rawEmail string, destinationURL, apiKey string, maxRetryAttempts int, isJunk bool, mailFrom string, mailTo string, traceID string, authenticatedUser string, circuitBreaker *CircuitBreaker, httpClient *http.Client, logger *slog.Logger, m *metrics.Metrics) error {
+	return postEmailWithRetries(ctx, rawEmail, destinationURL, apiKey, maxRetryAttempts, isJunk, mailFrom, mailTo, traceID, authenticatedUser, circuitBreaker, httpClient, logger, m)
 }
 
 // postEmailWithRetries contains the actual retry logic with circuit breaker protection per attempt
-func postEmailWithRetries(ctx context.Context, rawEmail string, destinationURL, apiKey string, maxRetryAttempts int, isJunk bool, mailFrom string, mailTo []string, traceID string, authenticatedUser string, circuitBreaker *CircuitBreaker, httpClient *http.Client, logger *slog.Logger) error {
+func postEmailWithRetries(ctx context.Context, rawEmail string, destinationURL, apiKey string, maxRetryAttempts int, isJunk bool, mailFrom string, mailTo string, traceID string, authenticatedUser string, circuitBreaker *CircuitBreaker, httpClient *http.Client, logger *slog.Logger, m *metrics.Metrics) error {
 	var lastErr error
 
 	// Ensure at least one attempt even if configured incorrectly
@@ -91,11 +110,11 @@ func postEmailWithRetries(ctx context.Context, rawEmail string, destinationURL, 
 		if circuitBreaker != nil {
 			// Circuit breaker protects each individual attempt
 			err = circuitBreaker.Call(func() error {
-				return postEmailAttemptWithContext(ctx, rawEmail, destinationURL, apiKey, isJunk, mailFrom, mailTo, traceID, authenticatedUser, httpClient, logger)
+				return postEmailAttemptWithContext(ctx, rawEmail, destinationURL, apiKey, isJunk, mailFrom, mailTo, traceID, authenticatedUser, httpClient, logger, m)
 			})
 		} else {
 			// No circuit breaker - call directly
-			err = postEmailAttemptWithContext(ctx, rawEmail, destinationURL, apiKey, isJunk, mailFrom, mailTo, traceID, authenticatedUser, httpClient, logger)
+			err = postEmailAttemptWithContext(ctx, rawEmail, destinationURL, apiKey, isJunk, mailFrom, mailTo, traceID, authenticatedUser, httpClient, logger, m)
 		}
 
 		if err == nil {
@@ -124,7 +143,7 @@ func postEmailWithRetries(ctx context.Context, rawEmail string, destinationURL, 
 
 // postEmailAttemptWithContext performs a single attempt to post the email with context support.
 // It sends the raw email as message/rfc822 content type with API key authentication.
-func postEmailAttemptWithContext(ctx context.Context, rawEmail string, destinationURL, apiKey string, isJunk bool, mailFrom string, mailTo []string, traceID string, authenticatedUser string, httpClient *http.Client, logger *slog.Logger) error {
+func postEmailAttemptWithContext(ctx context.Context, rawEmail string, destinationURL, apiKey string, isJunk bool, mailFrom string, mailTo string, traceID string, authenticatedUser string, httpClient *http.Client, logger *slog.Logger, m *metrics.Metrics) error {
 	if httpClient == nil {
 		return fmt.Errorf("httpClient cannot be nil")
 	}
@@ -146,8 +165,8 @@ func postEmailAttemptWithContext(ctx context.Context, rawEmail string, destinati
 	if mailFrom != "" {
 		req.Header.Set("X-Mail-From", mailFrom)
 	}
-	if len(mailTo) > 0 {
-		req.Header.Set("X-Mail-To", strings.Join(mailTo, ", "))
+	if mailTo != "" {
+		req.Header.Set("X-Mail-To", mailTo)
 	}
 
 	// Add trace ID for distributed tracing and log correlation
@@ -165,14 +184,31 @@ func postEmailAttemptWithContext(ctx context.Context, rawEmail string, destinati
 		req.Header.Set("X-Junk", "yes")
 	}
 
+	start := time.Now()
 	resp, err := httpClient.Do(req)
+	duration := time.Since(start).Seconds()
 	if err != nil {
+		if m != nil {
+			m.HTTPRequestsTotal.WithLabelValues("error").Inc()
+			m.HTTPRequestDuration.Observe(duration)
+			m.HTTPRequestSize.Observe(float64(len(rawEmail)))
+		}
 		return fmt.Errorf("failed to send HTTP request to URL: %w", err)
 	}
 	defer resp.Body.Close()
 
+	statusBucket := statusCodeBucket(resp.StatusCode)
+	if m != nil {
+		m.HTTPRequestsTotal.WithLabelValues(statusBucket).Inc()
+		m.HTTPRequestDuration.Observe(duration)
+		m.HTTPRequestSize.Observe(float64(len(rawEmail)))
+	}
+
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
 		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		if m != nil {
+			m.HTTPResponseSize.Observe(float64(len(bodyBytes)))
+		}
 		return NewHTTPStatusError(resp.StatusCode, string(bodyBytes))
 	}
 

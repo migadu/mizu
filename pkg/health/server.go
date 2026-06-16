@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"migadu/mizu/pkg/concurrency"
+	"net"
 	"net/http"
 	"time"
 
@@ -46,6 +47,16 @@ type CacheFlusher interface {
 	FlushCache() map[string]int
 }
 
+// CertRenewer defines an interface for components that can renew TLS certificates
+type CertRenewer interface {
+	RenewCertificate(domain string) ([]string, error)
+}
+
+// IPUnblocker defines an interface for components that can remove IPs from reputation tracking
+type IPUnblocker interface {
+	RemoveIP(ip string) bool
+}
+
 // Server represents the health check HTTP server.
 type Server struct {
 	listenAddr      string
@@ -53,6 +64,8 @@ type Server struct {
 	checkers        []Checker
 	statsProvider   StatsProvider
 	cacheFlusher    CacheFlusher
+	certRenewer     CertRenewer
+	ipUnblocker     IPUnblocker
 	httpServer      *http.Server
 	mux             *http.ServeMux
 	healthEnabled   bool   // Enable health endpoints (/health, /api/stats, /api/flush-cache)
@@ -86,6 +99,16 @@ func (s *Server) SetStatsProvider(provider StatsProvider) {
 // SetCacheFlusher registers a cache flusher for the /api/flush-cache endpoint
 func (s *Server) SetCacheFlusher(flusher CacheFlusher) {
 	s.cacheFlusher = flusher
+}
+
+// SetCertRenewer registers a certificate renewer for the /api/renew-cert endpoint
+func (s *Server) SetCertRenewer(renewer CertRenewer) {
+	s.certRenewer = renewer
+}
+
+// SetIPUnblocker registers an IP unblocker for the /api/unblock-ip endpoint
+func (s *Server) SetIPUnblocker(unblocker IPUnblocker) {
+	s.ipUnblocker = unblocker
 }
 
 // SetACMEHandler registers an HTTP handler for the ACME challenge
@@ -241,6 +264,8 @@ func (s *Server) Start() {
 		s.mux.HandleFunc("/health", s.basicAuthMiddleware(s.healthHandler))
 		s.mux.HandleFunc("/api/stats", s.basicAuthMiddleware(s.statsHandler))
 		s.mux.HandleFunc("/api/flush-cache", s.basicAuthMiddleware(s.flushCacheHandler))
+		s.mux.HandleFunc("/api/renew-cert", s.basicAuthMiddleware(s.renewCertHandler))
+		s.mux.HandleFunc("/api/unblock-ip", s.basicAuthMiddleware(s.unblockIPHandler))
 		s.logger.Info("Health endpoints registered", "auth_enabled", s.username != "")
 	}
 
@@ -614,6 +639,132 @@ func (s *Server) flushCacheHandler(w http.ResponseWriter, r *http.Request) {
 		"status":  "success",
 		"message": "Caches flushed successfully",
 		"flushed": flushed,
+	})
+}
+
+// renewCertHandler handles /api/renew-cert requests
+func (s *Server) renewCertHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if s.certRenewer == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotImplemented)
+		json.NewEncoder(w).Encode(map[string]any{
+			"status": "error",
+			"error":  "Certificate renewal not configured (TLS manager not available)",
+		})
+		return
+	}
+
+	domain := r.URL.Query().Get("domain")
+	if domain == "" {
+		// Try reading from JSON body
+		var body struct {
+			Domain string `json:"domain"`
+		}
+		if r.Body != nil {
+			json.NewDecoder(io.LimitReader(r.Body, 1024)).Decode(&body)
+			domain = body.Domain
+		}
+	}
+	if domain == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]any{
+			"status": "error",
+			"error":  "domain parameter is required",
+		})
+		return
+	}
+
+	s.logger.Info("Certificate renewal requested", "domain", domain)
+	renewed, err := s.certRenewer.RenewCertificate(domain)
+	if err != nil {
+		s.logger.Error("Certificate renewal failed", "domain", domain, "error", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]any{
+			"status": "error",
+			"error":  err.Error(),
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]any{
+		"status":  "success",
+		"message": fmt.Sprintf("Certificate cache cleared for %s — next TLS handshake will trigger fresh ACME request", domain),
+		"renewed": renewed,
+	})
+}
+
+// unblockIPHandler handles /api/unblock-ip requests
+func (s *Server) unblockIPHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.ipUnblocker == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotImplemented)
+		json.NewEncoder(w).Encode(map[string]any{
+			"status": "error",
+			"error":  "IP unblocking not configured",
+		})
+		return
+	}
+
+	// Parse IP from query param (precedence) or JSON body
+	ip := r.URL.Query().Get("ip")
+	if ip == "" {
+		var body struct {
+			IP string `json:"ip"`
+		}
+		if r.Body != nil {
+			if err := json.NewDecoder(io.LimitReader(r.Body, 1024)).Decode(&body); err != nil && err != io.EOF {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]any{
+					"status": "error",
+					"error":  "malformed request body",
+				})
+				return
+			}
+			ip = body.IP
+		}
+	}
+	if ip == "" || net.ParseIP(ip) == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]any{
+			"status": "error",
+			"error":  "valid ip parameter is required",
+		})
+		return
+	}
+
+	removed := s.ipUnblocker.RemoveIP(ip)
+
+	// Log the admin action
+	s.logger.Info("IP unblock requested",
+		"ip", ip,
+		"removed", removed,
+		"remote_addr", r.RemoteAddr,
+	)
+
+	w.Header().Set("Content-Type", "application/json")
+	msg := fmt.Sprintf("IP %s removed from reputation tracker", ip)
+	if !removed {
+		msg = fmt.Sprintf("IP %s was not tracked", ip)
+	}
+	json.NewEncoder(w).Encode(map[string]any{
+		"status":  "success",
+		"removed": removed,
+		"message": msg,
 	})
 }
 
