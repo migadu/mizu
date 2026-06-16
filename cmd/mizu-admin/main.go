@@ -1144,10 +1144,10 @@ func handleTLSCache(ctx context.Context) {
 		fatal("Failed to load config: %v", err)
 	}
 
-	// Check if fallback cache is configured
-	if cfg.TLS.LetsEncrypt.FallbackCacheDir == "" {
-		fmt.Println("Fallback cache directory not configured in config.toml")
-		fmt.Println("Set tls.letsencrypt.fallback_cache_dir to enable local certificate caching")
+	// Check if local cache is configured
+	if cfg.TLS.LetsEncrypt.CacheDir == "" {
+		fmt.Println("Local cache directory not configured in config.toml")
+		fmt.Println("Set tls.letsencrypt.cache_dir to enable local certificate caching")
 		os.Exit(1)
 	}
 
@@ -1157,11 +1157,11 @@ func handleTLSCache(ctx context.Context) {
 		fatal("Failed to initialize storage backend: %v", err)
 	}
 
-	fmt.Printf("Syncing certificates from storage to local cache: %s\n", cfg.TLS.LetsEncrypt.FallbackCacheDir)
+	fmt.Printf("Syncing certificates from storage to local cache: %s\n", cfg.TLS.LetsEncrypt.CacheDir)
 	fmt.Println()
 
 	// Ensure cache directory exists
-	if err := os.MkdirAll(cfg.TLS.LetsEncrypt.FallbackCacheDir, 0700); err != nil {
+	if err := os.MkdirAll(cfg.TLS.LetsEncrypt.CacheDir, 0700); err != nil {
 		fatal("Failed to create cache directory: %v", err)
 	}
 
@@ -1180,7 +1180,7 @@ func handleTLSCache(ctx context.Context) {
 		// Extract filename from key
 		parts := strings.Split(obj.Key, "/")
 		filename := parts[len(parts)-1]
-		localPath := filepath.Join(cfg.TLS.LetsEncrypt.FallbackCacheDir, filename)
+		localPath := filepath.Join(cfg.TLS.LetsEncrypt.CacheDir, filename)
 
 		// Check if local file exists and is newer
 		if stat, err := os.Stat(localPath); err == nil {

@@ -131,8 +131,16 @@ func main() {
 	if cfg.Local {
 		logger.Info("Running in LOCAL mode - TLS disabled, messages will be dumped to terminal")
 	} else {
+		// Storage backend (S3 client used by stats sync, health checks, distributed
+		// connection tracking). Initialized independently of TLS now.
+		_, s3Client, err = initStorageBackend(cfg, logger)
+		if err != nil {
+			logger.Error(fmt.Sprintf("Failed to initialize storage backend: %v", err))
+			os.Exit(1)
+		}
+
 		logger.Info("Initializing TLS subsystem", "enabled", cfg.TLS.Enabled, "provider", cfg.TLS.Provider)
-		tlsConfig, s3Client, tlsMgr, fileCertProvider, err = initTLS(cfg, clusterMgr, logger)
+		tlsConfig, tlsMgr, fileCertProvider, err = initTLS(ctx, cfg, clusterMgr, logger)
 		if err != nil {
 			logger.Error(fmt.Sprintf("Failed to initialize TLS: %v", err))
 			os.Exit(1)
@@ -522,123 +530,87 @@ func initStorageBackend(cfg *config.Config, logger *slog.Logger) (storage.Backen
 	return backend, s3Client, nil
 }
 
-// initTLS sets up the storage backend and TLS certificate management using autocert.
-func initTLS(cfg *config.Config, clusterMgr *cluster.Cluster, logger *slog.Logger) (*tls.Config, *s3.Client, *tlsmgr.Manager, *tlsmgr.FileCertProvider, error) {
-	// Check if TLS is enabled
+// initTLS sets up TLS certificate management.
+// For provider "file": loads cert/key from disk, returns a FileCertProvider for SIGHUP reload.
+// For provider "letsencrypt": sets up autocert with S3/file cache.
+func initTLS(ctx context.Context, cfg *config.Config, clusterMgr *cluster.Cluster, logger *slog.Logger) (*tls.Config, *tlsmgr.Manager, *tlsmgr.FileCertProvider, error) {
 	if !cfg.TLS.Enabled {
 		logger.Info("TLS management disabled in configuration")
-		return nil, nil, nil, nil, nil
+		return nil, nil, nil, nil
 	}
 
-	storageBackend, s3Client, err := initStorageBackend(cfg, logger)
-	if err != nil {
-		return nil, nil, nil, nil, err
-	}
-
-	var tlsConfig *tls.Config
-	var tlsMgr *tlsmgr.Manager
-
-	// Handle different TLS providers
 	switch cfg.TLS.Provider {
 	case "file":
-		// Load certificates from files via FileCertProvider (supports SIGHUP reload)
-		if cfg.TLS.File.CertFile == "" || cfg.TLS.File.KeyFile == "" {
-			return nil, nil, nil, nil, fmt.Errorf("tls.file.cert_file and tls.file.key_file are required when provider=file")
-		}
 		fileCertProvider, err := tlsmgr.NewFileCertProvider(cfg.TLS.File.CertFile, cfg.TLS.File.KeyFile, logger)
 		if err != nil {
-			return nil, nil, nil, nil, fmt.Errorf("failed to load TLS certificate: %w", err)
+			return nil, nil, nil, fmt.Errorf("failed to load TLS certificate: %w", err)
 		}
-		tlsConfig = &tls.Config{
-			GetCertificate: fileCertProvider.GetCertificate,
-			MinVersion:     tls.VersionTLS12,
+		tlsConfig := &tls.Config{
+			GetCertificate:         fileCertProvider.GetCertificate,
+			MinVersion:             tls.VersionTLS12,
+			SessionTicketsDisabled: true,
 		}
-		return tlsConfig, s3Client, nil, fileCertProvider, nil
+		return tlsConfig, nil, fileCertProvider, nil
 
 	case "letsencrypt":
-		// Get leader function from cluster
 		var isLeaderF func() bool
 		if clusterMgr != nil {
 			isLeaderF = clusterMgr.IsLeader
 		} else {
-			// Fallback: always return true if no cluster (single-node mode)
-			isLeaderF = func() bool { return true }
 			logger.Warn("No cluster configured - autocert running in single-node mode")
 		}
 
-		// Calculate renewal window
-		var renewBefore time.Duration
-		if cfg.TLS.LetsEncrypt.RenewBeforeDays > 0 {
-			renewBefore = time.Duration(cfg.TLS.LetsEncrypt.RenewBeforeDays) * 24 * time.Hour
+		mgrCfg := &tlsmgr.Config{
+			Enabled:  true,
+			Provider: cfg.TLS.Provider,
+			LetsEncrypt: tlsmgr.LetsEncryptConfig{
+				Email:               cfg.TLS.LetsEncrypt.Email,
+				Domains:             cfg.TLS.LetsEncrypt.Domains,
+				DefaultDomain:       cfg.TLS.LetsEncrypt.DefaultDomain,
+				StorageProvider:     cfg.TLS.LetsEncrypt.StorageProvider,
+				CacheDir:            cfg.TLS.LetsEncrypt.CacheDir,
+				SyncIntervalMinutes: cfg.TLS.LetsEncrypt.SyncIntervalMinutes,
+				S3: tlsmgr.S3Config{
+					Bucket:    cfg.TLS.LetsEncrypt.S3.Bucket,
+					Region:    cfg.TLS.LetsEncrypt.S3.Region,
+					Endpoint:  cfg.TLS.LetsEncrypt.S3.Endpoint,
+					Prefix:    cfg.TLS.LetsEncrypt.S3.Prefix,
+					AccessKey: cfg.TLS.LetsEncrypt.S3.AccessKey,
+					SecretKey: cfg.TLS.LetsEncrypt.S3.SecretKey,
+				},
+			},
 		}
 
-		// Calculate sync interval
-		var syncInterval time.Duration
-		if cfg.TLS.LetsEncrypt.SyncIntervalMinutes > 0 {
-			syncInterval = time.Duration(cfg.TLS.LetsEncrypt.SyncIntervalMinutes) * time.Minute
-		} else if cfg.TLS.LetsEncrypt.SyncIntervalMinutes == 0 && cfg.TLS.LetsEncrypt.FallbackCacheDir != "" {
-			// Default to 5 minutes if fallback cache is enabled but interval not specified
-			syncInterval = 5 * time.Minute
-		}
-
-		// Build storage prefix for certificates (append "certs/" to base prefix).
-		// Guard against duplication if s3_prefix already ends with "certs/".
-		certStoragePrefix := cfg.Storage.S3Prefix + "certs/"
-		if strings.HasSuffix(cfg.Storage.S3Prefix, "certs/") {
-			certStoragePrefix = cfg.Storage.S3Prefix
-		}
-
-		// Create TLS manager with autocert using storage backend abstraction
-		tlsMgr, err = tlsmgr.NewManager(tlsmgr.Config{
-			Enabled:        true,
-			Email:          cfg.TLS.LetsEncrypt.Email,
-			Domains:        cfg.TLS.LetsEncrypt.Domains,
-			DefaultDomain:  cfg.TLS.LetsEncrypt.DefaultDomain,
-			StorageBackend: storageBackend,
-			StoragePrefix:  certStoragePrefix,
-			IsLeaderF:      isLeaderF,
-			Staging:        cfg.TLS.LetsEncrypt.Staging,
-			RenewBefore:    renewBefore,
-			FallbackDir:    cfg.TLS.LetsEncrypt.FallbackCacheDir,
-			SyncInterval:   syncInterval,
-		}, logger)
+		tlsMgr, err := tlsmgr.NewManager(ctx, mgrCfg, logger, isLeaderF)
 		if err != nil {
-			return nil, nil, nil, nil, fmt.Errorf("failed to create TLS manager: %w", err)
+			return nil, nil, nil, fmt.Errorf("failed to create TLS manager: %w", err)
 		}
 
-		tlsConfig = tlsMgr.TLSConfig()
+		tlsConfig := tlsMgr.TLSConfig()
 		if tlsConfig == nil {
-			return nil, nil, nil, nil, fmt.Errorf("TLS manager returned nil config")
+			return nil, nil, nil, fmt.Errorf("TLS manager returned nil config")
 		}
 
 		logger.Info(fmt.Sprintf("Autocert initialized for domains: %v", cfg.TLS.LetsEncrypt.Domains))
 
-		// Set default minimum TLS version (can be overridden per-server)
 		tlsConfig.MinVersion = tls.VersionTLS12
 
-		// Clear HTTP-specific ALPN protocols set by autocert.TLSConfig().
-		// autocert sets NextProtos to ["h2", "http/1.1", "acme-tls/1"] which are
-		// appropriate for HTTPS but incorrect for SMTP. Advertising HTTP ALPN on
-		// an SMTP connection can cause strict clients (e.g. Exchange Online) to
-		// abort the TLS handshake. The ACME TLS-ALPN-01 challenges are handled
-		// by the dedicated HTTPS server on port 443, not the SMTP servers.
+		// autocert sets NextProtos to ["h2", "http/1.1", "acme-tls/1"] which break
+		// strict SMTP clients (e.g. Exchange Online). ACME TLS-ALPN-01 is not used
+		// here — ACME challenges are served via HTTPHandler on port 80.
 		tlsConfig.NextProtos = nil
 
-		// Disable TLS session tickets for SMTP.
-		// Go's TLS 1.3 implementation sends NewSessionTicket messages after the
-		// handshake completes. Some SMTP clients (notably Exchange Online/Outlook)
-		// don't expect post-handshake data and interpret it as a protocol error,
-		// closing the connection with EOF. Session ticket resumption provides
-		// minimal benefit for SMTP (connections are typically short-lived) and
-		// disabling it fixes compatibility with these clients.
+		// Go's TLS 1.3 sends NewSessionTicket after the handshake; Exchange Online /
+		// Outlook treat that as a protocol error and EOF. SMTP connections are
+		// short-lived so resumption isn't worth the compat cost.
 		tlsConfig.SessionTicketsDisabled = true
 
 		logger.Info("Default TLS configuration ready (per-server min version can be set in [server.tls])")
 
-		return tlsConfig, s3Client, tlsMgr, nil, nil
+		return tlsConfig, tlsMgr, nil, nil
 
 	default:
-		return nil, nil, nil, nil, fmt.Errorf("unknown TLS provider: %s (must be 'file' or 'letsencrypt')", cfg.TLS.Provider)
+		return nil, nil, nil, fmt.Errorf("unknown TLS provider: %s (must be 'file' or 'letsencrypt')", cfg.TLS.Provider)
 	}
 }
 
@@ -1392,29 +1364,12 @@ func runSMTPServerInstance(ctx context.Context, serverCfg *config.ServerConfig, 
 			"server", serverCfg.Name,
 			"type", serverCfg.Type,
 			"addr", serverCfg.ListenAddr,
-			"tls", serverCfg.TLS.Mode,
-			"deferred_handshake", serverCfg.TLS.DeferredHandshake)
+			"tls", serverCfg.TLS.Mode)
 
 		// For implicit TLS (port 465), wrap listener with TLS
 		if serverCfg.UsesImplicitTLS() && tlsConfig != nil {
-			// Use deferred TLS handshake if enabled to prevent head-of-line blocking
-			if serverCfg.TLS.DeferredHandshake {
-				// Determine handshake timeout
-				handshakeTimeout := time.Duration(serverCfg.TLS.HandshakeTimeoutSecs) * time.Second
-				if handshakeTimeout == 0 {
-					handshakeTimeout = 10 * time.Second // Default 10 seconds
-				}
-
-				tlsListener := tlsmgr.NewDeferredTLSListener(listener, tlsConfig, handshakeTimeout, logger)
-				logger.Info("Using deferred TLS handshake for implicit TLS",
-					"server", serverCfg.Name,
-					"handshake_timeout", handshakeTimeout)
-				serverErrors <- server.Serve(tlsListener)
-			} else {
-				// Traditional synchronous TLS handshake in Accept()
-				tlsListener := tls.NewListener(listener, tlsConfig)
-				serverErrors <- server.Serve(tlsListener)
-			}
+			tlsListener := tls.NewListener(listener, tlsConfig)
+			serverErrors <- server.Serve(tlsListener)
 		} else {
 			serverErrors <- server.Serve(listener)
 		}

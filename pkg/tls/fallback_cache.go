@@ -1,6 +1,7 @@
 package tls
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log/slog"
@@ -14,252 +15,257 @@ import (
 	"golang.org/x/crypto/acme/autocert"
 )
 
-// FallbackCache wraps an S3 cache with a local filesystem fallback.
-// If S3 operations fail, it falls back to a local directory cache.
-// This provides resilience against S3 outages or connectivity issues.
+// FallbackCache implements a two-tier cache system:
+// - Primary: S3 (source of truth, shared across cluster)
+// - Fallback: Local filesystem (fast cache, used when S3 unavailable)
+//
+// - Get(): Try local first (fast), fallback to S3, sync S3→local
+// - Put(): Try S3 first (source of truth), fallback to local, schedule background sync
+// - Periodic sync: Ensures S3 has all certificates from fallback cache
+//
+// S3 Circuit Breaker: If S3 operations fail, the cache stops trying S3 for
+// a configurable interval (default 30s) to avoid repeated timeouts.
 type FallbackCache struct {
-	primary       autocert.Cache // S3 cache
-	fallback      autocert.Cache // Local directory cache
-	fallbackDir   string
-	s3Available   bool
-	needsSync     bool // True when certs were written to fallback only and need S3 sync
-	lastS3Check   time.Time
-	checkInterval time.Duration // How often to retry S3 after failure
-	logger        *slog.Logger
-	mu            sync.RWMutex
+	primary          autocert.Cache
+	fallback         autocert.Cache
+	fallbackDir      string
+	logger           *slog.Logger
+	mu               sync.RWMutex
+	s3Mu             sync.RWMutex
+	s3Available      bool
+	needsSync        bool
+	lastS3Check      time.Time
+	checkInterval    time.Duration
+	consecutiveFails int
 }
 
-// NewFallbackCache creates a cache that uses S3 as primary storage
-// with a local filesystem fallback for resilience.
-// If the fallback directory cannot be created, returns S3-only cache with a warning.
-func NewFallbackCache(s3Cache autocert.Cache, fallbackDir string, logger *slog.Logger) (autocert.Cache, error) {
-	// Try to ensure fallback directory exists
-	if err := os.MkdirAll(fallbackDir, 0700); err != nil {
-		logger.Warn("Cannot create fallback directory - fallback cache disabled, using S3-only", "dir", fallbackDir, "error", err)
-		logger.Warn("Certificates will only be stored in S3. If S3 becomes unavailable, certificate operations will fail.")
-		// Return S3-only cache instead of failing
-		return s3Cache, nil
+// NewFallbackCache creates a new two-tier cache with S3 as primary.
+// Returns S3-only behavior with a warning if fallback directory cannot be created.
+func NewFallbackCache(localDir string, s3Cache *S3Cache, logger *slog.Logger) *FallbackCache {
+	if err := os.MkdirAll(localDir, 0700); err != nil {
+		logger.Warn("cannot create fallback directory - fallback cache disabled, using S3-only",
+			"dir", localDir,
+			"error", err)
+		logger.Warn("certificates will only be stored in S3 - if S3 becomes unavailable, certificate operations will fail")
 	}
 
-	// Create local directory cache as fallback
-	fallbackCache := autocert.DirCache(fallbackDir)
-
-	fc := &FallbackCache{
+	return &FallbackCache{
 		primary:       s3Cache,
-		fallback:      fallbackCache,
-		fallbackDir:   fallbackDir,
-		s3Available:   true, // Assume S3 is available initially
-		checkInterval: 30 * time.Second,
+		fallback:      autocert.DirCache(localDir),
+		fallbackDir:   localDir,
 		logger:        logger,
+		s3Available:   true,
+		checkInterval: 30 * time.Second,
 	}
-
-	logger.Info("Fallback cache initialized", "dir", fallbackDir)
-	return fc, nil
 }
 
-// isS3Available checks if S3 should be tried based on recent failures
-func (fc *FallbackCache) isS3Available() bool {
-	fc.mu.RLock()
-	defer fc.mu.RUnlock()
+func (f *FallbackCache) isS3Available() bool {
+	f.s3Mu.RLock()
+	defer f.s3Mu.RUnlock()
 
-	// If S3 is marked unavailable, check if enough time has passed to retry
-	if !fc.s3Available {
-		if time.Since(fc.lastS3Check) < fc.checkInterval {
+	if !f.s3Available {
+		if time.Since(f.lastS3Check) < f.checkInterval {
 			return false
 		}
 	}
 	return true
 }
 
-// markS3Unavailable marks S3 as unavailable and records the time
-func (fc *FallbackCache) markS3Unavailable() {
-	fc.mu.Lock()
-	defer fc.mu.Unlock()
+// markS3Unavailable marks S3 as unavailable, records the time, and tracks
+// consecutive failures. Escalates log severity when failures persist.
+func (f *FallbackCache) markS3Unavailable() {
+	f.s3Mu.Lock()
+	defer f.s3Mu.Unlock()
 
-	if fc.s3Available {
-		fc.logger.Warn("S3 certificate cache unavailable - falling back to local filesystem", "dir", fc.fallbackDir)
+	f.consecutiveFails++
+	f.s3Available = false
+	f.lastS3Check = time.Now()
+
+	switch {
+	case f.consecutiveFails == 1:
+		f.logger.Warn("S3 certificate cache unavailable - operations will use local cache only",
+			"retry_after", f.checkInterval,
+			"consecutive_failures", f.consecutiveFails)
+	case f.consecutiveFails <= 5:
+		f.logger.Warn("S3 certificate cache still unavailable",
+			"consecutive_failures", f.consecutiveFails,
+			"retry_after", f.checkInterval)
+	default:
+		f.logger.Error("PERSISTENT S3 FAILURE: certificate cache has been unavailable for an extended period — certificates are only stored locally and NOT replicated",
+			"consecutive_failures", f.consecutiveFails,
+			"retry_after", f.checkInterval)
 	}
-	fc.s3Available = false
-	fc.lastS3Check = time.Now()
 }
 
-// markS3Available marks S3 as available again
-func (fc *FallbackCache) markS3Available() {
-	fc.mu.Lock()
-	defer fc.mu.Unlock()
+func (f *FallbackCache) markS3Available() {
+	f.s3Mu.Lock()
+	defer f.s3Mu.Unlock()
 
-	if !fc.s3Available {
-		fc.logger.Info("S3 certificate cache restored - resuming S3 operations")
+	if !f.s3Available {
+		f.logger.Info("S3 certificate cache restored - resuming S3 operations",
+			"was_unavailable_for_failures", f.consecutiveFails)
 	}
-	fc.s3Available = true
+	f.s3Available = true
+	f.consecutiveFails = 0
 }
 
-// Get retrieves a certificate, trying local cache first (fast), then S3 (slow)
-// This ensures TLS handshakes are fast when certificates are already cached locally.
-func (fc *FallbackCache) Get(ctx context.Context, name string) ([]byte, error) {
-	fc.logger.Debug("FallbackCache: Get certificate (checking local cache first)", "name", name)
+// Get retrieves a certificate, trying local cache first (fast), then S3 (slow).
+// S3 operations have a 5-second timeout to prevent blocking TLS handshakes.
+func (f *FallbackCache) Get(ctx context.Context, key string) ([]byte, error) {
+	f.logger.Debug("FallbackCache: Get certificate (checking local cache first)", "name", key)
 
-	// STEP 1: Try local cache first (FAST - no network call)
-	data, err := fc.fallback.Get(ctx, name)
+	data, err := f.fallback.Get(ctx, key)
 	if err == nil {
-		fc.logger.Debug("FallbackCache: Certificate found in local cache", "name", name)
+		f.logger.Debug("FallbackCache: certificate found in local cache", "name", key)
 		return data, nil
 	}
 
-	// Not in local cache or error reading
 	if err != autocert.ErrCacheMiss {
-		fc.logger.Warn("FallbackCache: Error reading local cache (will try S3)", "name", name, "error", err)
+		f.logger.Warn("FallbackCache: error reading local cache (will try S3)", "name", key, "error", err)
 	} else {
-		fc.logger.Debug("FallbackCache: Certificate not in local cache (checking S3)", "name", name)
+		f.logger.Debug("FallbackCache: certificate not in local cache (checking S3)", "name", key)
 	}
 
-	// STEP 2: Try S3 (SLOW - network call) with timeout
-	if fc.isS3Available() {
-		fc.logger.Debug("FallbackCache: Fetching certificate from S3", "name", name)
-
-		// Create a timeout context for S3 operations (5 seconds max for TLS handshake path)
-		// This prevents TLS handshakes from blocking indefinitely on S3 issues
-		s3Ctx, s3Cancel := context.WithTimeout(ctx, 5*time.Second)
-		defer s3Cancel()
-
-		data, err := fc.primary.Get(s3Ctx, name)
-		if err == nil {
-			fc.logger.Info("FallbackCache: Certificate found in S3 - syncing to local cache", "name", name)
-			fc.markS3Available()
-			// Store in local cache for future fast access
-			concurrency.SafeGo(fc.logger, "tls-cert-sync-to-local", func() {
-				if putErr := fc.fallback.Put(context.Background(), name, data); putErr != nil {
-					fc.logger.Warn("FallbackCache: Failed to sync certificate to local cache", "error", putErr)
-				} else {
-					fc.logger.Debug("FallbackCache: Certificate synced to local cache", "name", name)
-				}
-			})
-			return data, nil
-		}
-
-		// If it's just a cache miss, don't mark S3 as unavailable
-		if err == autocert.ErrCacheMiss {
-			fc.logger.Debug("FallbackCache: Certificate not found in S3 (cache miss)", "name", name)
-			return nil, autocert.ErrCacheMiss
-		}
-
-		// S3 error (timeout or other error) - mark as unavailable
-		fc.logger.Warn("FallbackCache: S3 Get failed (marking S3 unavailable)", "name", name, "error", err)
-		fc.markS3Unavailable()
-		return nil, err
+	if !f.isS3Available() {
+		f.logger.Debug("FallbackCache: S3 unavailable (circuit breaker), certificate not found", "name", key)
+		return nil, autocert.ErrCacheMiss
 	}
 
-	// S3 not available and not in local cache
-	fc.logger.Debug("FallbackCache: Certificate not found (S3 unavailable, not in local cache)", "name", name)
-	return nil, autocert.ErrCacheMiss
+	f.logger.Debug("FallbackCache: fetching certificate from S3", "name", key)
+
+	s3Ctx, s3Cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer s3Cancel()
+
+	data, err = f.primary.Get(s3Ctx, key)
+	if err == nil {
+		f.logger.Info("FallbackCache: certificate found in S3 - syncing to local cache", "name", key)
+		f.markS3Available()
+
+		concurrency.SafeGo(f.logger, "tls-cert-sync-to-local", func() {
+			if putErr := f.fallback.Put(context.Background(), key, data); putErr != nil {
+				f.logger.Warn("FallbackCache: failed to sync certificate to local cache", "name", key, "error", putErr)
+			} else {
+				f.logger.Debug("FallbackCache: certificate synced to local cache", "name", key)
+			}
+		})
+
+		return data, nil
+	}
+
+	if err == autocert.ErrCacheMiss {
+		f.logger.Debug("FallbackCache: certificate not found in S3 (cache miss)", "name", key)
+		return nil, autocert.ErrCacheMiss
+	}
+
+	f.logger.Warn("FallbackCache: S3 Get failed (marking S3 unavailable)", "name", key, "error", err)
+	f.markS3Unavailable()
+	return nil, err
 }
 
-// Put stores a certificate, trying S3 first, then falling back to local cache
-func (fc *FallbackCache) Put(ctx context.Context, name string, data []byte) error {
+// Put stores a certificate, trying S3 first (source of truth), then falling back to local cache.
+func (f *FallbackCache) Put(ctx context.Context, key string, data []byte) error {
 	var s3Err error
 
-	// Try S3 first if available
-	if fc.isS3Available() {
-		s3Err = fc.primary.Put(ctx, name, data)
+	if f.isS3Available() {
+		s3Err = f.primary.Put(ctx, key, data)
 		if s3Err == nil {
-			fc.markS3Available()
-			// Also store in fallback cache for future resilience
-			if fallbackErr := fc.fallback.Put(ctx, name, data); fallbackErr != nil {
-				fc.logger.Warn("Failed to sync certificate to fallback cache", "error", fallbackErr)
+			f.markS3Available()
+			if fallbackErr := f.fallback.Put(ctx, key, data); fallbackErr != nil {
+				f.logger.Warn("failed to sync certificate to fallback cache", "name", key, "error", fallbackErr)
 			}
 			return nil
 		}
 
-		// S3 error - mark as unavailable
-		fc.logger.Warn("S3 Put failed - using fallback cache", "name", name, "error", s3Err)
-		fc.markS3Unavailable()
+		f.logger.Warn("S3 Put failed - using fallback cache", "name", key, "error", s3Err)
+		f.markS3Unavailable()
 	}
 
-	// Use fallback cache — mark that we need S3 sync later
-	fc.mu.Lock()
-	fc.needsSync = true
-	fc.mu.Unlock()
+	f.mu.Lock()
+	f.needsSync = true
+	f.mu.Unlock()
 
-	fc.logger.Info("Storing certificate in fallback cache (needs S3 sync)", "name", name)
-	if err := fc.fallback.Put(ctx, name, data); err != nil {
-		// Both failed - return the original S3 error if we have one
+	f.logger.Info("storing certificate in fallback cache (needs S3 sync)", "name", key)
+	if err := f.fallback.Put(ctx, key, data); err != nil {
 		if s3Err != nil {
 			return fmt.Errorf("both S3 and fallback cache failed - S3 error: %w, fallback error: %v", s3Err, err)
 		}
 		return err
 	}
 
-	// Schedule S3 sync for later (best effort)
-	concurrency.SafeGo(fc.logger, "tls-cert-sync-to-s3", func() {
-		fc.syncToS3(name, data)
+	concurrency.SafeGo(f.logger, "tls-cert-sync-to-s3", func() {
+		f.syncToS3(key, data)
 	})
 
 	return nil
 }
 
-// syncToS3 attempts to sync a certificate from fallback cache to S3 in the background
-func (fc *FallbackCache) syncToS3(name string, data []byte) {
-	// Wait a bit before retrying S3
-	time.Sleep(fc.checkInterval)
+func (f *FallbackCache) syncToS3(key string, data []byte) {
+	time.Sleep(f.checkInterval)
+
+	if !f.isS3Available() {
+		f.logger.Debug("background S3 sync skipped (circuit breaker)", "name", key)
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if err := fc.primary.Put(ctx, name, data); err != nil {
-		fc.logger.Debug("Background S3 sync failed (will retry on next operation)", "name", name, "error", err)
+	if err := f.primary.Put(ctx, key, data); err != nil {
+		f.logger.Warn("background S3 sync failed - certificate only stored locally (will retry on periodic sync)", "name", key, "error", err)
+		f.markS3Unavailable()
 	} else {
-		fc.logger.Info("Certificate synced from fallback cache to S3", "name", name)
-		fc.markS3Available()
+		f.logger.Info("certificate synced from fallback cache to S3 (background)", "name", key)
+		f.markS3Available()
 	}
 }
 
-// Delete removes a certificate from both S3 and fallback cache
-func (fc *FallbackCache) Delete(ctx context.Context, name string) error {
+func (f *FallbackCache) Delete(ctx context.Context, key string) error {
 	var s3Err error
 
-	// Try S3 first if available
-	if fc.isS3Available() {
-		s3Err = fc.primary.Delete(ctx, name)
+	if f.isS3Available() {
+		s3Err = f.primary.Delete(ctx, key)
 		if s3Err == nil {
-			fc.markS3Available()
+			f.markS3Available()
 		} else {
-			fc.logger.Warn("S3 Delete failed", "name", name, "error", s3Err)
-			fc.markS3Unavailable()
+			f.logger.Warn("S3 Delete failed", "name", key, "error", s3Err)
+			f.markS3Unavailable()
 		}
 	}
 
-	// Also delete from fallback cache
-	fallbackErr := fc.fallback.Delete(ctx, name)
+	fallbackErr := f.fallback.Delete(ctx, key)
 
-	// Return error only if both failed
 	if s3Err != nil && fallbackErr != nil {
 		return fmt.Errorf("both S3 and fallback cache delete failed - S3 error: %w, fallback error: %v", s3Err, fallbackErr)
+	}
+
+	if s3Err != nil {
+		f.logger.Warn("certificate deleted from local cache but S3 delete failed — S3 may retain stale certificate",
+			"name", key, "s3_error", s3Err)
 	}
 
 	return nil
 }
 
-// GetFallbackDir returns the local fallback directory path
-func (fc *FallbackCache) GetFallbackDir() string {
-	return fc.fallbackDir
-}
-
 // NeedsSync returns true if there are certificates in the local fallback cache
 // that haven't been synced to S3 yet (due to a previous S3 outage).
-// The cert sync worker uses this to avoid unnecessary S3 downloads every cycle.
-func (fc *FallbackCache) NeedsSync() bool {
-	fc.mu.RLock()
-	defer fc.mu.RUnlock()
-	return fc.needsSync
+func (f *FallbackCache) NeedsSync() bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.needsSync
 }
 
 // SyncAllToS3 attempts to sync all certificates from fallback cache to S3.
-// This can be called after S3 becomes available again to ensure consistency.
-// Only syncs certificates that are missing or different in S3 to avoid unnecessary writes.
-func (fc *FallbackCache) SyncAllToS3(ctx context.Context) error {
-	// List all files in fallback directory
-	entries, err := os.ReadDir(fc.fallbackDir)
+// Only syncs certificates that are missing or different in S3.
+func (f *FallbackCache) SyncAllToS3(ctx context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	entries, err := os.ReadDir(f.fallbackDir)
 	if err != nil {
+		if os.IsNotExist(err) {
+			f.logger.Debug("fallback cache directory does not exist yet", "dir", f.fallbackDir)
+			return nil
+		}
 		return fmt.Errorf("failed to read fallback directory: %w", err)
 	}
 
@@ -273,60 +279,50 @@ func (fc *FallbackCache) SyncAllToS3(ctx context.Context) error {
 		}
 
 		name := entry.Name()
-		path := filepath.Join(fc.fallbackDir, name)
+		path := filepath.Join(f.fallbackDir, name)
 
-		// Read from fallback
 		data, err := os.ReadFile(path)
 		if err != nil {
-			fc.logger.Warn("Failed to read fallback certificate", "name", name, "error", err)
+			f.logger.Warn("failed to read fallback certificate", "name", name, "error", err)
 			failed++
 			continue
 		}
 
-		// Check if S3 already has this certificate
-		s3Data, err := fc.primary.Get(ctx, name)
+		s3Data, err := f.primary.Get(ctx, name)
 		if err == nil {
-			// Certificate exists in S3 - compare contents
-			if len(s3Data) == len(data) && string(s3Data) == string(data) {
-				// Same certificate - skip
+			if len(s3Data) == len(data) && bytes.Equal(s3Data, data) {
 				skipped++
 				continue
 			}
-			// Different certificate - need to sync
-			fc.logger.Debug("Certificate differs in S3, syncing", "name", name)
+			f.logger.Debug("certificate differs in S3, syncing", "name", name)
 		} else if err != autocert.ErrCacheMiss {
-			// Transient S3 error (timeout, network, etc.) - skip this cert.
-			// Do NOT re-upload: we can't confirm the cert is missing vs S3 being unreachable.
-			// Re-uploading on transient errors causes massive S3 object accumulation.
-			fc.logger.Warn("Transient S3 error checking certificate - skipping sync", "name", name, "error", err)
+			// Transient S3 error - skip. Do NOT re-upload: we can't confirm cert
+			// is missing vs S3 being unreachable. Re-uploading on transient errors
+			// causes massive S3 object accumulation.
+			f.logger.Warn("transient S3 error checking certificate - skipping sync", "name", name, "error", err)
 			skipped++
 			continue
 		}
-		// If err == autocert.ErrCacheMiss, cert is genuinely missing from S3 - sync it
 
-		// Write to S3 (either missing or different)
-		if err := fc.primary.Put(ctx, name, data); err != nil {
-			fc.logger.Warn("Failed to sync certificate to S3", "name", name, "error", err)
+		if err := f.primary.Put(ctx, name, data); err != nil {
+			f.logger.Warn("failed to sync certificate to S3", "name", name, "error", err)
 			failed++
 			continue
 		}
 
 		synced++
-		fc.logger.Debug("Synced certificate to S3", "name", name)
+		f.logger.Debug("synced certificate to S3", "name", name)
 	}
 
 	if synced > 0 {
-		fc.logger.Info("Synced certificates from fallback cache to S3", "synced", synced, "skipped", skipped, "failed", failed)
+		f.logger.Info("synced certificates from fallback cache to S3", "synced", synced, "skipped", skipped, "failed", failed)
 	}
 
 	if failed > 0 {
 		return fmt.Errorf("failed to sync %d certificates to S3", failed)
 	}
 
-	// All certs synced successfully — clear the needsSync flag
-	fc.mu.Lock()
-	fc.needsSync = false
-	fc.mu.Unlock()
+	f.needsSync = false
 
 	return nil
 }

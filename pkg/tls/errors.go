@@ -2,12 +2,17 @@ package tls
 
 import "errors"
 
-// ErrMissingServerName is returned when a TLS handshake is attempted without SNI
-var ErrMissingServerName = errors.New("missing server name")
+var (
+	// ErrMissingServerName is returned when a TLS handshake is attempted without SNI
+	// and no default domain is configured.
+	ErrMissingServerName = errors.New("tls: missing server name (SNI) and no default domain configured")
 
-// ErrHostNotAllowed is returned when a TLS handshake is attempted for a domain not in the allowlist
-var ErrHostNotAllowed = errors.New("host not allowed")
+	// ErrHostNotAllowed is returned when a certificate is requested for a domain
+	// that is not in the configured whitelist.
+	ErrHostNotAllowed = errors.New("tls: host not allowed")
 
-// ErrCertificateUnavailable is returned when a certificate cannot be retrieved (cache miss + ACME failure)
-// This is often a transient error (S3 down, ACME rate limit, network issues) and should not crash the server
-var ErrCertificateUnavailable = errors.New("certificate unavailable")
+	// ErrCertificateUnavailable is returned when a certificate cannot be retrieved
+	// due to transient errors (S3 down, ACME rate limits, network issues).
+	// This allows the server to continue serving cached certificates for other domains.
+	ErrCertificateUnavailable = errors.New("tls: certificate unavailable")
+)

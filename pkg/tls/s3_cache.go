@@ -4,10 +4,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
-	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -15,137 +14,93 @@ import (
 	"golang.org/x/crypto/acme/autocert"
 )
 
-// S3Cache implements autocert.Cache using S3 for certificate storage.
-// This allows certificates to be shared across multiple instances of the application.
+// S3API defines the S3 operations required for certificate storage.
+type S3API interface {
+	GetObject(ctx context.Context, params *s3.GetObjectInput, optFns ...func(*s3.Options)) (*s3.GetObjectOutput, error)
+	PutObject(ctx context.Context, params *s3.PutObjectInput, optFns ...func(*s3.Options)) (*s3.PutObjectOutput, error)
+	DeleteObject(ctx context.Context, params *s3.DeleteObjectInput, optFns ...func(*s3.Options)) (*s3.DeleteObjectOutput, error)
+}
+
+// S3Cache implements autocert.Cache using an S3 bucket.
 type S3Cache struct {
-	client *s3.Client
-	bucket string
-	prefix string // Key prefix for certificate storage (default: "autocert/")
-	logger *slog.Logger
+	S3Client S3API
+	Bucket   string
+	Prefix   string
+	Logger   *slog.Logger
 }
 
-// NewS3Cache creates a new S3-backed autocert cache using AWS SDK.
-func NewS3Cache(client *s3.Client, bucket, prefix string, logger *slog.Logger) (*S3Cache, error) {
-	ctx := context.Background()
+func (s *S3Cache) Get(ctx context.Context, key string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
 
-	if logger == nil {
-		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
-	}
+	fullKey := s.Prefix + key
 
-	if prefix != "" && !strings.HasSuffix(prefix, "/") {
-		prefix += "/"
-	}
-
-	cache := &S3Cache{
-		client: client,
-		bucket: bucket,
-		prefix: prefix + "autocert/",
-		logger: logger,
-	}
-
-	// Verify bucket access
-	if err := cache.verifyBucketAccess(ctx); err != nil {
-		return nil, fmt.Errorf("failed to verify S3 bucket access: %w", err)
-	}
-
-	logger.Info("S3 autocert cache initialized", "bucket", bucket, "prefix", cache.prefix)
-	return cache, nil
-}
-
-// verifyBucketAccess checks if the S3 bucket exists and is accessible.
-func (c *S3Cache) verifyBucketAccess(ctx context.Context) error {
-	_, err := c.client.HeadBucket(ctx, &s3.HeadBucketInput{
-		Bucket: aws.String(c.bucket),
-	})
-	if err != nil {
-		var nsk *types.NoSuchBucket
-		if errors.As(err, &nsk) {
-			return fmt.Errorf("bucket %s does not exist", c.bucket)
-		}
-		return fmt.Errorf("failed to check bucket existence: %w", err)
-	}
-	return nil
-}
-
-// Get retrieves a certificate data from S3.
-func (c *S3Cache) Get(ctx context.Context, key string) ([]byte, error) {
-	s3Key := c.prefix + key
-
-	c.logger.Debug("S3-Cache: Getting certificate", "key", key, "s3_key", s3Key)
-
-	// Get object from S3
-	result, err := c.client.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(c.bucket),
-		Key:    aws.String(s3Key),
+	resp, err := s.S3Client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(s.Bucket),
+		Key:    aws.String(fullKey),
 	})
 	if err != nil {
 		var nsk *types.NoSuchKey
 		if errors.As(err, &nsk) {
-			c.logger.Debug("S3-Cache: Certificate not found (cache miss)", "key", key)
+			s.Logger.Debug("certificate not found in S3", "key", fullKey)
 			return nil, autocert.ErrCacheMiss
 		}
-		// Return the actual error for transient S3 failures (timeout, network, etc.).
-		// Returning ErrCacheMiss here would cause autocert to re-provision certificates.
-		c.logger.Error("S3-Cache: Failed to get object from S3", "key", key, "error", err)
-		return nil, fmt.Errorf("S3 get failed for %s: %w", key, err)
+		s.Logger.Error("failed to get certificate from S3", "key", fullKey, "error", err)
+		return nil, err
 	}
-	defer result.Body.Close()
+	defer resp.Body.Close()
 
-	// Read object data
-	data, err := io.ReadAll(result.Body)
+	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		c.logger.Error("S3-Cache: Failed to read object data", "error", err)
-		return nil, fmt.Errorf("failed to read object: %w", err)
+		s.Logger.Error("failed to read certificate data", "key", key, "error", err)
+		return nil, err
 	}
 
-	c.logger.Debug("S3-Cache: Successfully retrieved certificate", "key", key, "bytes", len(data))
+	s.Logger.Info("certificate retrieved from S3", "key", fullKey, "size", len(data))
 	return data, nil
 }
 
-// Put stores certificate data in S3.
-func (c *S3Cache) Put(ctx context.Context, key string, data []byte) error {
-	s3Key := c.prefix + key
+func (s *S3Cache) Put(ctx context.Context, key string, data []byte) error {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
 
-	c.logger.Debug("S3-Cache: Putting certificate", "key", key, "s3_key", s3Key, "bytes", len(data))
+	fullKey := s.Prefix + key
 
-	// Upload to S3
-	_, err := c.client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:      aws.String(c.bucket),
-		Key:         aws.String(s3Key),
-		Body:        bytes.NewReader(data),
-		ContentType: aws.String("application/octet-stream"),
-	})
-	if err != nil {
-		c.logger.Error("S3-Cache: Failed to upload certificate to S3", "error", err)
-		return fmt.Errorf("failed to upload to S3: %w", err)
+	if s.Prefix == "" {
+		s.Logger.Warn("S3Cache.Put: no prefix configured - storing in bucket root", "key", key)
+	} else {
+		s.Logger.Debug("S3Cache.Put: using prefix", "prefix", s.Prefix, "key", key, "fullKey", fullKey)
 	}
 
-	c.logger.Debug("S3-Cache: Successfully stored certificate", "key", key)
+	_, err := s.S3Client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(s.Bucket),
+		Key:    aws.String(fullKey),
+		Body:   bytes.NewReader(data),
+	})
+	if err != nil {
+		s.Logger.Error("failed to put certificate to S3", "key", fullKey, "error", err)
+		return err
+	}
+
+	s.Logger.Info("certificate stored in S3", "key", fullKey, "size", len(data))
 	return nil
 }
 
-// Delete removes certificate data from S3.
-func (c *S3Cache) Delete(ctx context.Context, key string) error {
-	s3Key := c.prefix + key
+func (s *S3Cache) Delete(ctx context.Context, key string) error {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
 
-	c.logger.Debug("S3-Cache: Deleting certificate", "key", key, "s3_key", s3Key)
+	fullKey := s.Prefix + key
 
-	// Delete from S3
-	_, err := c.client.DeleteObject(ctx, &s3.DeleteObjectInput{
-		Bucket: aws.String(c.bucket),
-		Key:    aws.String(s3Key),
+	_, err := s.S3Client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(s.Bucket),
+		Key:    aws.String(fullKey),
 	})
 	if err != nil {
-		// Check if object doesn't exist (which is fine for Delete)
-		var nsk *types.NoSuchKey
-		if errors.As(err, &nsk) {
-			c.logger.Debug("S3-Cache: Certificate already deleted or doesn't exist", "key", key)
-			return nil
-		}
-		c.logger.Error("S3-Cache: Failed to delete certificate from S3", "error", err)
-		return fmt.Errorf("failed to delete from S3: %w", err)
+		s.Logger.Error("failed to delete certificate from S3", "key", fullKey, "error", err)
+		return err
 	}
 
-	c.logger.Debug("S3-Cache: Successfully deleted certificate", "key", key)
+	s.Logger.Info("certificate deleted from S3", "key", fullKey)
 	return nil
 }

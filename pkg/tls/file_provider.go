@@ -55,7 +55,6 @@ func (p *FileCertProvider) Reload() error {
 	// Log certificate details including expiry for operational visibility
 	logAttrs := []any{"cert_file", p.certFile, "key_file", p.keyFile}
 	if cert.Leaf == nil {
-		// LoadX509KeyPair doesn't always populate Leaf; parse it ourselves
 		cert.Leaf, _ = x509.ParseCertificate(cert.Certificate[0])
 	}
 	if cert.Leaf != nil {
