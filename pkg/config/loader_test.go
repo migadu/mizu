@@ -379,6 +379,8 @@ func TestValidateConfig_ClusterBindAddr(t *testing.T) {
 			cfg.TLS.Provider = "letsencrypt"
 			cfg.TLS.LetsEncrypt.Email = "test@example.com"
 			cfg.TLS.LetsEncrypt.Domains = []string{"test.example.com"}
+			cfg.TLS.LetsEncrypt.StorageProvider = "s3"
+			cfg.TLS.LetsEncrypt.S3.Bucket = "test-bucket"
 
 			// Add a test server (DefaultConfig no longer includes servers)
 			cfg.Servers = []ServerConfig{
@@ -418,6 +420,107 @@ func TestValidateConfig_ClusterBindAddr(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestValidateConfig_TLSProvider(t *testing.T) {
+	// Helper to create a minimal valid config with TLS enabled.
+	baseCfg := func() Config {
+		cfg := DefaultConfig()
+		cfg.Local = false
+		cfg.Storage.Backend = "filesystem"
+		cfg.Storage.FilesystemPath = "/tmp/mizu"
+		cfg.TLS.Enabled = true
+		cfg.Servers = []ServerConfig{
+			{
+				Name:       "test-server",
+				Type:       "relay",
+				ListenAddr: ":25",
+				Hostname:   "test.example.com",
+				Delivery: DeliveryConfig{
+					URL:                "https://test.com",
+					AuthToken:          "test-token",
+					MaxRetryAttempts:   3,
+					HTTPTimeoutSeconds: 30,
+				},
+			},
+		}
+		return cfg
+	}
+
+	t.Run("file provider valid", func(t *testing.T) {
+		cfg := baseCfg()
+		cfg.TLS.Provider = "file"
+		cfg.TLS.File.CertFile = "/etc/ssl/cert.pem"
+		cfg.TLS.File.KeyFile = "/etc/ssl/key.pem"
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("expected no error, got: %v", err)
+		}
+	})
+
+	t.Run("file provider missing cert_file", func(t *testing.T) {
+		cfg := baseCfg()
+		cfg.TLS.Provider = "file"
+		cfg.TLS.File.CertFile = ""
+		cfg.TLS.File.KeyFile = "/etc/ssl/key.pem"
+		err := cfg.Validate()
+		if err == nil || !contains(err.Error(), "cert_file") {
+			t.Errorf("expected error about cert_file, got: %v", err)
+		}
+	})
+
+	t.Run("file provider missing key_file", func(t *testing.T) {
+		cfg := baseCfg()
+		cfg.TLS.Provider = "file"
+		cfg.TLS.File.CertFile = "/etc/ssl/cert.pem"
+		cfg.TLS.File.KeyFile = ""
+		err := cfg.Validate()
+		if err == nil || !contains(err.Error(), "key_file") {
+			t.Errorf("expected error about key_file, got: %v", err)
+		}
+	})
+
+	t.Run("letsencrypt provider valid", func(t *testing.T) {
+		cfg := baseCfg()
+		cfg.TLS.Provider = "letsencrypt"
+		cfg.TLS.LetsEncrypt.Email = "test@example.com"
+		cfg.TLS.LetsEncrypt.Domains = []string{"test.example.com"}
+		cfg.TLS.LetsEncrypt.StorageProvider = "s3"
+		cfg.TLS.LetsEncrypt.S3.Bucket = "test-bucket"
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("expected no error, got: %v", err)
+		}
+	})
+
+	t.Run("letsencrypt provider missing email", func(t *testing.T) {
+		cfg := baseCfg()
+		cfg.TLS.Provider = "letsencrypt"
+		cfg.TLS.LetsEncrypt.Email = ""
+		cfg.TLS.LetsEncrypt.Domains = []string{"test.example.com"}
+		cfg.TLS.LetsEncrypt.StorageProvider = "s3"
+		cfg.TLS.LetsEncrypt.S3.Bucket = "test-bucket"
+		err := cfg.Validate()
+		if err == nil || !contains(err.Error(), "email") {
+			t.Errorf("expected error about email, got: %v", err)
+		}
+	})
+
+	t.Run("empty provider", func(t *testing.T) {
+		cfg := baseCfg()
+		cfg.TLS.Provider = ""
+		err := cfg.Validate()
+		if err == nil || !contains(err.Error(), "tls.provider must be set") {
+			t.Errorf("expected error about provider, got: %v", err)
+		}
+	})
+
+	t.Run("invalid provider", func(t *testing.T) {
+		cfg := baseCfg()
+		cfg.TLS.Provider = "magic"
+		err := cfg.Validate()
+		if err == nil || !contains(err.Error(), "invalid tls.provider") {
+			t.Errorf("expected error about invalid provider, got: %v", err)
+		}
+	})
 }
 
 func contains(s, substr string) bool {

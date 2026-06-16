@@ -158,20 +158,27 @@ s3_region = "us-east-1"
 
 [tls]
 enabled = false
-provider = "file"
+provider = "file"             # "file" (cert/key on disk) or "letsencrypt" (automatic ACME)
 
 [tls.file]
-cert_file = ""
-key_file = ""
+cert_file = ""                # Path to PEM certificate file (provider=file only)
+key_file = ""                 # Path to PEM private key file (provider=file only)
 
 [tls.letsencrypt]
 email = "admin@example.com"
 domains = []
-default_domain = ""
-staging = false
-renew_before_days = 30
-fallback_cache_dir = ""
-sync_interval_minutes = 5
+default_domain = ""           # Defaults to first entry of `domains` if empty
+storage_provider = "s3"       # "s3" (hybrid file+S3 cache) or "file" (local only)
+cache_dir = ""                # Local cache dir (file mode) or fallback dir (s3 mode); defaults to "cert-cache"
+sync_interval_minutes = 5     # Periodic local→S3 sync (s3 mode only)
+
+[tls.letsencrypt.s3]
+bucket = ""
+region = "us-east-1"
+endpoint = ""                 # Custom S3 endpoint (Backblaze B2, MinIO, etc.); empty = AWS default
+prefix = ""
+access_key = ""
+secret_key = ""
 
 [health]
 enabled = true

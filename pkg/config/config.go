@@ -128,6 +128,20 @@ func (c *Config) Validate() error {
 			if len(c.TLS.LetsEncrypt.Domains) == 0 {
 				return errors.New("tls.letsencrypt.domains must be set for automatic certificate management")
 			}
+			switch c.TLS.LetsEncrypt.StorageProvider {
+			case "s3":
+				if c.TLS.LetsEncrypt.S3.Bucket == "" {
+					return errors.New("tls.letsencrypt.s3.bucket must be set when storage_provider=s3")
+				}
+			case "file":
+				if c.TLS.LetsEncrypt.CacheDir == "" {
+					return errors.New("tls.letsencrypt.cache_dir must be set when storage_provider=file")
+				}
+			case "":
+				return errors.New("tls.letsencrypt.storage_provider must be set (must be 's3' or 'file')")
+			default:
+				return fmt.Errorf("invalid tls.letsencrypt.storage_provider: %s (must be 's3' or 'file')", c.TLS.LetsEncrypt.StorageProvider)
+			}
 		case "":
 			return errors.New("tls.provider must be set when tls.enabled=true (must be 'file' or 'letsencrypt')")
 		default:
