@@ -195,12 +195,15 @@ func TestMultipleRecipients_SecondRecipientFails(t *testing.T) {
 		t.Fatal("Expected delivery to fail when second recipient returns 404")
 	}
 
+	// Without a distTracker, a 404 falls through to a generic temporary failure (451);
+	// the key guarantee is that the whole transaction fails (no partial success).
 	smtpErr, ok := err.(*smtp.SMTPError)
 	if !ok {
 		t.Fatalf("Expected *smtp.SMTPError, got %T", err)
 	}
-	if smtpErr.Code != 550 {
-		t.Errorf("Expected SMTP code 550, got %d", smtpErr.Code)
+
+	if smtpErr.Code != 451 {
+		t.Errorf("Expected SMTP code 451 for generic delivery failure, got %d", smtpErr.Code)
 	}
 
 	// Should have stopped after 2 POSTs (bob succeeded, charlie failed, dave skipped)

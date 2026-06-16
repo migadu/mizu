@@ -84,7 +84,8 @@ func TestHTTP413PayloadTooLarge(t *testing.T) {
 	}
 }
 
-// TestHTTP400BadRequest tests that HTTP 400 errors remain as SMTP 550
+// TestHTTP400BadRequest tests that a generic HTTP 400 delivery failure is
+// returned as a temporary SMTP 451 so the sender's MTA retries (zero message loss).
 func TestHTTP400BadRequest(t *testing.T) {
 	// Create a test HTTP server that returns 400
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -110,7 +111,7 @@ func TestHTTP400BadRequest(t *testing.T) {
 		t.Fatalf("RCPT TO failed: %v", err)
 	}
 
-	// Send DATA - this should fail with SMTP 550 (generic permanent failure)
+	// Send DATA - this should fail with SMTP 451 (temporary failure)
 	wc, err := client.Data()
 	if err != nil {
 		t.Fatalf("DATA command failed: %v", err)
@@ -132,17 +133,17 @@ func TestHTTP400BadRequest(t *testing.T) {
 
 	err = wc.Close()
 	if err == nil {
-		t.Fatal("Expected DATA to fail with 550, but got success")
+		t.Fatal("Expected DATA to fail with 451, but got success")
 	}
 
-	// Verify we got SMTP 550 error
+	// Verify we got SMTP 451 error
 	smtpErr, ok := err.(*smtp.SMTPError)
 	if !ok {
 		t.Fatalf("Expected SMTPError, got: %T: %v", err, err)
 	}
 
-	if smtpErr.Code != 550 {
-		t.Errorf("Expected SMTP code 550, got: %d", smtpErr.Code)
+	if smtpErr.Code != 451 {
+		t.Errorf("Expected SMTP code 451, got: %d", smtpErr.Code)
 	}
 }
 

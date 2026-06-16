@@ -1738,10 +1738,10 @@ func (s *Session) deliverToRecipient(signedEmail string, recipient string) error
 			}
 		}
 
-		if poster.IsRetryableError(err) {
-			return &smtp.SMTPError{Code: 451, EnhancedCode: smtp.EnhancedCode{4, 4, 0}, Message: "Temporary failure, please try again later"}
-		}
-		return &smtp.SMTPError{Code: 550, EnhancedCode: smtp.EnhancedCode{5, 4, 0}, Message: "Message delivery failed"}
+		// Any other delivery failure is treated as temporary so the sender's MTA
+		// retries rather than bouncing the message (zero message loss). Deliberate
+		// backend rejections (404/403/413) are handled above and remain permanent.
+		return &smtp.SMTPError{Code: 451, EnhancedCode: smtp.EnhancedCode{4, 4, 0}, Message: "Temporary failure, please try again later"}
 	}
 
 	return nil

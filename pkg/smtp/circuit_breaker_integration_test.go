@@ -201,9 +201,10 @@ func TestCircuitBreakerIntegration_OpenReturns451(t *testing.T) {
 	t.Log("✓ Integration test complete: Circuit breaker properly protects SMTP with 451 errors")
 }
 
-// TestCircuitBreakerIntegration_PermanentFailureReturns550 verifies that
-// permanent failures (like 4xx errors) return 550, not 451.
-func TestCircuitBreakerIntegration_PermanentFailureReturns550(t *testing.T) {
+// TestCircuitBreakerIntegration_GenericFailureReturns451 verifies that a generic
+// delivery failure (like a 400 error) returns a temporary 451 so the sender retries,
+// and that such non-retryable errors still don't trigger the circuit breaker.
+func TestCircuitBreakerIntegration_GenericFailureReturns451(t *testing.T) {
 	// Create a backend server that returns 400 Bad Request
 	badRequestServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest) // 400 - permanent failure
@@ -256,16 +257,16 @@ func TestCircuitBreakerIntegration_PermanentFailureReturns550(t *testing.T) {
 		t.Fatal("Expected delivery to fail with 400 error")
 	}
 
-	// Should get permanent failure (550) because 400 is not retryable
+	// Should get temporary failure (451) so the sender's MTA retries
 	smtpErr, ok := err.(*smtp.SMTPError)
 	if !ok {
 		t.Fatalf("Expected *smtp.SMTPError, got %T: %v", err, err)
 	}
-	if smtpErr.Code != 550 {
-		t.Errorf("Expected SMTP code 550 for permanent error, got %d", smtpErr.Code)
+	if smtpErr.Code != 451 {
+		t.Errorf("Expected SMTP code 451 for generic delivery failure, got %d", smtpErr.Code)
 	}
-	if smtpErr.EnhancedCode != (smtp.EnhancedCode{5, 4, 0}) {
-		t.Errorf("Expected enhanced code 5.4.0, got %v", smtpErr.EnhancedCode)
+	if smtpErr.EnhancedCode != (smtp.EnhancedCode{4, 4, 0}) {
+		t.Errorf("Expected enhanced code 4.4.0, got %v", smtpErr.EnhancedCode)
 	}
 
 	// Circuit should still be closed (4xx errors don't trigger circuit breaker)
@@ -273,12 +274,13 @@ func TestCircuitBreakerIntegration_PermanentFailureReturns550(t *testing.T) {
 		t.Errorf("Expected circuit to remain Closed for non-retryable errors, got %v", cb.GetState())
 	}
 
-	t.Logf("✓ Permanent failure (400) correctly returned 550: %s", smtpErr.Message)
+	t.Logf("✓ Generic delivery failure (400) correctly returned 451: %s", smtpErr.Message)
 	t.Log("✓ Circuit breaker remained CLOSED (4xx errors don't count as failures)")
 }
 
 // TestCircuitBreakerIntegration_4xxErrorsDoNotTriggerCircuit verifies that
-// 4xx errors (client errors) don't trigger the circuit breaker and return 550.
+// 4xx errors (client errors) don't trigger the circuit breaker. Without a
+// distTracker, a 404 falls through to a generic temporary failure (451).
 func TestCircuitBreakerIntegration_4xxErrorsDoNotTriggerCircuit(t *testing.T) {
 	var requestCount atomic.Int32
 
@@ -336,19 +338,19 @@ func TestCircuitBreakerIntegration_4xxErrorsDoNotTriggerCircuit(t *testing.T) {
 		t.Fatal("Expected delivery to fail with 404 error")
 	}
 
-	// Without distTracker, 404 returns generic permanent failure (550 5.4.0)
+	// Without distTracker, 404 falls through to generic temporary failure (451 4.4.0)
 	smtpErr, ok := err.(*smtp.SMTPError)
 	if !ok {
 		t.Fatalf("Expected *smtp.SMTPError, got %T: %v", err, err)
 	}
-	if smtpErr.Code != 550 {
-		t.Errorf("Expected SMTP code 550 for 4xx error, got %d", smtpErr.Code)
+	if smtpErr.Code != 451 {
+		t.Errorf("Expected SMTP code 451 for generic delivery failure, got %d", smtpErr.Code)
 	}
-	if smtpErr.EnhancedCode != (smtp.EnhancedCode{5, 4, 0}) {
-		t.Errorf("Expected enhanced code 5.4.0 (permanent failure), got %v", smtpErr.EnhancedCode)
+	if smtpErr.EnhancedCode != (smtp.EnhancedCode{4, 4, 0}) {
+		t.Errorf("Expected enhanced code 4.4.0 (temporary failure), got %v", smtpErr.EnhancedCode)
 	}
-	if smtpErr.Message != "Message delivery failed" {
-		t.Errorf("Expected 'Message delivery failed' message, got: %s", smtpErr.Message)
+	if smtpErr.Message != "Temporary failure, please try again later" {
+		t.Errorf("Expected 'Temporary failure, please try again later' message, got: %s", smtpErr.Message)
 	}
 
 	// Verify backend was called
@@ -361,6 +363,6 @@ func TestCircuitBreakerIntegration_4xxErrorsDoNotTriggerCircuit(t *testing.T) {
 		t.Errorf("Expected circuit to remain Closed for 4xx errors, got %v", cb.GetState())
 	}
 
-	t.Logf("✓ 404 error correctly returned 550 5.4.0: %s", smtpErr.Message)
+	t.Logf("✓ 404 error correctly returned 451 4.4.0: %s", smtpErr.Message)
 	t.Log("✓ Circuit breaker remained CLOSED (4xx errors don't trigger circuit breaker)")
 }
