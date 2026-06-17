@@ -1711,9 +1711,14 @@ func (s *Session) deliverToRecipient(signedEmail string, recipient string) error
 		}
 	}
 
+	// Add the X-Envelope-To header for this specific recipient. Delivery is
+	// per-recipient, so each delivered copy carries exactly the envelope
+	// recipient it was sent for.
+	emailForRecipient := addEnvelopeToHeader(signedEmail, recipient)
+
 	err := poster.PostEmailToDestinationWithContext(
 		s.ctx,
-		signedEmail,
+		emailForRecipient,
 		s.serverConfig.Delivery.URL,
 		s.serverConfig.Delivery.AuthToken,
 		s.serverConfig.Delivery.MaxRetryAttempts,

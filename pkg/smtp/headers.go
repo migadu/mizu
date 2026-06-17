@@ -192,6 +192,59 @@ func addJunkHeader(rawEmail, headerName string) string {
 	return fmt.Sprintf("%s: YES\r\n", safeName) + rawEmail
 }
 
+// addEnvelopeToHeader prepends an X-Envelope-To header carrying the envelope
+// recipient address. Delivery is per-recipient, so each delivered copy records
+// exactly the recipient it was sent for. Any X-Envelope-To header already
+// present (e.g. forged by an upstream sender) is removed first so the value we
+// emit is authoritative and never duplicated. The address comes from RCPT TO
+// (already parsed) but is sanitized for the same defense-in-depth reason as the
+// other header injection paths — a stray CR/LF would otherwise forge headers.
+func addEnvelopeToHeader(rawEmail, recipient string) string {
+	rawEmail = stripHeader(rawEmail, "X-Envelope-To")
+
+	safeRecipient := sanitizeHeaderValue(recipient)
+	if safeRecipient == "" {
+		return rawEmail
+	}
+	return fmt.Sprintf("X-Envelope-To: %s\r\n", safeRecipient) + rawEmail
+}
+
+// stripHeader removes every occurrence of the named header (case-insensitive),
+// including any RFC 5322 folded continuation lines, from the header section of
+// the message. Everything from the first empty line onward (the body) is left
+// untouched, so occurrences of the name in the body are not affected.
+func stripHeader(rawEmail, headerName string) string {
+	prefix := headerName + ":"
+	lines := strings.Split(rawEmail, "\r\n")
+	result := make([]string, 0, len(lines))
+	skipping := false
+
+	for i, line := range lines {
+		// Empty line marks the end of the header section: copy the body verbatim.
+		if line == "" {
+			result = append(result, lines[i:]...)
+			break
+		}
+
+		// Drop folded continuation lines belonging to a stripped header.
+		if skipping {
+			if line[0] == ' ' || line[0] == '\t' {
+				continue
+			}
+			skipping = false
+		}
+
+		if len(line) >= len(prefix) && strings.EqualFold(line[:len(prefix)], prefix) {
+			skipping = true
+			continue
+		}
+
+		result = append(result, line)
+	}
+
+	return strings.Join(result, "\r\n")
+}
+
 // modifySubject modifies the Subject header according to the provided pattern
 // The pattern should contain %s which will be replaced with the original subject
 func modifySubject(rawEmail, pattern string) string {

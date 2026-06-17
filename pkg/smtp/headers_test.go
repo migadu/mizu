@@ -462,6 +462,93 @@ func TestFixMissingHeaders_CaseInsensitive(t *testing.T) {
 	}
 }
 
+func TestAddEnvelopeToHeader(t *testing.T) {
+	originalEmail := "From: sender@example.com\r\nSubject: Test\r\n\r\nBody\r\n"
+
+	modifiedEmail := addEnvelopeToHeader(originalEmail, "recipient@example.com")
+
+	// The header must be prepended as the first line, carry the recipient,
+	// and leave the original message intact.
+	if !strings.HasPrefix(modifiedEmail, "X-Envelope-To: recipient@example.com\r\n") {
+		t.Errorf("Expected X-Envelope-To prepended, got:\n%s", modifiedEmail)
+	}
+	if !strings.HasSuffix(modifiedEmail, originalEmail) {
+		t.Errorf("Original email should remain unchanged after the header, got:\n%s", modifiedEmail)
+	}
+}
+
+func TestAddEnvelopeToHeader_Sanitization(t *testing.T) {
+	originalEmail := "From: sender@example.com\r\nSubject: Test\r\n\r\nBody\r\n"
+
+	// A CR/LF in the recipient must not forge an additional header line.
+	modifiedEmail := addEnvelopeToHeader(originalEmail, "recipient@example.com\r\nInjected-Header: yes")
+
+	for _, line := range strings.Split(modifiedEmail, "\r\n") {
+		if strings.HasPrefix(line, "Injected-Header") {
+			t.Errorf("Recipient injected as its own header line: %q", line)
+		}
+	}
+	if !strings.HasPrefix(modifiedEmail, "X-Envelope-To: recipient@example.comInjected-Header: yes\r\n") {
+		t.Errorf("Expected sanitized single-line header, got:\n%s", modifiedEmail)
+	}
+}
+
+func TestAddEnvelopeToHeader_ReplacesExisting(t *testing.T) {
+	// An upstream sender forged an X-Envelope-To; it must be replaced, not
+	// duplicated, so the value we emit is authoritative.
+	originalEmail := "From: sender@example.com\r\n" +
+		"X-Envelope-To: forged@evil.com\r\n" +
+		"Subject: Test\r\n" +
+		"\r\n" +
+		"Body\r\n"
+
+	modifiedEmail := addEnvelopeToHeader(originalEmail, "recipient@example.com")
+
+	if strings.Contains(modifiedEmail, "forged@evil.com") {
+		t.Errorf("Existing X-Envelope-To should be removed, got:\n%s", modifiedEmail)
+	}
+	if n := strings.Count(modifiedEmail, "X-Envelope-To:"); n != 1 {
+		t.Errorf("Expected exactly one X-Envelope-To header, got %d:\n%s", n, modifiedEmail)
+	}
+	if !strings.HasPrefix(modifiedEmail, "X-Envelope-To: recipient@example.com\r\n") {
+		t.Errorf("Expected our X-Envelope-To prepended, got:\n%s", modifiedEmail)
+	}
+}
+
+func TestAddEnvelopeToHeader_ReplacesFoldedExisting(t *testing.T) {
+	// A folded (multi-line) X-Envelope-To and its continuation must both be
+	// removed, while a header in the body is left untouched.
+	originalEmail := "From: sender@example.com\r\n" +
+		"x-envelope-to: forged@evil.com,\r\n" +
+		"\tsecond@evil.com\r\n" +
+		"Subject: Test\r\n" +
+		"\r\n" +
+		"X-Envelope-To: not-a-header-in-body\r\n"
+
+	modifiedEmail := addEnvelopeToHeader(originalEmail, "recipient@example.com")
+
+	if strings.Contains(modifiedEmail, "evil.com") {
+		t.Errorf("Folded X-Envelope-To and continuation should be removed, got:\n%s", modifiedEmail)
+	}
+	// The body line that happens to look like a header must survive.
+	if !strings.Contains(modifiedEmail, "X-Envelope-To: not-a-header-in-body\r\n") {
+		t.Errorf("Body content should be untouched, got:\n%s", modifiedEmail)
+	}
+	if !strings.HasPrefix(modifiedEmail, "X-Envelope-To: recipient@example.com\r\n") {
+		t.Errorf("Expected our X-Envelope-To prepended, got:\n%s", modifiedEmail)
+	}
+}
+
+func TestAddEnvelopeToHeader_EmptyRecipient(t *testing.T) {
+	originalEmail := "From: sender@example.com\r\nSubject: Test\r\n\r\nBody\r\n"
+
+	// A recipient that fully sanitizes away would yield a malformed colon-only
+	// line, so the email is returned unchanged.
+	if got := addEnvelopeToHeader(originalEmail, "\r\n"); got != originalEmail {
+		t.Errorf("Expected email unchanged for empty recipient, got:\n%s", got)
+	}
+}
+
 func TestGenerateMessageID(t *testing.T) {
 	domain := "mail.example.com"
 	messageID1 := generateMessageID(domain)
