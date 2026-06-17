@@ -3,10 +3,15 @@ package spamcheck
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -429,13 +434,14 @@ func TestClient_Check_ArrayHeaders(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(server.URL, "", 5*time.Second, slog.Default())
-	result, err := client.Check(context.Background(), CheckRequest{
-		Message:  "Subject: Test\r\n\r\nBody",
-		ClientIP: "1.2.3.4",
-		From:     "sender@example.com",
-		Rcpt:     []string{"recipient@example.com"},
-		Helo:     "mail.example.com",
-	})
+	result, err := client.Check(
+		context.Background(),
+		"Subject: Test\r\n\r\nBody",
+		"1.2.3.4",
+		"sender@example.com",
+		[]string{"recipient@example.com"},
+		"mail.example.com",
+	)
 
 	if err != nil {
 		t.Fatalf("Expected no error, got: %v", err)
@@ -485,11 +491,14 @@ func TestClient_Check_ArrayHeaders_OrderRespected(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(server.URL, "", 5*time.Second, slog.Default())
-	result, err := client.Check(context.Background(), CheckRequest{
-		Message: "Subject: Test\r\n\r\nBody",
-		From:    "sender@example.com",
-		Rcpt:    []string{"recipient@example.com"},
-	})
+	result, err := client.Check(
+		context.Background(),
+		"Subject: Test\r\n\r\nBody",
+		"",
+		"sender@example.com",
+		[]string{"recipient@example.com"},
+		"",
+	)
 	if err != nil {
 		t.Fatalf("Expected no error, got: %v", err)
 	}
@@ -527,11 +536,14 @@ func TestClient_Check_NullHeaderDropped(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(server.URL, "", 5*time.Second, slog.Default())
-	result, err := client.Check(context.Background(), CheckRequest{
-		Message: "Subject: Test\r\n\r\nBody",
-		From:    "sender@example.com",
-		Rcpt:    []string{"recipient@example.com"},
-	})
+	result, err := client.Check(
+		context.Background(),
+		"Subject: Test\r\n\r\nBody",
+		"",
+		"sender@example.com",
+		[]string{"recipient@example.com"},
+		"",
+	)
 	if err != nil {
 		t.Fatalf("Expected no error, got: %v", err)
 	}
@@ -544,6 +556,105 @@ func TestClient_Check_NullHeaderDropped(t *testing.T) {
 	}
 	if got := result.AddHeaders["X-Kept"]; len(got) != 1 || got[0] != "yes" {
 		t.Errorf("Expected X-Kept=[yes], got %v", got)
+	}
+}
+
+func TestClient_Check_RetryOnBrokenConnection(t *testing.T) {
+	// Reproduce the half-dead-keep-alive scenario: first connection is
+	// closed with SO_LINGER=0 so the client observes an RST mid-response;
+	// the second connection answers normally. The client should retry
+	// transparently and return success.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	var attempts atomic.Int32
+	const okBody = `{"action":"no action","score":0.0,"required_score":5.0,"symbols":{}}`
+	okResp := fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+		len(okBody), okBody)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			n := attempts.Add(1)
+			go func(conn net.Conn, attempt int32) {
+				defer conn.Close()
+				if attempt == 1 {
+					// Drain a few bytes so the client side commits to the
+					// connection, then RST.
+					_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+					buf := make([]byte, 64)
+					_, _ = conn.Read(buf)
+					if tcp, ok := conn.(*net.TCPConn); ok {
+						_ = tcp.SetLinger(0)
+					}
+					return
+				}
+				// Subsequent attempts: read request, write canned response.
+				_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+				buf := make([]byte, 4096)
+				for {
+					nRead, err := conn.Read(buf)
+					if err != nil || nRead < len(buf) {
+						break
+					}
+				}
+				_, _ = conn.Write([]byte(okResp))
+			}(conn, n)
+		}
+	}()
+	t.Cleanup(func() { ln.Close(); <-done })
+
+	url := fmt.Sprintf("http://%s/checkv2", ln.Addr().String())
+	client := NewClient(url, "", 5*time.Second, slog.Default())
+
+	result, err := client.Check(
+		context.Background(),
+		"Subject: Test\r\n\r\nBody",
+		"1.2.3.4",
+		"sender@example.com",
+		[]string{"recipient@example.com"},
+		"mail.example.com",
+	)
+	if err != nil {
+		t.Fatalf("Expected retry to succeed, got: %v", err)
+	}
+	if result == nil || result.Action != "no action" {
+		t.Fatalf("Unexpected result: %+v", result)
+	}
+	if got := attempts.Load(); got != 2 {
+		t.Errorf("Expected exactly 2 attempts (one broken, one good), got %d", got)
+	}
+}
+
+func TestIsBrokenConnErr(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"context canceled", context.Canceled, false},
+		{"deadline exceeded", context.DeadlineExceeded, false},
+		{"ECONNRESET", fmt.Errorf("wrap: %w", syscall.ECONNRESET), true},
+		{"EPIPE", fmt.Errorf("wrap: %w", syscall.EPIPE), true},
+		{"EOF", fmt.Errorf("wrap: %w", io.EOF), true},
+		{"unexpected EOF", fmt.Errorf("wrap: %w", io.ErrUnexpectedEOF), true},
+		{"random other error", fmt.Errorf("nope"), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isBrokenConnErr(tc.err); got != tc.want {
+				t.Errorf("isBrokenConnErr(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
 	}
 }
 

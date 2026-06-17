@@ -7,12 +7,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -113,6 +115,16 @@ func (l *rspamdHeaderList) UnmarshalJSON(data []byte) error {
 }
 
 // NewClient creates a new rspamd spam check client
+//
+// TODO: give the rspamd client its own *http.Transport with an
+// IdleConnTimeout shorter than rspamd's default keepalive (65s — so
+// ~30s here). Today we share http.DefaultTransport, whose 90s
+// IdleConnTimeout guarantees the 65–90s stale window where pooled
+// sockets RST on next use; the retry in Check papers over that.
+// Optionally, once the transport is dedicated, CloseIdleConnections()
+// could be called before the retry to flush sibling stale sockets
+// from the same pool — safe to do only on a dedicated transport,
+// since the global pool is shared with the rest of the process.
 func NewClient(url, password string, timeout time.Duration, logger *slog.Logger) *Client {
 	if logger == nil {
 		logger = slog.Default()
@@ -137,63 +149,31 @@ func NewClient(url, password string, timeout time.Duration, logger *slog.Logger)
 //   - rcpt: RCPT TO addresses
 //   - helo: HELO/EHLO hostname
 func (c *Client) Check(ctx context.Context, message, clientIP, from string, rcpt []string, helo string) (*CheckResult, error) {
-	// Prepare request
-	req, err := http.NewRequestWithContext(ctx, "POST", c.URL, bytes.NewReader([]byte(message)))
+	msgBytes := []byte(message)
+
+	// rspamd /checkv2 is effectively idempotent, but POSTs are not retried
+	// by the Go http.Client. A stale pooled connection (rspamd closes idle
+	// workers faster than our IdleConnTimeout) surfaces here as RST or EOF
+	// mid-response. Retry once on those transport-level glitches before
+	// surfacing the error.
+	bodyBytes, status, err := c.doCheckOnce(ctx, msgBytes, clientIP, from, rcpt, helo)
+	if err != nil && isBrokenConnErr(err) {
+		c.Logger.Debug("Retrying rspamd request after broken connection", "error", err)
+		bodyBytes, status, err = c.doCheckOnce(ctx, msgBytes, clientIP, from, rcpt, helo)
+	}
 	if err != nil {
-		return nil, fmt.Errorf("failed to create rspamd request: %w", err)
-	}
-
-	// Set rspamd protocol v2 headers
-	req.Header.Set("Content-Type", "text/plain")
-	req.Header.Set("User-Agent", "Mizu-SMTP/1.0")
-
-	// Add message metadata headers
-	if clientIP != "" {
-		req.Header.Set("IP", clientIP)
-	}
-	if from != "" {
-		req.Header.Set("From", from)
-	}
-	if len(rcpt) > 0 {
-		// Rspamd expects multiple Rcpt headers for multiple recipients
-		for _, r := range rcpt {
-			req.Header.Add("Rcpt", r)
-		}
-	}
-	if helo != "" {
-		req.Header.Set("Helo", helo)
-	}
-
-	// Add HTTPCrypt authentication if password is configured
-	if c.Password != "" {
-		nonce := fmt.Sprintf("%d", time.Now().Unix())
-		signature := c.generateHTTPCryptSignature(nonce)
-		req.Header.Set("Password", signature)
-		req.Header.Set("Nonce", nonce)
-	}
-
-	// Send request
-	resp, err := c.HTTPClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("rspamd request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	// Read full response body once for both status-check and decode paths.
-	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1 MiB cap
-	if err != nil {
-		return nil, fmt.Errorf("failed to read rspamd response: %w", err)
+		return nil, err
 	}
 
 	// Rspamd may return 504 when autolearn/statistics fails even though the
 	// scan itself succeeded. The body contains a JSON error (not a scan result),
 	// so we log and return a nil result rather than an error — fail open.
-	if resp.StatusCode != http.StatusOK {
-		if resp.StatusCode == http.StatusGatewayTimeout && isStatisticsError(bodyBytes) {
+	if status != http.StatusOK {
+		if status == http.StatusGatewayTimeout && isStatisticsError(bodyBytes) {
 			c.Logger.Debug("Ignoring rspamd statistics error (autolearn failure)", "body", string(bodyBytes))
 			return &CheckResult{AddHeaders: map[string][]string{}, Symbols: map[string]float64{}}, nil
 		}
-		return nil, fmt.Errorf("rspamd returned status %d: %s", resp.StatusCode, string(bodyBytes))
+		return nil, fmt.Errorf("rspamd returned status %d: %s", status, string(bodyBytes))
 	}
 
 	// Parse JSON response
@@ -253,6 +233,83 @@ func (c *Client) Check(ctx context.Context, message, clientIP, from string, rcpt
 		"symbols_count", len(result.Symbols))
 
 	return result, nil
+}
+
+// doCheckOnce performs a single rspamd /checkv2 round trip, returning the
+// response body and status code. Transport-level failures are returned
+// wrapped with the existing "rspamd request failed" / "failed to read
+// rspamd response" prefixes so the caller can decide whether to retry.
+func (c *Client) doCheckOnce(ctx context.Context, msgBytes []byte, clientIP, from string, rcpt []string, helo string) ([]byte, int, error) {
+	req, err := http.NewRequestWithContext(ctx, "POST", c.URL, bytes.NewReader(msgBytes))
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to create rspamd request: %w", err)
+	}
+
+	// Set rspamd protocol v2 headers
+	req.Header.Set("Content-Type", "text/plain")
+	req.Header.Set("User-Agent", "Mizu-SMTP/1.0")
+
+	// Add message metadata headers
+	if clientIP != "" {
+		req.Header.Set("IP", clientIP)
+	}
+	if from != "" {
+		req.Header.Set("From", from)
+	}
+	if len(rcpt) > 0 {
+		// Rspamd expects multiple Rcpt headers for multiple recipients
+		for _, r := range rcpt {
+			req.Header.Add("Rcpt", r)
+		}
+	}
+	if helo != "" {
+		req.Header.Set("Helo", helo)
+	}
+
+	// Add HTTPCrypt authentication if password is configured.
+	// UnixNano gives distinct nonces for back-to-back retries in the same
+	// second; rspamd treats the nonce as opaque HMAC input so the format
+	// doesn't matter, only that consecutive calls don't collide.
+	if c.Password != "" {
+		nonce := fmt.Sprintf("%d", time.Now().UnixNano())
+		signature := c.generateHTTPCryptSignature(nonce)
+		req.Header.Set("Password", signature)
+		req.Header.Set("Nonce", nonce)
+	}
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return nil, 0, fmt.Errorf("rspamd request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Read full response body once for both status-check and decode paths.
+	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1 MiB cap
+	if err != nil {
+		return nil, resp.StatusCode, fmt.Errorf("failed to read rspamd response: %w", err)
+	}
+	return bodyBytes, resp.StatusCode, nil
+}
+
+// isBrokenConnErr reports whether err looks like a transport-level glitch
+// from a half-dead TCP connection (commonly a pooled keep-alive socket
+// that the server already closed). Context cancellation and deadline
+// exceeded are explicitly excluded so we don't retry past the caller's
+// deadline.
+func isBrokenConnErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	if errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) {
+		return true
+	}
+	return false
 }
 
 // isStatisticsError returns true when the body is an rspamd JSON error whose
