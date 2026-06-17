@@ -12,6 +12,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"syscall"
@@ -176,8 +177,14 @@ func (c *Client) Check(ctx context.Context, message, clientIP, from string, rcpt
 		return nil, fmt.Errorf("rspamd returned status %d: %s", status, string(bodyBytes))
 	}
 
-	// TEMP: log full rspamd response body to investigate empty-action results.
-	c.Logger.Info("Rspamd raw response", "body", string(bodyBytes))
+	// TEMP: dump full rspamd response to stderr to investigate empty-action
+	// results. Bypassing slog so quotes/braces stay readable.
+	var pretty bytes.Buffer
+	if err := json.Indent(&pretty, bodyBytes, "", "  "); err == nil {
+		fmt.Fprintf(os.Stderr, "Rspamd raw response:\n%s\n", pretty.String())
+	} else {
+		fmt.Fprintf(os.Stderr, "Rspamd raw response (unparseable):\n%s\n", string(bodyBytes))
+	}
 
 	// Parse JSON response
 	var rspamdResp rspamdResponse
