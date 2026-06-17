@@ -61,6 +61,7 @@ func TestClient_Check_Spam(t *testing.T) {
 	// Test spam detection
 	result, err := client.Check(
 		context.Background(),
+		"test-trace",
 		"Subject: Get rich quick\r\n\r\nBuy now!",
 		"1.2.3.4",
 		"spammer@bad.com",
@@ -116,6 +117,7 @@ func TestClient_Check_Ham(t *testing.T) {
 
 	result, err := client.Check(
 		context.Background(),
+		"test-trace",
 		"Subject: Legitimate email\r\n\r\nHello!",
 		"10.0.0.1",
 		"user@example.com",
@@ -162,6 +164,7 @@ func TestClient_Check_Reject(t *testing.T) {
 
 	result, err := client.Check(
 		context.Background(),
+		"test-trace",
 		"Subject: Obvious spam\r\n\r\nVirus content",
 		"1.2.3.4",
 		"virus@malware.com",
@@ -212,6 +215,7 @@ func TestClient_Check_HTTPCrypt(t *testing.T) {
 
 	_, err := client.Check(
 		context.Background(),
+		"test-trace",
 		"Subject: Test\r\n\r\nBody",
 		"1.2.3.4",
 		"user@example.com",
@@ -268,6 +272,7 @@ func TestAdapter_Check(t *testing.T) {
 
 	result, err := adapter.Check(
 		context.Background(),
+		"test-trace",
 		"Subject: Spam\r\n\r\nSpam content",
 		"1.2.3.4",
 		"spammer@bad.com",
@@ -315,6 +320,7 @@ func TestAdapter_Check_RejectOnAction(t *testing.T) {
 
 	result, err := adapter.Check(
 		context.Background(),
+		"test-trace",
 		"Subject: Virus\r\n\r\nMalware",
 		"1.2.3.4",
 		"virus@malware.com",
@@ -388,6 +394,7 @@ func TestClient_Check_StringHeaders(t *testing.T) {
 	client := NewClient(server.URL, "", 5*time.Second, slog.Default())
 	result, err := client.Check(
 		context.Background(),
+		"test-trace",
 		"Subject: Test\r\n\r\nBody",
 		"1.2.3.4",
 		"sender@example.com",
@@ -436,6 +443,7 @@ func TestClient_Check_ArrayHeaders(t *testing.T) {
 	client := NewClient(server.URL, "", 5*time.Second, slog.Default())
 	result, err := client.Check(
 		context.Background(),
+		"test-trace",
 		"Subject: Test\r\n\r\nBody",
 		"1.2.3.4",
 		"sender@example.com",
@@ -493,6 +501,7 @@ func TestClient_Check_ArrayHeaders_OrderRespected(t *testing.T) {
 	client := NewClient(server.URL, "", 5*time.Second, slog.Default())
 	result, err := client.Check(
 		context.Background(),
+		"test-trace",
 		"Subject: Test\r\n\r\nBody",
 		"",
 		"sender@example.com",
@@ -538,6 +547,7 @@ func TestClient_Check_NullHeaderDropped(t *testing.T) {
 	client := NewClient(server.URL, "", 5*time.Second, slog.Default())
 	result, err := client.Check(
 		context.Background(),
+		"test-trace",
 		"Subject: Test\r\n\r\nBody",
 		"",
 		"sender@example.com",
@@ -617,6 +627,7 @@ func TestClient_Check_RetryOnBrokenConnection(t *testing.T) {
 
 	result, err := client.Check(
 		context.Background(),
+		"test-trace",
 		"Subject: Test\r\n\r\nBody",
 		"1.2.3.4",
 		"sender@example.com",
@@ -671,6 +682,7 @@ func TestClient_Check_StatisticsError504(t *testing.T) {
 	client := NewClient(server.URL, "", 5*time.Second, slog.Default())
 	result, err := client.Check(
 		context.Background(),
+		"test-trace",
 		"Subject: Test\r\n\r\nBody",
 		"1.2.3.4",
 		"sender@example.com",
@@ -701,6 +713,7 @@ func TestClient_Check_Non_Statistics504(t *testing.T) {
 	client := NewClient(server.URL, "", 5*time.Second, slog.Default())
 	_, err := client.Check(
 		context.Background(),
+		"test-trace",
 		"Subject: Test\r\n\r\nBody",
 		"1.2.3.4",
 		"sender@example.com",

@@ -96,7 +96,7 @@ type RecipientValidationResponse struct {
 
 // SpamChecker defines the interface for external spam checking (rspamd)
 type SpamChecker interface {
-	Check(ctx context.Context, message, clientIP, from string, rcpt []string, helo string) (SpamCheckResult, error)
+	Check(ctx context.Context, traceID, message, clientIP, from string, rcpt []string, helo string) (SpamCheckResult, error)
 }
 
 // SpamCheckResult represents the result of spam checking
@@ -1552,7 +1552,7 @@ func (s *Session) performPreDeliveryChecks(rawEmail string) error {
 
 	// External spam checking (rspamd)
 	if s.spamChecker != nil {
-		result, err := s.spamChecker.Check(context.Background(), rawEmail, s.remoteAddr, s.from, s.to, s.helo)
+		result, err := s.spamChecker.Check(context.Background(), s.traceID, rawEmail, s.remoteAddr, s.from, s.to, s.helo)
 		if err != nil {
 			s.Logger.Warn("Spam check failed", "error", err)
 			if s.metrics != nil {

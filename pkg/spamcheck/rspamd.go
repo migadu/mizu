@@ -149,7 +149,7 @@ func NewClient(url, password string, timeout time.Duration, logger *slog.Logger)
 //   - from: MAIL FROM address
 //   - rcpt: RCPT TO addresses
 //   - helo: HELO/EHLO hostname
-func (c *Client) Check(ctx context.Context, message, clientIP, from string, rcpt []string, helo string) (*CheckResult, error) {
+func (c *Client) Check(ctx context.Context, traceID, message, clientIP, from string, rcpt []string, helo string) (*CheckResult, error) {
 	msgBytes := []byte(message)
 
 	// rspamd /checkv2 is effectively idempotent, but POSTs are not retried
@@ -171,9 +171,9 @@ func (c *Client) Check(ctx context.Context, message, clientIP, from string, rcpt
 	// the status check so we capture 504/statistics-error fail-open bodies too.
 	var pretty bytes.Buffer
 	if err := json.Indent(&pretty, bodyBytes, "", "  "); err == nil {
-		fmt.Fprintf(os.Stderr, "Rspamd raw response (status=%d):\n%s\n", status, pretty.String())
+		fmt.Fprintf(os.Stderr, "Rspamd raw response (trace_id=%s status=%d):\n%s\n", traceID, status, pretty.String())
 	} else {
-		fmt.Fprintf(os.Stderr, "Rspamd raw response (status=%d, unparseable):\n%s\n", status, string(bodyBytes))
+		fmt.Fprintf(os.Stderr, "Rspamd raw response (trace_id=%s status=%d, unparseable):\n%s\n", traceID, status, string(bodyBytes))
 	}
 
 	// Rspamd may return 504 when autolearn/statistics fails even though the
