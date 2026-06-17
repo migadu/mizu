@@ -166,6 +166,16 @@ func (c *Client) Check(ctx context.Context, message, clientIP, from string, rcpt
 		return nil, err
 	}
 
+	// TEMP: dump full rspamd response to stderr to investigate empty-action
+	// results. Bypassing slog so quotes/braces stay readable. Logged BEFORE
+	// the status check so we capture 504/statistics-error fail-open bodies too.
+	var pretty bytes.Buffer
+	if err := json.Indent(&pretty, bodyBytes, "", "  "); err == nil {
+		fmt.Fprintf(os.Stderr, "Rspamd raw response (status=%d):\n%s\n", status, pretty.String())
+	} else {
+		fmt.Fprintf(os.Stderr, "Rspamd raw response (status=%d, unparseable):\n%s\n", status, string(bodyBytes))
+	}
+
 	// Rspamd may return 504 when autolearn/statistics fails even though the
 	// scan itself succeeded. The body contains a JSON error (not a scan result),
 	// so we log and return a nil result rather than an error — fail open.
@@ -175,15 +185,6 @@ func (c *Client) Check(ctx context.Context, message, clientIP, from string, rcpt
 			return &CheckResult{AddHeaders: map[string][]string{}, Symbols: map[string]float64{}}, nil
 		}
 		return nil, fmt.Errorf("rspamd returned status %d: %s", status, string(bodyBytes))
-	}
-
-	// TEMP: dump full rspamd response to stderr to investigate empty-action
-	// results. Bypassing slog so quotes/braces stay readable.
-	var pretty bytes.Buffer
-	if err := json.Indent(&pretty, bodyBytes, "", "  "); err == nil {
-		fmt.Fprintf(os.Stderr, "Rspamd raw response:\n%s\n", pretty.String())
-	} else {
-		fmt.Fprintf(os.Stderr, "Rspamd raw response (unparseable):\n%s\n", string(bodyBytes))
 	}
 
 	// Parse JSON response
