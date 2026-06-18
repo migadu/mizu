@@ -338,6 +338,56 @@ func TestAdapter_Check_RejectOnAction(t *testing.T) {
 	}
 }
 
+func TestAdapter_Check_Defer(t *testing.T) {
+	// rspamd's "soft reject" (rate limiting) and "greylist" (greylisting
+	// module) are both temporary failures: they must map to a defer
+	// regardless of reject_on_action, and must not be classified as spam.
+	for _, action := range []string{"soft reject", "greylist"} {
+		t.Run(action, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				resp := rspamdResponse{
+					Action:        action,
+					Score:         8.0,
+					RequiredScore: 15.0,
+				}
+
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(resp)
+			}))
+			defer server.Close()
+
+			// reject_on_action is "reject", which must NOT match a defer action.
+			client := NewClient(server.URL, "", 5*time.Second, slog.Default())
+			adapter := NewAdapter(client, "X-Junk", "yes", "", "reject")
+
+			result, err := adapter.Check(
+				context.Background(),
+				"test-trace",
+				"Subject: Hello\r\n\r\nBody",
+				"1.2.3.4",
+				"sender@example.com",
+				[]string{"victim@example.com"},
+				"example.com",
+			)
+
+			if err != nil {
+				t.Fatalf("Expected no error, got: %v", err)
+			}
+
+			if !result.ShouldDefer {
+				t.Errorf("Expected ShouldDefer to be true for %q action", action)
+			}
+			if result.ShouldReject {
+				t.Errorf("Expected ShouldReject to be false for %q action", action)
+			}
+			// A temporary failure is not a spam classification.
+			if result.IsSpam {
+				t.Errorf("Expected IsSpam to be false for %q action", action)
+			}
+		})
+	}
+}
+
 func TestRspamdHeader_UnmarshalJSON(t *testing.T) {
 	tests := []struct {
 		name     string

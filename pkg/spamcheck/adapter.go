@@ -59,6 +59,15 @@ func (a *Adapter) Check(ctx context.Context, traceID, message, clientIP, from st
 		adapterResult.ShouldReject = true
 	}
 
+	// rspamd "soft reject" and "greylist" are temporary failures: the sending
+	// MTA should retry later. "soft reject" covers rate limiting and similar
+	// transient conditions; "greylist" is rspamd's greylisting module asking
+	// the sender to retry after a delay. Both are fixed rspamd semantics, not
+	// configurable like rejectOnAction, so always map them to a defer (SMTP 4xx).
+	if strings.EqualFold(result.Action, ActionSoftReject) || strings.EqualFold(result.Action, ActionGreylist) {
+		adapterResult.ShouldDefer = true
+	}
+
 	// Add configured spam/ham header based on result
 	if result.IsSpam && a.spamHeaderValue != "" {
 		adapterResult.AddHeaders[a.spamHeader] = []string{a.spamHeaderValue}

@@ -105,7 +105,8 @@ type SpamCheckResult struct {
 	Action       string              // Rspamd action (e.g., "add header", "reject")
 	Score        float64             // Spam score
 	AddHeaders   map[string][]string // Headers to add (from rspamd milter); each key may map to multiple values when rspamd asks for the same header more than once (e.g. Authentication-Results)
-	ShouldReject bool                // True if message should be rejected based on action
+	ShouldReject bool                // True if message should be permanently rejected (5xx) based on action
+	ShouldDefer  bool                // True if message should be temporarily deferred (4xx), e.g. rspamd "soft reject"
 }
 
 // Backend implements smtp.Backend interface for our custom SMTP server.
@@ -1625,6 +1626,20 @@ func (s *Session) performPreDeliveryChecks(rawEmail string) error {
 				"is_spam", result.IsSpam,
 				"action", result.Action,
 				"score", result.Score)
+
+			// Check if we should defer based on rspamd action ("soft reject").
+			// This is a temporary failure: the sending MTA retries later.
+			if result.ShouldDefer {
+				s.Logger.Warn("Deferring message - spam check action", "action", result.Action, "score", result.Score)
+				if s.metrics != nil {
+					s.metrics.SMTPMessagesRejected.WithLabelValues(s.serverName(), s.serverType(), "spam_soft_reject").Inc()
+				}
+				return &smtp.SMTPError{
+					Code:         451,
+					EnhancedCode: smtp.EnhancedCode{4, 7, 1},
+					Message:      "message deferred, please try again later",
+				}
+			}
 
 			// Check if we should reject based on rspamd action
 			if result.ShouldReject {

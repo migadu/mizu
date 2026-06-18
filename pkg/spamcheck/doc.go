@@ -48,10 +48,11 @@
 //
 // Supported actions:
 //   - "no action": Message is not spam
-//   - "greylist": Temporary rejection (not implemented)
+//   - "greylist": Temporary failure - defer with SMTP 4xx (sender retries later)
 //   - "add header": Add spam header to message
 //   - "rewrite subject": Modify subject line (header provided in milter)
-//   - "reject": Reject message as spam
+//   - "soft reject": Temporary failure - defer with SMTP 4xx (sender retries later)
+//   - "reject": Reject message as spam (5xx, if reject_on_action = "reject")
 //
 // # HTTPCrypt Authentication
 //

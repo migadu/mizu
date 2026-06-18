@@ -20,6 +20,17 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
+// Rspamd actions as returned in the checkv2 response "action" field.
+// See https://rspamd.com/doc/architecture/protocol.html#rspamd-actions
+const (
+	ActionNoAction       = "no action"       // Message is clean (ham)
+	ActionGreylist       = "greylist"        // Greylist: ask sender to retry later
+	ActionAddHeader      = "add header"      // Mark as spam via header
+	ActionRewriteSubject = "rewrite subject" // Mark as spam by rewriting subject
+	ActionSoftReject     = "soft reject"     // Temporary rejection (defer, SMTP 4xx)
+	ActionReject         = "reject"          // Permanent rejection (SMTP 5xx)
+)
+
 // Client is an HTTP client for checking messages against rspamd
 type Client struct {
 	URL        string       // Rspamd URL (e.g., "http://rspamd:11333/checkv2")
@@ -201,7 +212,7 @@ func (c *Client) Check(ctx context.Context, traceID, message, clientIP, from str
 
 	// Determine if message is spam based on action
 	action := strings.ToLower(rspamdResp.Action)
-	result.IsSpam = action == "add header" || action == "rewrite subject" || action == "reject"
+	result.IsSpam = action == ActionAddHeader || action == ActionRewriteSubject || action == ActionReject
 
 	// Extract headers to add from milter section. Rspamd uses `order` to
 	// disambiguate entries that share a header name (e.g. multiple
