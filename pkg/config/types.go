@@ -60,6 +60,7 @@ type ServerConfig struct {
 	DisableMizuHeaders bool `toml:"disable_mizu_headers"` // Disable X-Mizu-* headers (keeps Received header, removes X-Mizu-Trace-ID, X-Mizu-Authentication-Results, X-Mizu-Junk)
 
 	// === Email Validation ===
+	HELOValidation        *bool  `toml:"helo_validation"`         // Validate HELO/EHLO hostname for security (default: true, set to false to disable)
 	SPFCheck              bool   `toml:"spf_check"`               // Enable SPF validation
 	DKIMCheck             bool   `toml:"dkim_check"`              // Enable DKIM validation
 	ARCCheck              bool   `toml:"arc_check"`               // Enable ARC validation
@@ -291,6 +292,12 @@ func (s *ServerConfig) ApplyDefaults(defaults DefaultsConfig) {
 	if s.Validation.LoopDetection == nil {
 		trueVal := true
 		s.Validation.LoopDetection = &trueVal
+	}
+
+	// HELOValidation defaults to true for security (uses pointer to detect unset)
+	if s.HELOValidation == nil {
+		trueVal := true
+		s.HELOValidation = &trueVal
 	}
 }
 

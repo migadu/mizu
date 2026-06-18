@@ -794,8 +794,9 @@ func (s *Session) Helo(hostname string) error {
 		}
 	}
 
-	// Validate HELO hostname for security (skip in local development mode)
-	if !s.globalConfig.Local {
+	// Validate HELO hostname for security (skip in local development mode
+	// or when HELO validation is explicitly disabled via helo_validation = false)
+	if !s.globalConfig.Local && s.heloValidationEnabled() {
 		if err := s.validateHeloHostname(hostname); err != nil {
 			return err
 		}
@@ -811,6 +812,13 @@ func (s *Session) Helo(hostname string) error {
 	}
 
 	return nil
+}
+
+// heloValidationEnabled reports whether HELO/EHLO hostname validation is
+// enabled for this server. It defaults to true when unset (nil) so validation
+// remains on unless an operator explicitly sets helo_validation = false.
+func (s *Session) heloValidationEnabled() bool {
+	return s.serverConfig.HELOValidation == nil || *s.serverConfig.HELOValidation
 }
 
 // validateHeloHostname checks a HELO/EHLO hostname for security issues.
@@ -942,7 +950,7 @@ func (s *Session) Mail(from string, opts *smtp.MailOptions) error {
 		if heloHostname != "" && s.helo == "" {
 			// EHLO was handled by go-smtp internally — run the same
 			// validation that the explicit Helo() path uses.
-			if !s.globalConfig.Local {
+			if !s.globalConfig.Local && s.heloValidationEnabled() {
 				if err := s.validateHeloHostname(heloHostname); err != nil {
 					return err
 				}

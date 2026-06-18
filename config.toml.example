@@ -12,6 +12,7 @@
 # max_connection_duration_seconds = 300                 # Max connection duration in seconds before force-release (default: 300 = 5m, 0 = disabled)
 #
 # # Email Authentication & Validation
+# helo_validation = true                                # Validate HELO/EHLO hostname for security: rejects spoofed/own hostname, bare IPs, single-label names (default: true)
 # spf_check = true                                      # Enable SPF (Sender Policy Framework) validation (default: false)
 # dmarc_check = true                                    # Enable DMARC validation (default: false) - requires SPF check enabled
 # dmarc_reject_action = "reject"                        # Action for DMARC policy=reject: "reject", "junk", "none" (default: "reject")

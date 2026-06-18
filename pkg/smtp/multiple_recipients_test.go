@@ -91,6 +91,17 @@ func TestMultipleRecipients_DeliveryToBackend(t *testing.T) {
 		if !strings.Contains(p.body, "This is a test email") {
 			t.Errorf("POST %d: expected email body to contain test message", i)
 		}
+		// Each delivered copy must carry the X-Envelope-To for its own recipient.
+		envelopeHeader := "X-Envelope-To: " + expectedRecipients[i] + "\r\n"
+		if !strings.Contains(p.body, envelopeHeader) {
+			t.Errorf("POST %d: expected body to contain %q, got:\n%s", i, envelopeHeader, p.body)
+		}
+		// And only that recipient's address — not another recipient's copy.
+		for j, other := range expectedRecipients {
+			if j != i && strings.Contains(p.body, "X-Envelope-To: "+other) {
+				t.Errorf("POST %d: leaked X-Envelope-To for recipient %q", i, other)
+			}
+		}
 	}
 }
 
