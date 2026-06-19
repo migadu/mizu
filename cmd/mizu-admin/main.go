@@ -851,17 +851,14 @@ func handleTLSList(ctx context.Context) {
 	}
 
 	// Initialize storage backend
-	backend, err := initStorageBackend(ctx, cfg)
+	backend, prefix, err := initCertBackend(ctx, cfg)
 	if err != nil {
-		fatal("Failed to initialize storage backend: %v", err)
+		fatal("Failed to initialize certificate storage backend: %v", err)
 	}
 
 	fmt.Println("Listing certificates in storage...")
 	fmt.Println()
 
-	// List objects with autocert prefix (certs/ + autocert/)
-	// The server stores certs at: S3Prefix + "certs/" + "autocert/"
-	prefix := cfg.Storage.S3Prefix + "certs/autocert/"
 	objects, err := backend.ListObjects(ctx, prefix, true)
 	if err != nil {
 		fatal("Failed to list certificates: %v", err)
@@ -962,9 +959,9 @@ func handleTLSDelete(ctx context.Context) {
 	}
 
 	// Initialize storage backend
-	backend, err := initStorageBackend(ctx, cfg)
+	backend, prefix, err := initCertBackend(ctx, cfg)
 	if err != nil {
-		fatal("Failed to initialize storage backend: %v", err)
+		fatal("Failed to initialize certificate storage backend: %v", err)
 	}
 
 	fmt.Printf("Deleting certificate for domain: %s\n", domain)
@@ -972,9 +969,7 @@ func handleTLSDelete(ctx context.Context) {
 	fmt.Println("The server will automatically request a new certificate on next use.")
 	fmt.Println()
 
-	// Compute S3 keys for both ECDSA and RSA variants
-	// Certificates are stored with plain domain names: prefix + domain, prefix + domain+rsa
-	prefix := cfg.Storage.S3Prefix + "certs/autocert/"
+	// Compute keys for both ECDSA and RSA variants at the cert storage prefix.
 	ecdsaKey := prefix + domain
 	rsaKey := prefix + domain + "+rsa"
 
@@ -1034,16 +1029,14 @@ func handleTLSClean(ctx context.Context) {
 	}
 
 	// Initialize storage backend
-	backend, err := initStorageBackend(ctx, cfg)
+	backend, prefix, err := initCertBackend(ctx, cfg)
 	if err != nil {
-		fatal("Failed to initialize storage backend: %v", err)
+		fatal("Failed to initialize certificate storage backend: %v", err)
 	}
 
 	fmt.Println("Cleaning up expired and invalid certificates...")
 	fmt.Println()
 
-	// List objects with autocert prefix
-	prefix := cfg.Storage.S3Prefix + "certs/autocert/"
 	objects, err := backend.ListObjects(ctx, prefix, true)
 	if err != nil {
 		fatal("Failed to list certificates: %v", err)
@@ -1152,9 +1145,9 @@ func handleTLSCache(ctx context.Context) {
 	}
 
 	// Initialize storage backend
-	backend, err := initStorageBackend(ctx, cfg)
+	backend, prefix, err := initCertBackend(ctx, cfg)
 	if err != nil {
-		fatal("Failed to initialize storage backend: %v", err)
+		fatal("Failed to initialize certificate storage backend: %v", err)
 	}
 
 	fmt.Printf("Syncing certificates from storage to local cache: %s\n", cfg.TLS.LetsEncrypt.CacheDir)
@@ -1165,8 +1158,6 @@ func handleTLSCache(ctx context.Context) {
 		fatal("Failed to create cache directory: %v", err)
 	}
 
-	// List objects with autocert prefix
-	prefix := cfg.Storage.S3Prefix + "certs/autocert/"
 	objects, err := backend.ListObjects(ctx, prefix, true)
 	if err != nil {
 		fatal("Failed to list certificates: %v", err)
@@ -1324,41 +1315,47 @@ type CertificateInfo struct {
 	Issuer       string
 }
 
-func initStorageBackend(ctx context.Context, cfg *config.Config) (storage.Backend, error) {
-	switch cfg.Storage.Backend {
-	case "s3":
-		// Initialize S3 backend using AWS SDK v2
+// initCertBackend builds the storage backend and key prefix where mizu-server
+// stores Let's Encrypt certificates. It MUST mirror pkg/tls (manager.go): the
+// server uses the dedicated [tls.letsencrypt.s3] settings in "s3" mode (or the
+// local cache_dir in "file" mode) with autocert's flat key layout — keys are
+// "<prefix><domain>", NOT under a "certs/autocert/" infix, and NOT in the global
+// [storage] bucket.
+func initCertBackend(ctx context.Context, cfg *config.Config) (storage.Backend, string, error) {
+	le := cfg.TLS.LetsEncrypt
+	switch le.StorageProvider {
+	case "", "s3":
 		awsCfg, err := awsconfig.LoadDefaultConfig(ctx,
-			awsconfig.WithRegion(cfg.Storage.S3Region),
+			awsconfig.WithRegion(le.S3.Region),
 			awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
-				cfg.Storage.S3AccessKey,
-				cfg.Storage.S3SecretKey,
+				le.S3.AccessKey,
+				le.S3.SecretKey,
 				"",
 			)),
 		)
 		if err != nil {
-			return nil, fmt.Errorf("failed to load AWS config: %w", err)
+			return nil, "", fmt.Errorf("failed to load AWS config: %w", err)
 		}
 
 		s3Client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
-			// Custom endpoint resolver for non-AWS S3 services
-			if cfg.Storage.S3Endpoint != "" {
-				o.BaseEndpoint = aws.String(cfg.Storage.S3Endpoint)
+			// Custom endpoint for non-AWS S3 services (Backblaze B2, MinIO, …).
+			if le.S3.Endpoint != "" {
+				o.BaseEndpoint = aws.String(le.S3.Endpoint)
 				o.UsePathStyle = true
 			}
 		})
 
-		return storage.NewS3Backend(s3Client, cfg.Storage.S3Bucket, nil), nil
+		return storage.NewS3Backend(s3Client, le.S3.Bucket, nil), le.S3.Prefix, nil
 
-	case "filesystem":
-		backend, err := storage.NewFilesystemBackend(cfg.Storage.FilesystemPath, nil)
+	case "file":
+		backend, err := storage.NewFilesystemBackend(le.CacheDir, nil)
 		if err != nil {
-			return nil, fmt.Errorf("failed to init filesystem backend: %w", err)
+			return nil, "", fmt.Errorf("failed to init filesystem backend: %w", err)
 		}
-		return backend, nil
+		return backend, "", nil
 
 	default:
-		return nil, fmt.Errorf("unsupported storage backend: %s", cfg.Storage.Backend)
+		return nil, "", fmt.Errorf("unsupported tls.letsencrypt.storage_provider: %s", le.StorageProvider)
 	}
 }
 
