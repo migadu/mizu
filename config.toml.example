@@ -1,135 +1,3 @@
-# Define one or more SMTP servers with individual configurations
-# Example server configurations:
-#
-# [[server]]
-# name = "relay"
-# listen_addr = ":25"
-# disable_mizu_headers = false                          # Disable X-Mizu-* headers (keeps Received header, removes X-Mizu-Trace-ID, X-Mizu-Authentication-Results, X-Mizu-Junk)
-#
-# [server.limits]
-# max_connections = 1000                                # Max total connections for this server
-# max_connections_per_ip = 10                           # Max connections per IP
-# max_connection_duration_seconds = 300                 # Max connection duration in seconds before force-release (default: 300 = 5m, 0 = disabled)
-#
-# # Email Authentication & Validation
-# helo_validation = true                                # Validate HELO/EHLO hostname for security: rejects spoofed/own hostname, bare IPs, single-label names (default: true)
-# spf_check = true                                      # Enable SPF (Sender Policy Framework) validation (default: false)
-# dmarc_check = true                                    # Enable DMARC validation (default: false) - requires SPF check enabled
-# dmarc_reject_action = "reject"                        # Action for DMARC policy=reject: "reject", "junk", "none" (default: "reject")
-# dmarc_quarantine_action = "junk"                      # Action for DMARC policy=quarantine: "reject", "junk", "none" (default: "junk")
-# arc_check = true                                      # Enable ARC (Authenticated Received Chain) validation (default: false) - preserves auth through forwarding
-#
-# [server.sender_validation]
-# enabled = true                                    # Enable sender validation during MAIL FROM
-# url = "https://api.example.com/validate/sender?ip=$ip&from=$email"
-# auth_token = "DiNciQbKphGdskCQ0JUqqRCVD"         # Bearer token for API authentication
-# http_timeout_seconds = 5                          # HTTP request timeout
-# cache_ttl_seconds = 300                           # Cache successful validations for 5 minutes
-# # Sender Validation API contract (GET request with URL interpolation):
-# #   URL supports placeholders: $ip, $ptr, $helo, $email (or $from)
-# #   Headers: Authorization: Bearer <auth_token>
-# #            X-Auth-User: <authenticated_user> (only if user authenticated via SMTP AUTH)
-# #   Response 200 OK: Sender accepted (optional JSON: {"message": "custom text"})
-# #   Response 404 Not Found: Sender not authorized
-# #   Response 403 Forbidden: Sender address rejected/blocked
-# #   Response 429 Too Many Requests: Rate limit exceeded (temporary failure)
-# #   Response 502/503/504: Temporary backend failures (retry later)
-# [server.recipient_validation]
-# enabled = true                                    # Enable recipient validation during RCPT TO
-# url = "https://api.example.com/validate/recipient?ip=$ip&from=$from&to=$email"
-# auth_token = "DiNciQbKphGdskCQ0JUqqRCVD"         # Bearer token for API authentication
-# http_timeout_seconds = 5                          # HTTP request timeout
-# cache_ttl_seconds = 300                           # Cache successful validations for 5 minutes
-# # Recipient Validation API contract (same as sender validation above)
-# [server.validation]
-# loop_detection = true                             # Enable mail loop detection (default: true) - prevents infinite loops by checking Received headers
-# max_hops = 30                                     # Maximum hops before rejecting as loop (default: 30, RFC 5321 recommends 100)
-# allow_null_sender = true                          # Allow bounce messages with null sender <> (default: true for relay, false for submission)
-# missing_headers_action = "fix"                    # Action for missing Date/Message-ID: "reject", "fix", "none" (default: "reject" for submission, "fix" for relay)
-#
-# [server.reputation]
-# enabled = false                                   # Enable reputation checking (default: false - opt-in for production deployments)
-# min_ip_score = -0.2                               # Minimum IP reputation score (default: -0.2, range: -1.0 to 1.0) - IPs below this are rejected
-# min_domain_score = -0.2                           # Minimum domain reputation score (default: -0.2, range: -1.0 to 1.0) - domains below this are rejected
-# reject_code = 421                                 # SMTP code for reputation rejection (default: 421, common: 421=temp fail, 450=temp fail, 451=local error, 550=perm fail)
-# reject_message = "poor reputation, please try again later"  # Custom rejection message
-# whitelist_ips = ["1.2.3.4", "10.0.0.0/8"]         # IPs/CIDRs to whitelist - bypass reputation checks (e.g., monitoring services)
-# whitelist_hosts = ["hetrixtools.com", "pingdom.com"]  # PTR hostnames to whitelist - suffix match (e.g., "wk9-4.hetrixtools.com" matches "hetrixtools.com")
-#
-# [server.reputation.dnsbl]
-# enabled = false                                   # Enable DNSBL checking that feeds into reputation (default: false)
-# ipv4_lists = ["zen.spamhaus.org", "bl.spamcop.net"]  # DNS blacklist servers for IPv4
-# ipv6_lists = ["zen.spamhaus.org"]                 # DNS blacklist servers for IPv6
-# timeout_seconds = 3                               # Timeout for DNSBL queries (default: 3)
-# weight = 5                                        # Negative reputation weight for DNSBL hits (default: 5, range similar to other weights: 1-10)
-#
-# [server.dns_checks]
-# require_rdns = false                              # Require reverse DNS for sender IP (default: false)
-# require_sender_mx = false                         # Require sender domain to have MX records (default: false)
-# require_resolvable_helo = false                   # Require HELO hostname to have DNS records (default: false)
-#
-# [server.spam_check]
-# enabled = false                                   # Enable external spam checking via rspamd (default: false)
-# url = "http://rspamd:11333/checkv2"               # Rspamd HTTP endpoint (protocol v2)
-# password = ""                                     # HTTPCrypt password for rspamd authentication (optional)
-# http_timeout_seconds = 15                         # HTTP request timeout (default: 15)
-# spam_header = "X-Junk"                            # Header name to add when spam detected (default: "X-Junk")
-# spam_header_value = "yes"                         # Header value for spam messages (default: "yes")
-# ham_header_value = ""                             # Header value for ham/not spam (default: "", empty = don't add header for ham)
-# reject_on_action = ""                             # Reject if rspamd action matches this value (e.g., "reject", empty = never reject based on action)
-# # Rspamd actions: "reject", "add header", "rewrite subject", "greylist", "no action"
-# # If spam detected but not rejected, spam_header will be added to the message
-#
-# [server.delivery]
-# url = "https://backend.example.com/incoming"
-# auth_token = "${DELIVERY_AUTH_TOKEN}"
-# max_retry_attempts = 3                                # Number of delivery attempts with exponential backoff (default: 3)
-# http_timeout_seconds = 30                             # HTTP client timeout per request (default: 30)
-# max_idle_conns_per_host = 100                         # Idle connections kept per backend host (default: 100, Go default is only 2)
-# max_conns_per_host = 0                                # Max total connections per host (default: 0 = unlimited, set to match backend capacity)
-# idle_conn_timeout_seconds = 90                        # How long idle connections stay in pool before closing (default: 90)
-#
-# [[server]]
-# name = "submission"
-# listen_addr = ":587"
-# disable_mizu_headers = false                          # Disable X-Mizu-* headers (useful for outbound servers that don't need debugging headers)
-#
-# [server.reputation]
-# enabled = false                                   # Disable reputation checking for submission servers (default: false)
-#
-# [server.auth]
-# enabled = true                                    # Enable SMTP AUTH
-# required = true                                   # Require authentication before MAIL FROM
-# url = "https://auth.example.com/api/users/$email?ip=$ip"
-# auth_token = "${AUTH_TOKEN}"                      # Bearer token (supports env vars)
-# # Authentication API contract (GET request):
-# #   Response 200: {"password_hashes": ["$2a$10$...", "{SSHA512}..."], "allowed_from": ["user@example.com"]}
-# #   Response 404: User not found
-# # Supported password hash formats: bcrypt ($2a$, $2b$, $2y$, {BLF-CRYPT}), SSHA512 ({SSHA512}, {SSHA512.b64}, {SSHA512.HEX}), SHA512 ({SHA512}, {SHA512.b64}, {SHA512.HEX})
-#
-# # Auth cache - ENABLED BY DEFAULT for brute force protection
-# # Omit this section to use defaults, or customize as needed
-# [server.auth.cache]
-# enabled = true                                    # Enable authentication result caching (DEFAULT: true)
-# positive_ttl = "5m"                              # Cache successful auth for 5 minutes (DEFAULT: "5m")
-# negative_ttl = "1m"                              # Cache failed auth for 1 minute (DEFAULT: "1m")
-# max_size = 50000                                 # Maximum cache entries (DEFAULT: 50000)
-# cleanup_interval = "5m"                          # How often to cleanup expired entries (DEFAULT: "5m")
-# positive_revalidation_window = "30s"             # Revalidate successful auth if older than this (DEFAULT: "30s")
-# # To disable (NOT RECOMMENDED): set enabled = false
-# # WARNING: Disabling removes brute force protection - every failed auth hits your backend API
-# [server.tls]
-# mode = "starttls"                                 # "starttls" or "implicit" (for port 465)
-# min_tls_version = "1.2"                           # "1.2" or "1.3" (default 1.2)
-# max_tls_version = "1.2"                            # "1.2" or "1.3" (empty = no cap). Set "1.2" on the
-#                                                   #   inbound MX for Exchange Online interop: its SChannel
-#                                                   #   stack misclassifies Go's TLS 1.3 handshake as a
-#                                                   #   renegotiation and aborts ("451 4.4.0 Security status
-#                                                   #   Renegotiate").
-# [server.delivery]
-# url = "https://backend.example.com/incoming"
-# auth_token = "${DELIVERY_AUTH_TOKEN}"
-
 server = []
 local = false
 
@@ -141,9 +9,9 @@ shutdown_timeout_seconds = 60
 max_connections = 100
 
 [logging]
-level = "info"       # debug, info, warn, error
-format = "console"   # console (human-readable), json (structured)
-output = "syslog"    # stderr, stdout, syslog, or /path/to/file.log
+level = "info"
+format = "console"
+output = "syslog"
 
 [dns]
 resolvers = []
@@ -154,10 +22,8 @@ cache_negative_ttl = 60
 [storage]
 backend = "s3"
 filesystem_path = "/var/lib/mizu/storage"
-s3_endpoint = "https://s3.amazonaws.com"  # Full URL including https://
+s3_endpoint = "s3.amazonaws.com"
 s3_bucket = "email-mx-certs"
-# Base prefix for all S3 keys (e.g., "myapp/" → myapp/certs/, myapp/stats/, myapp/connections/).
-# Subdirectories are appended automatically. Do NOT use "certs/" here — it would create "certs/certs/".
 s3_prefix = ""
 s3_access_key = ""
 s3_secret_key = ""
@@ -165,24 +31,23 @@ s3_region = "us-east-1"
 
 [tls]
 enabled = false
-provider = "file"             # "file" (cert/key on disk) or "letsencrypt" (automatic ACME)
-
+provider = "file"
 [tls.file]
-cert_file = ""                # Path to PEM certificate file (provider=file only)
-key_file = ""                 # Path to PEM private key file (provider=file only)
-
+cert_file = ""
+key_file = ""
 [tls.letsencrypt]
 email = "admin@example.com"
 domains = []
-default_domain = ""           # Defaults to first entry of `domains` if empty
-storage_provider = "s3"       # "s3" (hybrid file+S3 cache) or "file" (local only)
-cache_dir = ""                # Local cache dir (file mode) or fallback dir (s3 mode); defaults to "cert-cache"
-sync_interval_minutes = 5     # Periodic local→S3 sync (s3 mode only)
-
+default_domain = ""
+storage_provider = "s3"
+cache_dir = ""
+sync_interval_minutes = 5
+staging = false
+renew_before_days = 30
 [tls.letsencrypt.s3]
 bucket = ""
-region = "us-east-1"
-endpoint = ""                 # Custom S3 endpoint (Backblaze B2, MinIO, etc.); empty = AWS default
+region = ""
+endpoint = ""
 prefix = ""
 access_key = ""
 secret_key = ""
@@ -195,18 +60,19 @@ password = ""
 
 [metrics]
 enabled = true
+bind = ":9091"
 path = "/metrics"
 username = ""
 password = ""
 
 [stats]
 enabled = true
-retention_seconds = 86400          # How long to keep stats (24 hours)
-sync_enabled = false                # Enable cluster-wide stats sync via S3
-sync_interval_seconds = 60          # How often to sync stats (1 minute)
-max_ip_entries = 100000             # Maximum IP entries to track
-max_domain_entries = 50000          # Maximum domain entries to track
-buffer_size = 100000                # Event channel buffer size (increase if seeing "channel is full" warnings)
+retention_seconds = 86400
+sync_enabled = false
+sync_interval_seconds = 60
+max_ip_entries = 100000
+max_domain_entries = 50000
+buffer_size = 100000
 
 [cluster]
 enabled = false
@@ -215,66 +81,3 @@ port = 7946
 node_name = ""
 peers = []
 secret_key = ""
-
-# Rate Limiting Configuration
-# Available dimension keys: IP, FROM, FROM_DOMAIN, TO, TO_DOMAIN, AUTHENTICATED_USER
-# Keys can be combined to create composite rate limits (e.g., ["IP", "FROM"] limits per IP+sender combination)
-#
-# [server.rate_limit]
-# enabled = true
-# gossip_enabled = false                    # Share rate limit state across cluster
-# gossip_interval_seconds = 5               # How often to gossip rate limit data
-#
-# # Whitelist Configuration - Exempt trusted domains/senders from ALL rate limits
-# whitelisted_domains = ["example.com", "trusted.org"]           # Domains exempt from rate limits
-# whitelisted_senders = ["admin@example.com", "noreply@app.com"] # Specific email addresses exempt from rate limits
-#
-# # Example: Per-IP rate limiting (100 emails per hour from any single IP)
-# [[server.rate_limit.dimensions]]
-# name = "per_ip"
-# keys = ["IP"]
-# limit = 100
-# window_seconds = 3600
-#
-# # Example: Per-sender domain rate limiting (500 emails per hour from any single domain)
-# [[server.rate_limit.dimensions]]
-# name = "per_sender_domain"
-# keys = ["FROM_DOMAIN"]
-# limit = 500
-# window_seconds = 3600
-#
-# # Example: Per-recipient rate limiting (200 emails per hour to any single recipient)
-# [[server.rate_limit.dimensions]]
-# name = "per_recipient"
-# keys = ["TO"]
-# limit = 200
-# window_seconds = 3600
-#
-# # Example: Per-recipient domain rate limiting (1000 emails per hour to any single domain)
-# [[server.rate_limit.dimensions]]
-# name = "per_recipient_domain"
-# keys = ["TO_DOMAIN"]
-# limit = 1000
-# window_seconds = 3600
-#
-# # Example: Per-authenticated-user rate limiting (100 emails per hour per user)
-# # Requires SMTP AUTH (submission server on ports 587/465)
-# [[server.rate_limit.dimensions]]
-# name = "per_user_hourly"
-# keys = ["AUTHENTICATED_USER"]
-# limit = 100
-# window_seconds = 3600
-#
-# # Example: Composite rate limiting (50 emails per 10 minutes from specific IP+sender combination)
-# [[server.rate_limit.dimensions]]
-# name = "per_ip_and_sender"
-# keys = ["IP", "FROM"]
-# limit = 50
-# window_seconds = 600
-#
-# # Example: Burst protection (10 emails per minute from any IP)
-# [[server.rate_limit.dimensions]]
-# name = "burst_protection"
-# keys = ["IP"]
-# limit = 10
-# window_seconds = 60

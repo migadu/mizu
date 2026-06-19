@@ -475,6 +475,8 @@ type TLSLetsEncryptConfig struct {
 	StorageProvider     string      `toml:"storage_provider"`      // "s3" or "file" (default: "s3")
 	CacheDir            string      `toml:"cache_dir"`             // Local cache dir (file mode) or fallback dir (s3 mode)
 	SyncIntervalMinutes int         `toml:"sync_interval_minutes"` // Local→S3 sync interval (default: 5 minutes; only applies when storage_provider="s3")
+	Staging             bool        `toml:"staging"`               // Use Let's Encrypt staging environment for testing (issued certs are untrusted)
+	RenewBeforeDays     int         `toml:"renew_before_days"`     // Days before expiry to renew (default: 30)
 	S3                  TLSS3Config `toml:"s3"`                    // S3 credentials and bucket for certificate storage
 }
 
@@ -534,6 +536,8 @@ func DefaultConfig() Config {
 				StorageProvider:     "s3",
 				CacheDir:            "",
 				SyncIntervalMinutes: 5,
+				Staging:             false,
+				RenewBeforeDays:     30,
 			},
 		},
 		Health: HealthConfig{

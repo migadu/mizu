@@ -16,6 +16,7 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/acme/autocert"
 )
 
@@ -34,6 +35,8 @@ type LetsEncryptConfig struct {
 	StorageProvider     string // "s3" or "file"
 	CacheDir            string // local cache dir (file mode) or fallback dir (s3 mode)
 	SyncIntervalMinutes int    // periodic local→S3 sync interval (default 5)
+	Staging             bool   // use Let's Encrypt staging environment (issued certs untrusted)
+	RenewBeforeDays     int    // days before expiry to renew (0 = autocert default, 30)
 	S3                  S3Config
 }
 
@@ -125,6 +128,21 @@ func NewManager(ctx context.Context, cfg *Config, logger *slog.Logger, isLeaderF
 		Email:      cfg.LetsEncrypt.Email,
 	}
 
+	// Override autocert's 30-day default renewal window when configured.
+	if cfg.LetsEncrypt.RenewBeforeDays > 0 {
+		autocertMgr.RenewBefore = time.Duration(cfg.LetsEncrypt.RenewBeforeDays) * 24 * time.Hour
+	}
+
+	// Point at Let's Encrypt staging for testing. Staging certs are signed by an
+	// untrusted root, so clients won't validate them — use only to exercise the
+	// issuance flow without consuming production rate limits.
+	if cfg.LetsEncrypt.Staging {
+		autocertMgr.Client = &acme.Client{
+			DirectoryURL: "https://acme-staging-v02.api.letsencrypt.org/directory",
+		}
+		logger.Warn("TLS: using Let's Encrypt STAGING environment — issued certificates are NOT trusted by clients")
+	}
+
 	defaultDomain := cfg.LetsEncrypt.DefaultDomain
 	if defaultDomain == "" && len(cfg.LetsEncrypt.Domains) > 0 {
 		defaultDomain = cfg.LetsEncrypt.Domains[0]
@@ -188,6 +206,15 @@ func NewManager(ctx context.Context, cfg *Config, logger *slog.Logger, isLeaderF
 				"error_type", fmt.Sprintf("%T", err))
 			return nil, fmt.Errorf("%w for %s: %v", ErrCertificateUnavailable, serverName, err)
 		}
+		// A leaf-only chain (no intermediates) makes strict clients — notably
+		// Outlook / Exchange Online — abort the handshake. Skip TLS-ALPN-01 token
+		// certs, which are intentionally single self-signed certs.
+		isALPNChallenge := len(hello.SupportedProtos) == 1 && hello.SupportedProtos[0] == acme.ALPNProto
+		if !isALPNChallenge && cert != nil && len(cert.Certificate) <= 1 {
+			logger.Warn("TLS: certificate chain may be incomplete (no intermediates) — Outlook/Exchange Online require the full chain",
+				"domain", serverName,
+				"chain_length", len(cert.Certificate))
+		}
 		logger.Debug("TLS: certificate provided successfully", "domain", serverName)
 		return cert, nil
 	}
@@ -205,14 +232,15 @@ func NewManager(ctx context.Context, cfg *Config, logger *slog.Logger, isLeaderF
 
 // TLSConfig returns the TLS configuration for use with HTTP/SMTP servers.
 func (m *Manager) TLSConfig() *tls.Config {
-	if m == nil {
+	if m == nil || m.tlsConfig == nil {
 		return nil
 	}
-	if m.tlsConfig != nil {
-		m.logger.Debug("TLSConfig retrieved (using cached wrapped config)",
-			"has_get_certificate", m.tlsConfig.GetCertificate != nil)
-	}
-	return m.tlsConfig
+	// Return a clone so callers can safely mutate fields (NextProtos, MinVersion,
+	// SessionTicketsDisabled, …) for their own use — e.g. SMTP servers strip
+	// autocert's ALPN protos — without corrupting the shared config that other
+	// consumers rely on, notably the :443 TLS-ALPN-01 challenge server which needs
+	// autocert's "acme-tls/1" ALPN proto left intact.
+	return m.tlsConfig.Clone()
 }
 
 // HTTPHandler returns an HTTP handler for ACME HTTP-01 challenges. Register at

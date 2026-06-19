@@ -147,9 +147,26 @@ func main() {
 		}
 		logger.Info("initTLS completed", "tlsMgr_nil", tlsMgr == nil, "tlsConfig_nil", tlsConfig == nil)
 
-		// Start ACME HTTP-01 challenge server (only for Let's Encrypt)
+		// Start ACME challenge servers (only for Let's Encrypt)
 		if tlsMgr != nil {
-			logger.Info("TLS manager initialized successfully - starting ACME challenge server")
+			logger.Info("TLS manager initialized successfully - starting ACME challenge servers")
+			// Start HTTPS server on port 443 for TLS-ALPN-01 challenges (primary method).
+			// Without this, autocert still attempts tls-alpn-01 first and fails the
+			// authorization (connection refused on :443) before falling back to http-01,
+			// burning a failed validation against Let's Encrypt rate limits on every issue/renew.
+			concurrency.SafeGo(logger, "acme-tls-alpn-server", func() {
+				logger.Info("Starting HTTPS server for ACME TLS-ALPN-01 challenges on :443")
+				server := &http.Server{
+					Addr:      ":443",
+					TLSConfig: tlsMgr.TLSConfig(),
+				}
+				// Empty cert/key files - TLSConfig.GetCertificate handles everything.
+				if err := server.ListenAndServeTLS("", ""); err != nil {
+					logger.Error("TLS-ALPN-01 challenge server failed", "error", err)
+				}
+			})
+
+			// Start HTTP server on port 80 for HTTP-01 challenges (fallback).
 			concurrency.SafeGo(logger, "acme-http-server", func() {
 				logger.Info("Starting HTTP server for ACME HTTP-01 challenges on :80")
 				if err := http.ListenAndServe(":80", tlsMgr.HTTPHandler()); err != nil {
@@ -570,6 +587,8 @@ func initTLS(ctx context.Context, cfg *config.Config, clusterMgr *cluster.Cluste
 				StorageProvider:     cfg.TLS.LetsEncrypt.StorageProvider,
 				CacheDir:            cfg.TLS.LetsEncrypt.CacheDir,
 				SyncIntervalMinutes: cfg.TLS.LetsEncrypt.SyncIntervalMinutes,
+				Staging:             cfg.TLS.LetsEncrypt.Staging,
+				RenewBeforeDays:     cfg.TLS.LetsEncrypt.RenewBeforeDays,
 				S3: tlsmgr.S3Config{
 					Bucket:    cfg.TLS.LetsEncrypt.S3.Bucket,
 					Region:    cfg.TLS.LetsEncrypt.S3.Region,
@@ -593,11 +612,15 @@ func initTLS(ctx context.Context, cfg *config.Config, clusterMgr *cluster.Cluste
 
 		logger.Info(fmt.Sprintf("Autocert initialized for domains: %v", cfg.TLS.LetsEncrypt.Domains))
 
+		// tlsMgr.TLSConfig() returns a fresh clone, so these mutations customize the
+		// SMTP-facing config only and never touch the shared config used by the
+		// dedicated :443 TLS-ALPN-01 challenge server (which keeps autocert's
+		// "acme-tls/1" ALPN proto intact).
 		tlsConfig.MinVersion = tls.VersionTLS12
 
 		// autocert sets NextProtos to ["h2", "http/1.1", "acme-tls/1"] which break
-		// strict SMTP clients (e.g. Exchange Online). ACME TLS-ALPN-01 is not used
-		// here — ACME challenges are served via HTTPHandler on port 80.
+		// strict SMTP clients (e.g. Exchange Online). Strip them for SMTP use;
+		// TLS-ALPN-01 is served by the dedicated :443 server.
 		tlsConfig.NextProtos = nil
 
 		// Go's TLS 1.3 sends NewSessionTicket after the handshake; Exchange Online /
