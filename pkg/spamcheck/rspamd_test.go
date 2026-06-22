@@ -143,6 +143,70 @@ func TestClient_Check_Ham(t *testing.T) {
 	}
 }
 
+func TestClient_Check_QueueIDHeader(t *testing.T) {
+	// Mock rspamd server that records the Queue-ID header it receives.
+	var receivedQueueID string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedQueueID = r.Header.Get("Queue-ID")
+
+		resp := rspamdResponse{Action: "no action", Score: 0.0, RequiredScore: 5.0}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "", 5*time.Second, slog.Default())
+
+	_, err := client.Check(
+		context.Background(),
+		"trace-abc-123",
+		"Subject: Hello\r\n\r\nBody",
+		"10.0.0.1",
+		"user@example.com",
+		[]string{"recipient@example.com"},
+		"mail.example.com",
+	)
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+
+	if receivedQueueID != "trace-abc-123" {
+		t.Errorf("Expected Queue-ID header 'trace-abc-123', got '%s'", receivedQueueID)
+	}
+}
+
+func TestClient_Check_QueueIDHeaderOmittedWhenEmpty(t *testing.T) {
+	// An empty trace ID must not produce a blank Queue-ID header.
+	var queueIDPresent bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, queueIDPresent = r.Header["Queue-Id"]
+
+		resp := rspamdResponse{Action: "no action", Score: 0.0, RequiredScore: 5.0}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "", 5*time.Second, slog.Default())
+
+	_, err := client.Check(
+		context.Background(),
+		"",
+		"Subject: Hello\r\n\r\nBody",
+		"10.0.0.1",
+		"user@example.com",
+		[]string{"recipient@example.com"},
+		"mail.example.com",
+	)
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+
+	if queueIDPresent {
+		t.Error("Expected no Queue-ID header when trace ID is empty")
+	}
+}
+
 func TestClient_Check_Reject(t *testing.T) {
 	// Mock rspamd server that returns "reject" action
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

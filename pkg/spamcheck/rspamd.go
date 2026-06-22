@@ -167,10 +167,10 @@ func (c *Client) Check(ctx context.Context, traceID, message, clientIP, from str
 	// workers faster than our IdleConnTimeout) surfaces here as RST or EOF
 	// mid-response. Retry once on those transport-level glitches before
 	// surfacing the error.
-	bodyBytes, status, err := c.doCheckOnce(ctx, msgBytes, clientIP, from, rcpt, helo)
+	bodyBytes, status, err := c.doCheckOnce(ctx, traceID, msgBytes, clientIP, from, rcpt, helo)
 	if err != nil && isBrokenConnErr(err) {
 		c.Logger.Debug("Retrying rspamd request after broken connection", "error", err)
-		bodyBytes, status, err = c.doCheckOnce(ctx, msgBytes, clientIP, from, rcpt, helo)
+		bodyBytes, status, err = c.doCheckOnce(ctx, traceID, msgBytes, clientIP, from, rcpt, helo)
 	}
 	if err != nil {
 		return nil, err
@@ -258,7 +258,7 @@ func (c *Client) Check(ctx context.Context, traceID, message, clientIP, from str
 // response body and status code. Transport-level failures are returned
 // wrapped with the existing "rspamd request failed" / "failed to read
 // rspamd response" prefixes so the caller can decide whether to retry.
-func (c *Client) doCheckOnce(ctx context.Context, msgBytes []byte, clientIP, from string, rcpt []string, helo string) ([]byte, int, error) {
+func (c *Client) doCheckOnce(ctx context.Context, traceID string, msgBytes []byte, clientIP, from string, rcpt []string, helo string) ([]byte, int, error) {
 	req, err := http.NewRequestWithContext(ctx, "POST", c.URL, bytes.NewReader(msgBytes))
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to create rspamd request: %w", err)
@@ -267,6 +267,12 @@ func (c *Client) doCheckOnce(ctx context.Context, msgBytes []byte, clientIP, fro
 	// Set rspamd protocol v2 headers
 	req.Header.Set("Content-Type", "text/plain")
 	req.Header.Set("User-Agent", "Mizu-SMTP/1.0")
+
+	// Pass our trace ID as the rspamd Queue-ID so rspamd records it in its
+	// own logs, letting us correlate a Mizu trace with the matching scan.
+	if traceID != "" {
+		req.Header.Set("Queue-ID", traceID)
+	}
 
 	// Add message metadata headers
 	if clientIP != "" {
