@@ -4,9 +4,27 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"strings"
 )
+
+// isLocalhostURL reports whether the given URL points to a loopback address,
+// allowing http:// for local development/testing of authentication endpoints.
+func isLocalhostURL(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	if host == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
 
 // Validate checks the configuration for required fields and placeholder values.
 func (c *Config) Validate() error {
@@ -218,9 +236,9 @@ func (s *ServerConfig) Validate() error {
 		if s.Auth.URL == "" {
 			return errors.New("auth.url is required when auth.required=true")
 		}
-		// Enforce HTTPS for authentication endpoint
-		if !strings.HasPrefix(s.Auth.URL, "https://") {
-			return errors.New("auth.url must use https:// (HTTPS required for authentication)")
+		// Enforce HTTPS for authentication endpoint (localhost may use http:// for development)
+		if !strings.HasPrefix(s.Auth.URL, "https://") && !isLocalhostURL(s.Auth.URL) {
+			return errors.New("auth.url must use https:// (HTTPS required for authentication, except for localhost)")
 		}
 	}
 
