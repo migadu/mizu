@@ -162,27 +162,23 @@ func NewManager(ctx context.Context, cfg *Config, logger *slog.Logger, isLeaderF
 
 	originalGetCert := baseTLSConfig.GetCertificate
 	baseTLSConfig.GetCertificate = func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-		serverName := hello.ServerName
+		// RFC 4343: DNS names are case-insensitive.
+		serverName := strings.ToLower(hello.ServerName)
 
-		if serverName == "" {
-			if defaultDomain != "" {
-				logger.Debug("TLS: missing SNI - using default domain", "domain", defaultDomain)
-				serverName = defaultDomain
-			} else {
-				logger.Debug("TLS: rejected certificate request - missing SNI and no default domain")
+		// A sender that omits SNI, or puts an IP literal in it (RFC 6066 forbids IP
+		// SNI, but some MTAs send it anyway), hasn't named a certificate we can serve.
+		// Fall back to the default domain's cert instead of hard-failing the
+		// handshake — failing breaks opportunistic inbound TLS and surfaces on the
+		// sender as "Failed to init TLS". The default domain is substituted before
+		// autocert sees the name, so a bogus SNI can never trigger ACME issuance.
+		if serverName == "" || isIPAddress(serverName) {
+			if defaultDomain == "" {
+				logger.Debug("TLS: no usable SNI and no default domain configured", "sni", hello.ServerName)
 				return nil, ErrMissingServerName
 			}
-		}
-
-		// RFC 4343: DNS names are case-insensitive.
-		serverName = strings.ToLower(serverName)
-
-		// Let's Encrypt doesn't issue certificates for IP addresses.
-		if isIPAddress(serverName) {
-			logger.Debug("TLS: rejected certificate request for IP address (Let's Encrypt requires domain names)",
-				"ip", serverName,
-				"remote_addr", hello.Conn.RemoteAddr().String())
-			return nil, fmt.Errorf("%w: IP addresses not supported (use domain name)", ErrHostNotAllowed)
+			logger.Debug("TLS: missing or IP-literal SNI - using default domain",
+				"sni", hello.ServerName, "default_domain", defaultDomain)
+			serverName = strings.ToLower(defaultDomain)
 		}
 
 		if err := autocertMgr.HostPolicy(nil, serverName); err != nil {
