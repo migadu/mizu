@@ -1335,6 +1335,34 @@ func runSMTPServerInstance(ctx context.Context, serverCfg *config.ServerConfig, 
 				"max_tls_version", serverCfg.TLS.MaxTLSVersion)
 		}
 
+		// Log inbound senders that can only negotiate TLS below our floor. Go calls
+		// GetConfigForClient with the ClientHello BEFORE version negotiation rejects a
+		// too-old peer, so this captures senders that would otherwise vanish into a
+		// failed handshake (and, for opportunistic port 25, a silent plaintext
+		// fallback). Returning (nil, nil) keeps this same config, so cert selection
+		// via GetCertificate is unaffected.
+		minVer := serverTLSConfig.MinVersion
+		if minVer == 0 {
+			minVer = tls.VersionTLS12
+		}
+		listenerName := serverCfg.Name
+		serverTLSConfig.GetConfigForClient = func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+			if highest := maxTLSVersion(hello.SupportedVersions); highest != 0 && highest < minVer {
+				remote := ""
+				if hello.Conn != nil {
+					remote = hello.Conn.RemoteAddr().String()
+				}
+				logger.Warn("TLS: sender offered only deprecated TLS versions below the configured minimum",
+					"listener", listenerName,
+					"remote_addr", remote,
+					"server_name", hello.ServerName,
+					"offered_versions", formatTLSVersions(hello.SupportedVersions),
+					"highest_offered", tlsVersionName(highest),
+					"minimum_required", tlsVersionName(minVer))
+			}
+			return nil, nil
+		}
+
 		server.TLSConfig = serverTLSConfig
 		logger.Info("TLS configured for SMTP server",
 			"server", serverCfg.Name,
@@ -1476,6 +1504,48 @@ func getTLSVersion(version string) uint16 {
 		// Default to TLS 1.2 for security - TLS 1.0 and 1.1 are deprecated
 		return tls.VersionTLS12
 	}
+}
+
+// maxTLSVersion returns the highest TLS version a client advertised, or 0 if the
+// slice is empty. Used to detect senders that can only negotiate below our floor.
+func maxTLSVersion(versions []uint16) uint16 {
+	var highest uint16
+	for _, v := range versions {
+		if v > highest {
+			highest = v
+		}
+	}
+	return highest
+}
+
+// tlsVersionName renders a TLS version constant as a human-readable string for logs.
+func tlsVersionName(v uint16) string {
+	switch v {
+	case tls.VersionTLS13:
+		return "1.3"
+	case tls.VersionTLS12:
+		return "1.2"
+	case tls.VersionTLS11:
+		return "1.1"
+	case tls.VersionTLS10:
+		return "1.0"
+	case 0:
+		return "none"
+	default:
+		return fmt.Sprintf("0x%04x", v)
+	}
+}
+
+// formatTLSVersions renders a list of advertised TLS versions for logging.
+func formatTLSVersions(versions []uint16) string {
+	if len(versions) == 0 {
+		return "none"
+	}
+	parts := make([]string, len(versions))
+	for i, v := range versions {
+		parts[i] = tlsVersionName(v)
+	}
+	return strings.Join(parts, ",")
 }
 
 // smtpDebugWriter wraps slog.Logger for go-smtp Debug output
