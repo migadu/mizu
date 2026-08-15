@@ -194,9 +194,9 @@ func (a *HTTPAuthenticator) fetchCredentials(username, remoteIP string) (*AuthRe
 		a.logger.Error("auth request failed", "url", requestURL, "status", status, "error", err)
 		if status == http.StatusOK {
 			// Got a 200 but the body was unreadable or not valid JSON
-			return nil, fmt.Errorf("internal error")
+			return nil, fmt.Errorf("internal error: %w", ErrAuthUnavailable)
 		}
-		return nil, fmt.Errorf("authentication service unavailable")
+		return nil, fmt.Errorf("authentication service unavailable: %w", ErrAuthUnavailable)
 	}
 
 	switch status {
@@ -226,7 +226,7 @@ func (a *HTTPAuthenticator) fetchCredentials(username, remoteIP string) (*AuthRe
 			"url", requestURL,
 			"status", status,
 			"response", string(body))
-		return nil, fmt.Errorf("authentication service error: %d", status)
+		return nil, fmt.Errorf("authentication service error: %d: %w", status, ErrAuthUnavailable)
 	}
 }
 
@@ -295,9 +295,16 @@ func (a *HTTPAuthenticator) CanSendAs(authenticatedUser, fromAddress string) boo
 		return false
 	}
 
-	// Normalize addresses for comparison
+	// Normalize addresses for comparison.
+	//
+	// The envelope sender is normalized but NOT unwrapped. It arrives already
+	// parsed from the reverse-path, so it is an addr-spec and never a
+	// "Name <addr>" display form — but a quoted local part can legally carry
+	// '<' and '>' through the parser, and unwrapping it here would make the gate
+	// judge a substring while the sender-domain accounting and the X-Mail-From
+	// we forward both use the whole string. Judge exactly what will be sent.
 	authUser := strings.ToLower(strings.TrimSpace(authenticatedUser))
-	fromAddr := extractEmail(fromAddress)
+	fromAddr := strings.ToLower(strings.TrimSpace(fromAddress))
 
 	// Check against cached allowed_from list
 	if a.checkAllowedFrom(entry.allowedFromAddresses, authUser, fromAddr) {
@@ -448,16 +455,34 @@ func (c *compiledRegexCache) get(pattern string) (*regexp.Regexp, error) {
 	return entry.re, entry.err
 }
 
-// extractEmail extracts the email address from "Name <email>" or just "email" format
+// extractEmail extracts the email address from "Name <email>" or just "email"
+// format. It is for AUTHORIZATION ENTRIES only — see checkAllowedFrom.
+//
+// The unwrap is ANCHORED: the entry must END with '>', and the address is taken
+// from the LAST '<'. That is what an RFC 5322 display form looks like, and the
+// anchoring is a security property rather than tidiness.
+//
+// Unanchored ("first '<' to first '>'") this returns an interior substring of
+// the entry, so an allowed_from value that merely CONTAINS a bracketed address
+// authorizes that address instead of itself. allowed_from is served whole by the
+// backend and is derived from operator- and customer-supplied strings (mailbox
+// local parts, display names), so an entry shaped like
+//
+//	someone+<other@elsewhere.example>@theirdomain.example
+//
+// would have been reduced to other@elsewhere.example and granted send rights for
+// a domain its owner does not control. Anchoring removes that: the value above
+// does not end with '>', so it is compared verbatim and matches only itself.
+//
+// A genuine display form is unaffected — "Support <help@example.com>" still
+// yields help@example.com.
 func extractEmail(address string) string {
 	addr := strings.TrimSpace(address)
 
-	// Extract email address from "Name <email>" format
-	if strings.Contains(addr, "<") && strings.Contains(addr, ">") {
-		start := strings.Index(addr, "<")
-		end := strings.Index(addr, ">")
-		if start < end {
-			addr = addr[start+1 : end]
+	// Extract email address from "Name <email>" format.
+	if strings.HasSuffix(addr, ">") {
+		if start := strings.LastIndex(addr, "<"); start != -1 {
+			addr = addr[start+1 : len(addr)-1]
 		}
 	}
 
@@ -558,10 +583,29 @@ type LoginServer struct {
 	step          int
 }
 
-// Next processes the LOGIN authentication handshake
+// Next processes the LOGIN authentication handshake.
+//
+// Two shapes must both work. Without an initial response it is the three-step
+// form (AUTH LOGIN, "Username:", "Password:"); with one, the client has already
+// sent its username on the AUTH command and is waiting only for the password.
 func (l *LoginServer) Next(response []byte) (challenge []byte, done bool, err error) {
 	switch l.step {
 	case 0:
+		// RFC 4954 §4 lets the client carry an INITIAL RESPONSE on the AUTH
+		// command; for LOGIN that is the username. go-smtp hands it to us here —
+		// nil when absent, empty (non-nil) for the "=" zero-length form.
+		//
+		// Discarding it desynchronizes the exchange: a client that already sent
+		// its username answers our "Username:" prompt with its PASSWORD, which we
+		// then try as a username. That is not hypothetical — go-sasl's own LOGIN
+		// client always sends one, and it rejects any challenge that is not
+		// literally "Password:", so AUTH LOGIN could not succeed for such a
+		// client at all.
+		if response != nil {
+			l.username = string(response)
+			l.step = 2
+			return []byte("Password:"), false, nil
+		}
 		// First step: request username
 		l.step = 1
 		return []byte("Username:"), false, nil
