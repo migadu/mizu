@@ -1,6 +1,7 @@
 package smtp
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -92,7 +93,7 @@ func (s *Session) Auth(mech string) (sasl.Server, error) {
 					"username", user,
 					"ip", remoteIP,
 					"error", err)
-				return fmt.Errorf("authentication rate limit exceeded")
+				return ErrAuthRateLimited
 			}
 
 			// Apply progressive delay if configured
@@ -104,7 +105,7 @@ func (s *Session) Auth(mech string) (sasl.Server, error) {
 					"delay", delay)
 				select {
 				case <-s.ctx.Done():
-					return fmt.Errorf("authentication cancelled")
+					return ErrAuthCancelled
 				case <-time.After(delay):
 					// Delay complete, continue
 				}
@@ -120,25 +121,36 @@ func (s *Session) Auth(mech string) (sasl.Server, error) {
 			authenticated, err = s.authenticator.Authenticate(user, password)
 		}
 
-		// Record auth attempt result in rate limiter
-		if s.authRateLimiter != nil {
-			s.authRateLimiter.RecordAuthAttempt(s.ctx, remoteIP, user, authenticated && err == nil)
+		// A backend we could not reach never JUDGED the credential, and the two
+		// outcomes must not be reported alike — so this is decided FIRST, and on
+		// the sentinel rather than on err being non-nil. Authenticate returns
+		// (false, err) for a wrong password AND for an outage, so testing err
+		// alone would make every wrong password temporary, which is the mirror
+		// of the bug being fixed here.
+		noVerdict := errors.Is(err, ErrAuthUnavailable)
+
+		// Record the attempt with the brute-force damper only when a verdict was
+		// actually reached. Counting our own outage as a failed attempt spends a
+		// legitimate user's budget and keeps blocking them for the whole block
+		// duration after the backend recovers; counting it as a success would be
+		// worse still, since that clears their accumulated failures.
+		if s.authRateLimiter != nil && !noVerdict {
+			s.authRateLimiter.RecordAuthAttempt(s.ctx, remoteIP, user, authenticated)
+		}
+
+		if noVerdict {
+			s.Logger.Error("Authentication error", "username", user, "error", err)
+			return ErrAuthTemporaryFailure
 		}
 
 		if !authenticated {
+			// Permanent. RFC 4954 §6's 535 5.7.8: the credential was checked and
+			// rejected, so retrying it cannot help. Anything 4xx here tells the
+			// client to try the same secret again — which it does, until the
+			// connection is closed, and the user reads that as an outage rather
+			// than as a password prompt.
 			s.Logger.Warn("Authentication failed", "username", user, "reason", err)
-			return fmt.Errorf("invalid credentials")
-		}
-
-		if err != nil {
-			s.Logger.Error("Authentication error", "username", user, "error", err)
-			// Return a temporary failure error that SASL can understand
-			// The SASL library will convert this to appropriate SMTP response
-			return &smtp.SMTPError{
-				Code:         454,
-				EnhancedCode: smtp.EnhancedCode{4, 7, 0},
-				Message:      "temporary authentication failure: please try again later",
-			}
+			return ErrAuthCredentialsInvalid
 		}
 
 		// Mark session as authenticated
