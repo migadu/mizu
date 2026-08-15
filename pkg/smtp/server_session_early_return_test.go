@@ -10,6 +10,8 @@ import (
 
 	"migadu/mizu/pkg/config"
 	"migadu/mizu/pkg/metrics"
+
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // TestBackend_EarlyReturn_WaitGroupLeak tests that early returns properly clean up WaitGroup
@@ -45,7 +47,7 @@ func TestBackend_EarlyReturn_WaitGroupLeak(t *testing.T) {
 		},
 	}
 
-	metricsRegistry := metrics.New("test_early_return_leak")
+	metricsRegistry := metrics.NewWithRegisterer("test_early_return_leak", prometheus.NewRegistry())
 	resolver, _ := NewDNSResolver(nil, 1*time.Second, 5*time.Minute)
 	tracker := NewConnectionTracker(100, 10, 0, nil)
 

@@ -1,6 +1,9 @@
 package metrics
 
 import (
+	"fmt"
+	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -8,7 +11,7 @@ import (
 
 func TestNew(t *testing.T) {
 	// Create metrics with default namespace
-	m := New("")
+	m := NewWithRegisterer("", prometheus.NewRegistry())
 	if m == nil {
 		t.Fatal("Metrics is nil")
 	}
@@ -23,7 +26,7 @@ func TestNew(t *testing.T) {
 
 func TestNew_CustomNamespace(t *testing.T) {
 	// Create metrics with custom namespace
-	m := New("custom")
+	m := NewWithRegisterer("custom", prometheus.NewRegistry())
 	if m == nil {
 		t.Fatal("Metrics is nil")
 	}
@@ -37,7 +40,7 @@ func TestNew_CustomNamespace(t *testing.T) {
 }
 
 func TestMetrics_SMTPMetrics(t *testing.T) {
-	m := New("test_smtp")
+	m := NewWithRegisterer("test_smtp", prometheus.NewRegistry())
 
 	// Test counters with server labels
 	m.SMTPConnectionsTotal.WithLabelValues("relay", "relay").Inc()
@@ -67,7 +70,7 @@ func TestMetrics_SMTPMetrics(t *testing.T) {
 }
 
 func TestMetrics_HTTPMetrics(t *testing.T) {
-	m := New("test_http")
+	m := NewWithRegisterer("test_http", prometheus.NewRegistry())
 
 	// Test counter vec
 	m.HTTPRequestsTotal.WithLabelValues("2xx").Inc()
@@ -82,7 +85,7 @@ func TestMetrics_HTTPMetrics(t *testing.T) {
 }
 
 func TestMetrics_CircuitBreakerMetrics(t *testing.T) {
-	m := New("test_cb")
+	m := NewWithRegisterer("test_cb", prometheus.NewRegistry())
 
 	// Test gauge vec
 	m.CircuitBreakerState.WithLabelValues("closed").Set(1)
@@ -97,7 +100,7 @@ func TestMetrics_CircuitBreakerMetrics(t *testing.T) {
 }
 
 func TestMetrics_ConnectionTrackerMetrics(t *testing.T) {
-	m := New("test_conn")
+	m := NewWithRegisterer("test_conn", prometheus.NewRegistry())
 
 	m.ConnectionsTrackerTotal.Set(100)
 	m.ConnectionsTrackerLimit.Set(1000)
@@ -107,7 +110,7 @@ func TestMetrics_ConnectionTrackerMetrics(t *testing.T) {
 }
 
 func TestMetrics_RateLimiterMetrics(t *testing.T) {
-	m := New("test_rate")
+	m := NewWithRegisterer("test_rate", prometheus.NewRegistry())
 
 	m.RateLimitChecks.WithLabelValues("IP", "allowed").Inc()
 	m.RateLimitViolations.WithLabelValues("IP").Inc()
@@ -117,7 +120,7 @@ func TestMetrics_RateLimiterMetrics(t *testing.T) {
 }
 
 func TestMetrics_StatsManagerMetrics(t *testing.T) {
-	m := New("test_stats")
+	m := NewWithRegisterer("test_stats", prometheus.NewRegistry())
 
 	m.StatsIPEntriesTotal.Set(1000)
 	m.StatsDomainEntriesTotal.Set(500)
@@ -128,7 +131,7 @@ func TestMetrics_StatsManagerMetrics(t *testing.T) {
 }
 
 func TestMetrics_ClusterMetrics(t *testing.T) {
-	m := New("test_cluster")
+	m := NewWithRegisterer("test_cluster", prometheus.NewRegistry())
 
 	m.ClusterMembers.Set(3)
 	m.ClusterLeader.WithLabelValues("node1").Set(1)
@@ -138,7 +141,7 @@ func TestMetrics_ClusterMetrics(t *testing.T) {
 }
 
 func TestMetrics_RecipientCacheMetrics(t *testing.T) {
-	m := New("test_cache")
+	m := NewWithRegisterer("test_cache", prometheus.NewRegistry())
 
 	m.RecipientCacheHits.WithLabelValues("routing").Inc()
 	m.RecipientCacheMisses.Inc()
@@ -148,7 +151,7 @@ func TestMetrics_RecipientCacheMetrics(t *testing.T) {
 }
 
 func TestMetrics_AllMetricsNonNil(t *testing.T) {
-	m := New("test_all")
+	m := NewWithRegisterer("test_all", prometheus.NewRegistry())
 
 	// Check all metrics are non-nil
 	if m.SMTPConnectionsTotal == nil {
@@ -175,10 +178,40 @@ func TestMetrics_PrometheusRegistration(t *testing.T) {
 	_ = prometheus.NewRegistry()
 
 	// This tests that metrics can be registered without panic
-	m := New("test_registration")
+	m := NewWithRegisterer("test_registration", prometheus.NewRegistry())
 	if m == nil {
 		t.Fatal("Failed to create metrics")
 	}
 
 	t.Log("✓ Metrics registered with Prometheus successfully")
 }
+
+// TestNewRegistersInTheDefaultRegistry is the counterweight to the registry
+// split. Every other test here builds against a PRIVATE registry, so nothing
+// would notice if New itself stopped using the default one — and /metrics is
+// served from the default gatherer, so that mistake would silently empty every
+// mizu_* series in production while the suite stayed green.
+//
+// The namespace is unique per run so this test does not reintroduce the
+// duplicate-registration panic: the default registry outlives the test.
+func TestNewRegistersInTheDefaultRegistry(t *testing.T) {
+	namespace := fmt.Sprintf("test_default_reg_%d", defaultRegSeq.Add(1))
+
+	if m := New(namespace); m == nil {
+		t.Fatal("Failed to create metrics")
+	}
+
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	for _, f := range families {
+		if strings.HasPrefix(f.GetName(), namespace+"_") {
+			return
+		}
+	}
+	t.Errorf("New(%q) registered nothing in the DEFAULT registry; /metrics would serve no mizu_* series", namespace)
+}
+
+// defaultRegSeq keeps the namespace above unique across -count=N runs.
+var defaultRegSeq atomic.Int64

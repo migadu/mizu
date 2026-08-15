@@ -79,52 +79,71 @@ type Metrics struct {
 	DNSResolverErrors *prometheus.CounterVec // Labels: resolver, error_type
 }
 
-// New creates and registers all Prometheus metrics
+// New creates and registers all Prometheus metrics in the DEFAULT registry.
+// This is what the server uses, so /metrics keeps working unchanged.
 func New(namespace string) *Metrics {
+	return NewWithRegisterer(namespace, prometheus.DefaultRegisterer)
+}
+
+// NewWithRegisterer is New against a caller-supplied registry.
+//
+// It exists because registering into a process-global registry makes a Metrics
+// UNCONSTRUCTABLE TWICE for one namespace: promauto panics on a duplicate
+// collector. That is invisible in production (one instance per process) and
+// fatal in tests — "go test -count=2" re-runs every test in the SAME process,
+// so any test building a Metrics with a fixed namespace panics on the second
+// pass and the package cannot be run repeatedly to check for flakes.
+//
+// Tests should pass prometheus.NewRegistry(): a private registry is discarded
+// with the test, which is both repeatable and free of cross-test interference.
+// testutil.ToFloat64 reads a Collector directly, not a registry, so assertions
+// are unaffected.
+func NewWithRegisterer(namespace string, reg prometheus.Registerer) *Metrics {
 	if namespace == "" {
 		namespace = "mizu"
 	}
+	factory := promauto.With(reg)
 
 	return &Metrics{
 		// SMTP connection metrics (per-server)
-		SMTPConnectionsTotal: promauto.NewCounterVec(prometheus.CounterOpts{
+		SMTPConnectionsTotal: factory.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace,
 			Subsystem: "smtp",
 			Name:      "connections_total",
 			Help:      "Total number of SMTP connections accepted per server",
 		}, []string{"server_name", "server_type"}),
-		SMTPConnectionsActive: promauto.NewGaugeVec(prometheus.GaugeOpts{
+		SMTPConnectionsActive: factory.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Subsystem: "smtp",
 			Name:      "connections_active",
 			Help:      "Current number of active SMTP connections per server",
 		}, []string{"server_name", "server_type"}),
-		SMTPConnectionsPerIPActive: promauto.NewGaugeVec(prometheus.GaugeOpts{
+		SMTPConnectionsPerIPActive: factory.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Subsystem: "smtp",
 			Name:      "connections_per_ip_active",
 			Help:      "Current number of active connections per IP address and server",
 		}, []string{"server_name", "ip"}),
-		SMTPConnectionDuration: promauto.NewHistogramVec(prometheus.HistogramOpts{
+		SMTPConnectionDuration: factory.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: namespace,
 			Subsystem: "smtp",
 			Name:      "connection_duration_seconds",
 			Help:      "Duration of SMTP connections in seconds per server",
 			Buckets:   prometheus.DefBuckets,
 		}, []string{"server_name", "server_type"}),
-		SMTPMessagesReceived: promauto.NewCounterVec(prometheus.CounterOpts{
+		SMTPMessagesReceived: factory.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace,
 			Subsystem: "smtp",
 			Name:      "messages_received_total",
 			Help:      "Total number of messages received via SMTP per server",
 		}, []string{"server_name", "server_type"}),
-		SMTPMessagesRejected: promauto.NewCounterVec(prometheus.CounterOpts{
+		SMTPMessagesRejected: factory.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace,
 			Subsystem: "smtp",
 			Name:      "messages_rejected_total",
 			Help:      "Total number of messages rejected per server",
 		}, []string{"server_name", "server_type", "reason"}),
-		SMTPMessageSize: promauto.NewHistogramVec(prometheus.HistogramOpts{
+		SMTPMessageSize: factory.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: namespace,
 			Subsystem: "smtp",
 			Name:      "message_size_bytes",
@@ -133,31 +152,31 @@ func New(namespace string) *Metrics {
 		}, []string{"server_name", "server_type"}),
 
 		// SMTP validation metrics (per-server)
-		SMTPSPFChecks: promauto.NewCounterVec(prometheus.CounterOpts{
+		SMTPSPFChecks: factory.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace,
 			Subsystem: "smtp",
 			Name:      "spf_checks_total",
 			Help:      "Total number of SPF checks performed per server",
 		}, []string{"server_name", "result"}),
-		SMTPDMARCChecks: promauto.NewCounterVec(prometheus.CounterOpts{
+		SMTPDMARCChecks: factory.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace,
 			Subsystem: "smtp",
 			Name:      "dmarc_checks_total",
 			Help:      "Total number of DMARC checks performed per server",
 		}, []string{"server_name", "result"}),
-		SMTPDKIMChecks: promauto.NewCounterVec(prometheus.CounterOpts{
+		SMTPDKIMChecks: factory.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace,
 			Subsystem: "smtp",
 			Name:      "dkim_checks_total",
 			Help:      "Total number of DKIM checks performed per server",
 		}, []string{"server_name", "result"}),
-		SMTPARCChecks: promauto.NewCounterVec(prometheus.CounterOpts{
+		SMTPARCChecks: factory.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace,
 			Subsystem: "smtp",
 			Name:      "arc_checks_total",
 			Help:      "Total number of ARC (Authenticated Received Chain) checks performed per server",
 		}, []string{"server_name", "result"}),
-		SMTPBlacklistChecks: promauto.NewCounterVec(prometheus.CounterOpts{
+		SMTPBlacklistChecks: factory.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace,
 			Subsystem: "smtp",
 			Name:      "blacklist_checks_total",
@@ -165,27 +184,27 @@ func New(namespace string) *Metrics {
 		}, []string{"server_name", "result"}),
 
 		// HTTP destination metrics
-		HTTPRequestsTotal: promauto.NewCounterVec(prometheus.CounterOpts{
+		HTTPRequestsTotal: factory.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace,
 			Subsystem: "http",
 			Name:      "requests_total",
 			Help:      "Total number of HTTP requests to destination",
 		}, []string{"status_code"}),
-		HTTPRequestDuration: promauto.NewHistogram(prometheus.HistogramOpts{
+		HTTPRequestDuration: factory.NewHistogram(prometheus.HistogramOpts{
 			Namespace: namespace,
 			Subsystem: "http",
 			Name:      "request_duration_seconds",
 			Help:      "Duration of HTTP requests to destination in seconds",
 			Buckets:   prometheus.DefBuckets,
 		}),
-		HTTPRequestSize: promauto.NewHistogram(prometheus.HistogramOpts{
+		HTTPRequestSize: factory.NewHistogram(prometheus.HistogramOpts{
 			Namespace: namespace,
 			Subsystem: "http",
 			Name:      "request_size_bytes",
 			Help:      "Size of HTTP request bodies in bytes",
 			Buckets:   prometheus.ExponentialBuckets(1024, 2, 15), // 1KB to 16MB
 		}),
-		HTTPResponseSize: promauto.NewHistogram(prometheus.HistogramOpts{
+		HTTPResponseSize: factory.NewHistogram(prometheus.HistogramOpts{
 			Namespace: namespace,
 			Subsystem: "http",
 			Name:      "response_size_bytes",
@@ -194,25 +213,25 @@ func New(namespace string) *Metrics {
 		}),
 
 		// Circuit breaker metrics
-		CircuitBreakerState: promauto.NewGaugeVec(prometheus.GaugeOpts{
+		CircuitBreakerState: factory.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Subsystem: "circuit_breaker",
 			Name:      "state",
 			Help:      "Current state of circuit breaker (0=closed, 1=open, 2=half_open)",
 		}, []string{"state"}),
-		CircuitBreakerFailures: promauto.NewCounter(prometheus.CounterOpts{
+		CircuitBreakerFailures: factory.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Subsystem: "circuit_breaker",
 			Name:      "failures_total",
 			Help:      "Total number of circuit breaker failures",
 		}),
-		CircuitBreakerSuccesses: promauto.NewCounter(prometheus.CounterOpts{
+		CircuitBreakerSuccesses: factory.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Subsystem: "circuit_breaker",
 			Name:      "successes_total",
 			Help:      "Total number of circuit breaker successes",
 		}),
-		CircuitBreakerRejects: promauto.NewCounter(prometheus.CounterOpts{
+		CircuitBreakerRejects: factory.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Subsystem: "circuit_breaker",
 			Name:      "rejects_total",
@@ -220,19 +239,19 @@ func New(namespace string) *Metrics {
 		}),
 
 		// Connection tracker metrics
-		ConnectionsTrackerTotal: promauto.NewGauge(prometheus.GaugeOpts{
+		ConnectionsTrackerTotal: factory.NewGauge(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Subsystem: "connections",
 			Name:      "tracker_total",
 			Help:      "Total number of tracked connections",
 		}),
-		ConnectionsTrackerPerIP: promauto.NewGaugeVec(prometheus.GaugeOpts{
+		ConnectionsTrackerPerIP: factory.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Subsystem: "connections",
 			Name:      "tracker_per_ip",
 			Help:      "Number of connections tracked per IP",
 		}, []string{"ip"}),
-		ConnectionsTrackerLimit: promauto.NewGauge(prometheus.GaugeOpts{
+		ConnectionsTrackerLimit: factory.NewGauge(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Subsystem: "connections",
 			Name:      "tracker_limit",
@@ -240,19 +259,19 @@ func New(namespace string) *Metrics {
 		}),
 
 		// Rate limiter metrics
-		RateLimitChecks: promauto.NewCounterVec(prometheus.CounterOpts{
+		RateLimitChecks: factory.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace,
 			Subsystem: "rate_limit",
 			Name:      "checks_total",
 			Help:      "Total number of rate limit checks",
 		}, []string{"dimension", "result"}),
-		RateLimitViolations: promauto.NewCounterVec(prometheus.CounterOpts{
+		RateLimitViolations: factory.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace,
 			Subsystem: "rate_limit",
 			Name:      "violations_total",
 			Help:      "Total number of rate limit violations",
 		}, []string{"dimension"}),
-		RateLimitWindowCount: promauto.NewGaugeVec(prometheus.GaugeOpts{
+		RateLimitWindowCount: factory.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Subsystem: "rate_limit",
 			Name:      "window_count",
@@ -260,25 +279,25 @@ func New(namespace string) *Metrics {
 		}, []string{"dimension", "key"}),
 
 		// Stats manager metrics
-		StatsIPEntriesTotal: promauto.NewGauge(prometheus.GaugeOpts{
+		StatsIPEntriesTotal: factory.NewGauge(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Subsystem: "stats",
 			Name:      "ip_entries_total",
 			Help:      "Total number of IP entries in stats manager",
 		}),
-		StatsDomainEntriesTotal: promauto.NewGauge(prometheus.GaugeOpts{
+		StatsDomainEntriesTotal: factory.NewGauge(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Subsystem: "stats",
 			Name:      "domain_entries_total",
 			Help:      "Total number of domain entries in stats manager",
 		}),
-		StatsEventsProcessed: promauto.NewCounter(prometheus.CounterOpts{
+		StatsEventsProcessed: factory.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Subsystem: "stats",
 			Name:      "events_processed_total",
 			Help:      "Total number of stats events processed",
 		}),
-		StatsEventsDropped: promauto.NewCounter(prometheus.CounterOpts{
+		StatsEventsDropped: factory.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Subsystem: "stats",
 			Name:      "events_dropped_total",
@@ -286,19 +305,19 @@ func New(namespace string) *Metrics {
 		}),
 
 		// Cluster metrics
-		ClusterMembers: promauto.NewGauge(prometheus.GaugeOpts{
+		ClusterMembers: factory.NewGauge(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Subsystem: "cluster",
 			Name:      "members_total",
 			Help:      "Total number of cluster members",
 		}),
-		ClusterLeader: promauto.NewGaugeVec(prometheus.GaugeOpts{
+		ClusterLeader: factory.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Subsystem: "cluster",
 			Name:      "leader",
 			Help:      "Whether this node is the cluster leader (1=leader, 0=not leader)",
 		}, []string{"node"}),
-		ClusterGossipMessages: promauto.NewCounterVec(prometheus.CounterOpts{
+		ClusterGossipMessages: factory.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace,
 			Subsystem: "cluster",
 			Name:      "gossip_messages_total",
@@ -306,19 +325,19 @@ func New(namespace string) *Metrics {
 		}, []string{"type", "direction"}),
 
 		// Recipient cache metrics
-		RecipientCacheHits: promauto.NewCounterVec(prometheus.CounterOpts{
+		RecipientCacheHits: factory.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace,
 			Subsystem: "recipient_cache",
 			Name:      "hits_total",
 			Help:      "Total number of recipient cache hits",
 		}, []string{"type"}),
-		RecipientCacheMisses: promauto.NewCounter(prometheus.CounterOpts{
+		RecipientCacheMisses: factory.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Subsystem: "recipient_cache",
 			Name:      "misses_total",
 			Help:      "Total number of recipient cache misses",
 		}),
-		RecipientCacheSize: promauto.NewGaugeVec(prometheus.GaugeOpts{
+		RecipientCacheSize: factory.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Subsystem: "recipient_cache",
 			Name:      "size",
@@ -326,32 +345,32 @@ func New(namespace string) *Metrics {
 		}, []string{"type"}),
 
 		// Auth rate limiter metrics
-		AuthRateLimitIPBlocks: promauto.NewCounterVec(prometheus.CounterOpts{
+		AuthRateLimitIPBlocks: factory.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace,
 			Subsystem: "auth_rate_limit",
 			Name:      "ip_blocks_total",
 			Help:      "Total number of IPs blocked due to authentication failures",
 		}, []string{"ip"}),
-		AuthRateLimitIPUsernameBlocks: promauto.NewCounterVec(prometheus.CounterOpts{
+		AuthRateLimitIPUsernameBlocks: factory.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace,
 			Subsystem: "auth_rate_limit",
 			Name:      "ip_username_blocks_total",
 			Help:      "Total number of IP+username combinations blocked",
 		}, []string{"ip", "username"}),
-		AuthRateLimitDelays: promauto.NewHistogramVec(prometheus.HistogramOpts{
+		AuthRateLimitDelays: factory.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: namespace,
 			Subsystem: "auth_rate_limit",
 			Name:      "delay_seconds",
 			Help:      "Authentication delay durations in seconds",
 			Buckets:   prometheus.ExponentialBuckets(0.1, 2, 10), // 0.1s to 51.2s
 		}, []string{"type"}),
-		AuthRateLimitEvictions: promauto.NewCounterVec(prometheus.CounterOpts{
+		AuthRateLimitEvictions: factory.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace,
 			Subsystem: "auth_rate_limit",
 			Name:      "evictions_total",
 			Help:      "Total number of LRU evictions by cache type",
 		}, []string{"type"}),
-		AuthRateLimitCacheSize: promauto.NewGaugeVec(prometheus.GaugeOpts{
+		AuthRateLimitCacheSize: factory.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Subsystem: "auth_rate_limit",
 			Name:      "cache_size",
@@ -359,7 +378,7 @@ func New(namespace string) *Metrics {
 		}, []string{"type"}),
 
 		// Spam check metrics
-		SpamCheckUp: promauto.NewGauge(prometheus.GaugeOpts{
+		SpamCheckUp: factory.NewGauge(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Subsystem: "spam_check",
 			Name:      "up",
@@ -367,32 +386,32 @@ func New(namespace string) *Metrics {
 		}),
 
 		// DNS cache metrics
-		DNSCacheHits: promauto.NewCounterVec(prometheus.CounterOpts{
+		DNSCacheHits: factory.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace,
 			Subsystem: "dns_cache",
 			Name:      "hits_total",
 			Help:      "Total number of DNS cache hits",
 		}, []string{"record_type"}),
-		DNSCacheMisses: promauto.NewCounterVec(prometheus.CounterOpts{
+		DNSCacheMisses: factory.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace,
 			Subsystem: "dns_cache",
 			Name:      "misses_total",
 			Help:      "Total number of DNS cache misses",
 		}, []string{"record_type"}),
-		DNSCacheSize: promauto.NewGaugeVec(prometheus.GaugeOpts{
+		DNSCacheSize: factory.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Subsystem: "dns_cache",
 			Name:      "size",
 			Help:      "Current size of DNS cache by record type",
 		}, []string{"record_type"}),
-		DNSQueryDuration: promauto.NewHistogramVec(prometheus.HistogramOpts{
+		DNSQueryDuration: factory.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: namespace,
 			Subsystem: "dns",
 			Name:      "query_duration_seconds",
 			Help:      "DNS query duration in seconds",
 			Buckets:   prometheus.DefBuckets,
 		}, []string{"record_type"}),
-		DNSResolverErrors: promauto.NewCounterVec(prometheus.CounterOpts{
+		DNSResolverErrors: factory.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace,
 			Subsystem: "dns",
 			Name:      "resolver_errors_total",

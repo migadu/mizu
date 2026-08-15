@@ -75,7 +75,7 @@ func TestBackend_MetricsWithServerLabels(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	// Create metrics (they auto-register)
-	m := metrics.New("test_backend")
+	m := metrics.NewWithRegisterer("test_backend", prometheus.NewRegistry())
 
 	// Create server configs
 	relayConfig := &config.ServerConfig{
@@ -145,7 +145,7 @@ func TestBackend_MetricsWithServerLabels(t *testing.T) {
 // TestBackend_ActiveConnectionsMetric tests that active connections are tracked per server
 func TestBackend_ActiveConnectionsMetric(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	m := metrics.New("test_active")
+	m := metrics.NewWithRegisterer("test_active", prometheus.NewRegistry())
 
 	relayConfig := &config.ServerConfig{
 		Name: "relay",
@@ -181,7 +181,7 @@ func TestBackend_ActiveConnectionsMetric(t *testing.T) {
 
 // TestBackend_ValidationMetrics tests that SPF/DMARC/DKIM/ARC metrics are per-server
 func TestBackend_ValidationMetrics(t *testing.T) {
-	m := metrics.New("test_validation")
+	m := metrics.NewWithRegisterer("test_validation", prometheus.NewRegistry())
 
 	// Relay server - strict validation
 	m.SMTPSPFChecks.WithLabelValues("relay", "pass").Inc()
@@ -220,7 +220,7 @@ func TestBackend_ValidationMetrics(t *testing.T) {
 
 // TestBackend_RejectionMetrics tests that rejections are tracked per server with reasons
 func TestBackend_RejectionMetrics(t *testing.T) {
-	m := metrics.New("test_rejections")
+	m := metrics.NewWithRegisterer("test_rejections", prometheus.NewRegistry())
 
 	// Relay rejections
 	m.SMTPMessagesRejected.WithLabelValues("relay", "relay", "spam").Inc()
@@ -254,7 +254,7 @@ func TestBackend_RejectionMetrics(t *testing.T) {
 
 // TestMultiServer_ConcurrentMetrics tests concurrent metric updates from multiple servers
 func TestMultiServer_ConcurrentMetrics(t *testing.T) {
-	m := metrics.New("test_concurrent")
+	m := metrics.NewWithRegisterer("test_concurrent", prometheus.NewRegistry())
 
 	servers := []struct {
 		name string
@@ -304,7 +304,7 @@ func TestMultiServer_ConcurrentMetrics(t *testing.T) {
 
 // TestMultiServer_PerIPTracking tests that per-IP metrics include server context
 func TestMultiServer_PerIPTracking(t *testing.T) {
-	m := metrics.New("test_per_ip")
+	m := metrics.NewWithRegisterer("test_per_ip", prometheus.NewRegistry())
 
 	// Same IP connecting to different servers
 	testIP := "192.168.1.100"
@@ -328,7 +328,7 @@ func TestMultiServer_PerIPTracking(t *testing.T) {
 
 // TestMultiServer_MessageSizeHistogram tests message size tracking per server
 func TestMultiServer_MessageSizeHistogram(t *testing.T) {
-	m := metrics.New("test_size")
+	m := metrics.NewWithRegisterer("test_size", prometheus.NewRegistry())
 
 	// Relay receives larger messages (external)
 	m.SMTPMessageSize.WithLabelValues("relay", "relay").Observe(500000)  // 500KB
@@ -345,7 +345,7 @@ func TestMultiServer_MessageSizeHistogram(t *testing.T) {
 // TestBackend_NewSession_MetricsIncrement tests that NewSession records metrics with server labels
 func TestBackend_NewSession_MetricsIncrement(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	m := metrics.New("test_newsession")
+	m := metrics.NewWithRegisterer("test_newsession", prometheus.NewRegistry())
 
 	cfg := config.DefaultConfig()
 	cfg.Local = true
