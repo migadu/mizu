@@ -202,6 +202,7 @@ Key packages:
 
   // Response (user found)
   {
+    "identity": "user@example.com",                   // Address this login acts as (optional; see Master access)
     "password_hashes": ["$2a$10$...", "$2a$10$..."],  // Array of password hashes (bcrypt, SSHA512, SHA512)
     "allowed_from": ["user@example.com", "alias@example.com", "*@team.example.com", "/^user\\+.*@example.com/"]
   }
@@ -244,6 +245,37 @@ Key packages:
 - `allowed_from` entries may be exact addresses, `*@domain` wildcards, or
   `/regex/` patterns (rcptd's regex_sender_login pass-through, matched
   case-insensitively against MAIL FROM with substring semantics like Postfix pcre)
+- **Master access (`user@domain@SUFFIX` logins).** Sora accepts support logins
+  where a suffix after a second `@` is a master username or remotelookup token
+  (`sora/server/address.go`). The suffix names the *credential*; the address it
+  acts as is the base address, which rcptd resolves and returns as `identity`.
+  Mizu never derives it — an absent or empty `identity` means no rewrite, so a
+  backend that does not serve the field behaves exactly as before.
+  - `ResolveSender` ([pkg/smtp/auth.go](pkg/smtp/auth.go)) authorizes a MAIL
+    FROM and returns the address to send as. A FROM equal to the login string
+    resolves to `identity`; every other FROM is authorized as sent, so a master
+    credential cannot send as a third party — the resolved address still has to
+    pass `allowed_from`. `CanSendAs` is now a wrapper over it.
+  - `Session.Mail` applies the resolution to the envelope *before* anything
+    downstream reads the sender, so stats, rate limiting, the spam check and the
+    envelope handed to mailqueuer all carry the identity rather than a login
+    string whose "domain" is the master username.
+  - `SenderIdentity` answers "is this session acting as someone else" from the
+    credentials cache only (never a refetch — `Session.Mail` asks on every
+    message). `Data` then calls `rewriteFromHeader`
+    ([pkg/smtp/headers.go](pkg/smtp/headers.go)) when — and only when — the
+    session has an identity and the `From` header holds exactly the login
+    string. Deliberately independent of the envelope decision: a client that
+    put the base address in MAIL FROM but the login in `From` must still have
+    the header fixed.
+    The display name is kept: `Support <user@dom@TOKEN>` → `Support <user@dom>`.
+    Clients that prefill their compose form from the login string (Sora's
+    webmail does) would otherwise publish the master username to every
+    recipient and leave `From` unparseable for DMARC alignment.
+  - Mizu only *verifies* DKIM; Strela signs, so the rewrite lands before the
+    signature.
+  - With an empty `allowed_from`, the fallback compares MAIL FROM against the
+    **identity**, never the raw login — a suffixed login is not an address.
 - Password verification happens **locally** (never send passwords over network)
 - Supports multiple password hashes per user (tries all until one matches)
 - URL supports `$email` and `$ip` placeholders for interpolation

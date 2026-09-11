@@ -211,6 +211,19 @@ type Backend struct {
 type Authenticator interface {
 	Authenticate(username, password string) (bool, error)
 	CanSendAs(authenticatedUser, fromAddress string) bool
+
+	// ResolveSender authorizes a FROM address and returns the address the
+	// session should actually send as. The two differ only when the backend
+	// reports an identity distinct from the AUTH username — a master/token
+	// login, where the login string is a credential rather than a routable
+	// address. An implementation with no such notion returns what it was given.
+	ResolveSender(authenticatedUser, fromAddress string) (string, bool)
+
+	// SenderIdentity returns the address this login acts as when that differs
+	// from the login itself, and "" otherwise. It is a property of the session,
+	// not of any one MAIL FROM, so the From-header rewrite does not depend on
+	// the client having put the same string in both places.
+	SenderIdentity(authenticatedUser string) string
 }
 
 // EHLO/HELO is called for the HELO/EHLO command.
@@ -809,6 +822,12 @@ type Session struct {
 	commandState int      // Track SMTP command sequence state for protocol enforcement
 	traceID      string   // Unique trace ID for correlating logs and tracking email through system
 
+	// senderIdentity is set only when MAIL FROM was rewritten: the client sent
+	// its own (master/token) login string as the sender and the backend
+	// resolved it to this address. It is what the From header is rewritten to
+	// in the DATA stage, and empty for every ordinary session.
+	senderIdentity string
+
 	// Stats tracking
 	senderDomain string // Domain from MAIL FROM for stats
 	spfResult    *validation.SPFResult
@@ -1137,9 +1156,16 @@ func (s *Session) Mail(ctx context.Context, from string, opts *smtp.MailOptions)
 		}
 	}
 
-	// Verify authenticated user can send as this FROM address
+	// Verify authenticated user can send as this FROM address, and take the
+	// address the backend says the session actually sends as. These differ only
+	// for a master/token login that presented its own login string as the
+	// sender: that string is a credential, not a routable address, so the
+	// envelope carries the identity instead. Resolving here, before anything
+	// downstream reads the sender, means stats, rate limiting, spam checking
+	// and the envelope handed to mailqueuer all see the real address.
 	if s.isAuthenticated && s.authenticator != nil {
-		if !s.authenticator.CanSendAs(s.authenticatedUser, from) {
+		resolved, ok := s.authenticator.ResolveSender(s.authenticatedUser, from)
+		if !ok {
 			s.Logger.Warn("User not allowed to send from address",
 				"user", s.authenticatedUser,
 				"from", from)
@@ -1149,6 +1175,19 @@ func (s *Session) Mail(ctx context.Context, from string, opts *smtp.MailOptions)
 				Message:      "sender address rejected: not allowed",
 			}
 		}
+		if resolved != "" && resolved != extractEmail(from) {
+			s.Logger.Info("Rewrote sender to authenticated identity",
+				"user", s.authenticatedUser,
+				"from", from,
+				"identity", resolved,
+				"master", true)
+			from = resolved
+		}
+		// Record the identity separately from the envelope decision above: it
+		// is a property of the login, so the From-header rewrite in DATA does
+		// not depend on the client having put the same string in both places.
+		// Empty for every ordinary login.
+		s.senderIdentity = s.authenticator.SenderIdentity(s.authenticatedUser)
 	}
 
 	// Perform sender validation if enabled (skip for authenticated sessions - already validated via allowed_from)
@@ -1492,6 +1531,20 @@ func (s *Session) Data(ctx context.Context, r io.Reader) (err error) {
 		return err
 	}
 	defer s.mailData.Reset() // Ensure buffer is cleared after processing.
+
+	// 1b. If MAIL FROM was resolved to a different address (a master/token
+	// login that presented its own login string as the sender), bring the From
+	// header along so the visible header and the envelope agree. Done before
+	// any check reads the message, so header validation, DMARC and the spam
+	// checker all see the address the message will actually carry. A no-op for
+	// every ordinary session, where senderIdentity is empty.
+	if s.senderIdentity != "" {
+		if rewritten, ok := rewriteFromHeader(rawEmail, s.authenticatedUser, s.senderIdentity); ok {
+			rawEmail = rewritten
+			s.Logger.Info("Rewrote From header to authenticated identity",
+				"identity", s.senderIdentity, "master", true)
+		}
+	}
 
 	// 2. Handle local mode separately for development and testing.
 	if s.globalConfig.Local {
@@ -2230,6 +2283,7 @@ func (s *Session) Reset() {
 	// rotation and can follow the session history.
 	s.Logger.Info("Trace ID rotated", "previous_trace_id", previousTraceID)
 	s.from = ""
+	s.senderIdentity = ""
 	s.to = make([]string, 0)
 	s.mailData.Reset()
 	s.commandState = stateHelo // After reset, we're back to post-HELO state

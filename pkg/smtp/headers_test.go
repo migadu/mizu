@@ -787,3 +787,102 @@ func TestGenerateMessageID(t *testing.T) {
 		t.Errorf("Message-ID should contain @ symbol: %s", messageID1)
 	}
 }
+
+// === rewriteFromHeader (master/token login senders) ===
+
+func TestRewriteFromHeader(t *testing.T) {
+	const login = "user@example.com@MASTER"
+	const identity = "user@example.com"
+
+	tests := []struct {
+		name     string
+		raw      string
+		wantFrom string // expected From line, "" when no rewrite is expected
+		wantOK   bool
+	}{
+		{
+			name:     "bare address rewritten",
+			raw:      "From: <" + login + ">\r\nTo: x@y.com\r\n\r\nbody\r\n",
+			wantFrom: "From: <" + identity + ">",
+			wantOK:   true,
+		},
+		{
+			name:     "address without angle brackets",
+			raw:      "From: " + login + "\r\nTo: x@y.com\r\n\r\nbody\r\n",
+			wantFrom: "From: <" + identity + ">",
+			wantOK:   true,
+		},
+		{
+			name:     "display name preserved",
+			raw:      "From: Support Team <" + login + ">\r\nTo: x@y.com\r\n\r\nbody\r\n",
+			wantFrom: "From: Support Team <" + identity + ">",
+			wantOK:   true,
+		},
+		{
+			name:     "case-insensitive header name and address",
+			raw:      "FROM: <User@Example.COM@MASTER>\r\nTo: x@y.com\r\n\r\nbody\r\n",
+			wantFrom: "From: <" + identity + ">",
+			wantOK:   true,
+		},
+		{
+			name:     "folded value collapsed to one line",
+			raw:      "From: Support\r\n <" + login + ">\r\nTo: x@y.com\r\n\r\nbody\r\n",
+			wantFrom: "From: Support <" + identity + ">",
+			wantOK:   true,
+		},
+		{
+			// The whole point of matching exactly: a From that is not this
+			// session's login is somebody else's and must not be touched.
+			name:   "different address untouched",
+			raw:    "From: <someone@example.com>\r\nTo: x@y.com\r\n\r\nbody\r\n",
+			wantOK: false,
+		},
+		{
+			name:   "no From header",
+			raw:    "To: x@y.com\r\nSubject: hi\r\n\r\nbody\r\n",
+			wantOK: false,
+		},
+		{
+			// A From-looking line in the body is not a header.
+			name:   "From in body ignored",
+			raw:    "To: x@y.com\r\n\r\nFrom: <" + login + ">\r\n",
+			wantOK: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := rewriteFromHeader(tt.raw, login, identity)
+			if ok != tt.wantOK {
+				t.Fatalf("rewriteFromHeader ok = %v, want %v (got %q)", ok, tt.wantOK, got)
+			}
+			if !tt.wantOK {
+				if got != tt.raw {
+					t.Errorf("message must be unchanged when no rewrite happens:\n got %q\nwant %q", got, tt.raw)
+				}
+				return
+			}
+			if !strings.Contains(got, tt.wantFrom+"\r\n") {
+				t.Errorf("expected From line %q in:\n%q", tt.wantFrom, got)
+			}
+			if strings.Contains(got, "MASTER") {
+				t.Errorf("master suffix survived the rewrite:\n%q", got)
+			}
+			// Everything after the headers must be untouched.
+			if !strings.HasSuffix(got, "\r\n\r\nbody\r\n") {
+				t.Errorf("body or CRLF framing damaged:\n%q", got)
+			}
+		})
+	}
+}
+
+// An empty old or new address is a no-op rather than a way to blank the header.
+func TestRewriteFromHeader_EmptyArgs(t *testing.T) {
+	raw := "From: <user@example.com>\r\n\r\nbody\r\n"
+	if got, ok := rewriteFromHeader(raw, "", "new@example.com"); ok || got != raw {
+		t.Error("empty old address must be a no-op")
+	}
+	if got, ok := rewriteFromHeader(raw, "user@example.com", ""); ok || got != raw {
+		t.Error("empty new address must be a no-op")
+	}
+}

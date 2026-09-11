@@ -302,6 +302,71 @@ func stripHeader(rawEmail, headerName string) string {
 	return strings.Join(result, "\r\n")
 }
 
+// rewriteFromHeader replaces the address in the From header with newAddress,
+// but only when the address currently there is exactly oldAddress. Any display
+// name is preserved: "Support <user@domain@TOKEN>" becomes "Support <user@domain>".
+//
+// This exists for master/token logins. A client that prefills its compose form
+// from the login string — Sora's webmail does — puts "user@domain@SUFFIX" in
+// From, which is not a routable address and which would publish the master
+// username to every recipient. The envelope is already resolved by then
+// (Session.Mail); this brings the visible header along so the two agree and
+// DMARC can align.
+//
+// The match is exact and case-insensitive on the address only, so a From that
+// is anything other than the login is left untouched — this can never rewrite
+// one user's message into another's name. Returns the message and whether a
+// rewrite happened.
+func rewriteFromHeader(rawEmail, oldAddress, newAddress string) (string, bool) {
+	oldAddress = strings.ToLower(strings.TrimSpace(oldAddress))
+	newAddress = strings.TrimSpace(newAddress)
+	if oldAddress == "" || newAddress == "" {
+		return rawEmail, false
+	}
+
+	const prefix = "From:"
+	lines := strings.Split(rawEmail, "\r\n")
+
+	for i := 0; i < len(lines); i++ {
+		line := lines[i]
+		// Empty line marks the end of the header section.
+		if line == "" {
+			break
+		}
+		if len(line) < len(prefix) || !strings.EqualFold(line[:len(prefix)], prefix) {
+			continue
+		}
+
+		// Gather the full value, including RFC 5322 folded continuations.
+		value := strings.TrimSpace(line[len(prefix):])
+		last := i
+		for last+1 < len(lines) && len(lines[last+1]) > 0 && (lines[last+1][0] == ' ' || lines[last+1][0] == '\t') {
+			last++
+			value += " " + strings.TrimSpace(lines[last])
+		}
+
+		if extractEmail(value) != oldAddress {
+			return rawEmail, false // Not the login: leave it alone.
+		}
+
+		// Preserve the display name, if any, and re-emit as a single line.
+		rewritten := "From: <" + newAddress + ">"
+		if open := strings.Index(value, "<"); open > 0 {
+			if name := strings.TrimSpace(value[:open]); name != "" {
+				rewritten = "From: " + name + " <" + newAddress + ">"
+			}
+		}
+
+		out := make([]string, 0, len(lines))
+		out = append(out, lines[:i]...)
+		out = append(out, rewritten)
+		out = append(out, lines[last+1:]...)
+		return strings.Join(out, "\r\n"), true
+	}
+
+	return rawEmail, false
+}
+
 // modifySubject modifies the Subject header according to the provided pattern
 // The pattern should contain %s which will be replaced with the original subject
 func modifySubject(rawEmail, pattern string) string {

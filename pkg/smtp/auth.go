@@ -43,6 +43,7 @@ type HTTPAuthenticator struct {
 type credCacheEntry struct {
 	passwordHashes       []string // Password hashes from backend
 	allowedFromAddresses []string // Email addresses user can send as
+	identity             string   // Address the login acts as (see AuthResponse.Identity)
 	expiresAt            time.Time
 }
 
@@ -71,6 +72,14 @@ func NewHTTPAuthenticator(urlTemplate, apiKey string, logger *slog.Logger, authC
 type AuthResponse struct {
 	PasswordHashes []string `json:"password_hashes"` // List of hashed passwords (bcrypt, SSHA512, etc.)
 	AllowedFrom    []string `json:"allowed_from"`    // Email addresses user can send as
+
+	// Identity is the address the AUTH username acts as. For an ordinary login
+	// it equals the username; for a master/token login ("user@domain@SUFFIX",
+	// Sora's support access) it is the base address, because the suffix names
+	// the credential and not the sender. The backend is the only authority for
+	// this: an empty value means "no rewrite", so a backend that does not serve
+	// the field behaves exactly as before.
+	Identity string `json:"identity"`
 }
 
 // Authenticate verifies username and password by fetching hash from backend and verifying locally
@@ -94,7 +103,7 @@ func (a *HTTPAuthenticator) AuthenticateWithIP(username, password, remoteIP stri
 				// Creds not in cache - fetch them for CanSendAs later
 				creds, fetchErr := a.fetchCredentials(username, remoteIP)
 				if fetchErr == nil && len(creds.PasswordHashes) > 0 {
-					a.cacheCredentials(username, creds.PasswordHashes, creds.AllowedFrom)
+					a.cacheCredentials(username, creds.PasswordHashes, creds.AllowedFrom, creds.Identity)
 				}
 			}
 			return true, nil
@@ -137,13 +146,13 @@ func (a *HTTPAuthenticator) AuthenticateWithIP(username, password, remoteIP stri
 			// Verify password against fresh credentials
 			if a.verifyAgainstHashes(creds.PasswordHashes, password) {
 				// Success with fresh credentials (password was changed)
-				a.cacheCredentials(username, creds.PasswordHashes, creds.AllowedFrom)
+				a.cacheCredentials(username, creds.PasswordHashes, creds.AllowedFrom, creds.Identity)
 				a.logger.Info("authentication successful with fresh credentials", "username", username)
 				return true, nil
 			}
 
 			// Password still doesn't match - cache fresh credentials
-			a.cacheCredentials(username, creds.PasswordHashes, creds.AllowedFrom)
+			a.cacheCredentials(username, creds.PasswordHashes, creds.AllowedFrom, creds.Identity)
 			return false, fmt.Errorf("password verification failed")
 		}
 	}
@@ -185,12 +194,12 @@ func (a *HTTPAuthenticator) AuthenticateWithIP(username, password, remoteIP stri
 			a.authCache.SetFailure(username, password, AuthInvalidPassword)
 		}
 		// Cache credentials anyway so future attempts can use them
-		a.cacheCredentials(username, creds.PasswordHashes, creds.AllowedFrom)
+		a.cacheCredentials(username, creds.PasswordHashes, creds.AllowedFrom, creds.Identity)
 		return false, fmt.Errorf("password verification failed")
 	}
 
 	// Cache successful authentication
-	a.cacheCredentials(username, creds.PasswordHashes, creds.AllowedFrom)
+	a.cacheCredentials(username, creds.PasswordHashes, creds.AllowedFrom, creds.Identity)
 	if a.authCache != nil {
 		a.authCache.SetSuccess(username, password)
 	}
@@ -327,25 +336,50 @@ func BuildAuthURL(template, email, ip string) string {
 	return strings.ReplaceAll(result, "$ip", url.QueryEscape(ip))
 }
 
-// CanSendAs checks if authenticated user can send as a specific FROM address
-// Supports wildcards in allowed_from patterns (e.g., "*@example.com")
-// If the FROM address is not in the cached allowed list, refetches from backend to detect changes
+// CanSendAs reports whether the authenticated user may send as a FROM address.
+// It is ResolveSender without the resolved address, kept for callers that only
+// need the verdict.
 func (a *HTTPAuthenticator) CanSendAs(authenticatedUser, fromAddress string) bool {
+	_, ok := a.ResolveSender(authenticatedUser, fromAddress)
+	return ok
+}
+
+// ResolveSender authorizes a FROM address for an authenticated user and returns
+// the address the session should actually send as.
+//
+// The two differ only for a master/token login ("user@domain@SUFFIX"), where a
+// client — Sora's webmail prefills its compose form from the login string —
+// may present the suffixed login as the sender. That string is not a routable
+// address, and it carries the master username, which must not reach a
+// recipient. When the FROM address is exactly the login, it is resolved to the
+// identity the backend reported at AUTH and authorized as that. Every other
+// FROM address is authorized as sent, so this cannot be used to send as a third
+// party: the resolved address still has to pass allowed_from.
+//
+// The backend is the sole authority for the rewrite. With no identity served
+// (an older rcptd, or another backend) the login is its own identity and
+// nothing is rewritten.
+//
+// Supports wildcards in allowed_from patterns (e.g., "*@example.com"). If the
+// FROM address is not in the cached allowed list, refetches from the backend to
+// detect changes.
+func (a *HTTPAuthenticator) ResolveSender(authenticatedUser, fromAddress string) (string, bool) {
 	// Get cached credentials entry to check allowed FROM addresses
 	entry := a.getCredCached(authenticatedUser)
 	if entry == nil {
 		// Not in cache - shouldn't happen if Authenticate was called first
 		a.logger.Warn("CanSendAs called but user credentials not in cache", "user", authenticatedUser)
-		return false
+		return "", false
 	}
 
 	// Normalize addresses for comparison
 	authUser := strings.ToLower(strings.TrimSpace(authenticatedUser))
-	fromAddr := extractEmail(fromAddress)
+	identity := resolveIdentity(authUser, entry.identity)
+	fromAddr := resolveFrom(extractEmail(fromAddress), authUser, identity)
 
 	// Check against cached allowed_from list
-	if a.checkAllowedFrom(entry.allowedFromAddresses, authUser, fromAddr) {
-		return true
+	if a.checkAllowedFrom(entry.allowedFromAddresses, identity, fromAddr) {
+		return fromAddr, true
 	}
 
 	// FROM address not in cached list - refetch credentials to check for updates
@@ -364,37 +398,83 @@ func (a *HTTPAuthenticator) CanSendAs(authenticatedUser, fromAddress string) boo
 		} else {
 			a.logger.Error("failed to refetch credentials for CanSendAs check", "user", authenticatedUser, "error", err)
 		}
-		return false
+		return "", false
 	}
 
 	if len(creds.PasswordHashes) == 0 {
 		a.logger.Warn("user serves no password hashes during CanSendAs refetch", "user", authenticatedUser)
-		return false
+		return "", false
 	}
 
 	// Cache fresh credentials
-	a.cacheCredentials(authenticatedUser, creds.PasswordHashes, creds.AllowedFrom)
+	a.cacheCredentials(authenticatedUser, creds.PasswordHashes, creds.AllowedFrom, creds.Identity)
+
+	// The identity may have moved with the refetch, so redo the resolution
+	// against the fresh answer rather than the one the cache held.
+	identity = resolveIdentity(authUser, creds.Identity)
+	fromAddr = resolveFrom(extractEmail(fromAddress), authUser, identity)
 
 	// Check again with fresh allowed_from list
-	if a.checkAllowedFrom(creds.AllowedFrom, authUser, fromAddr) {
+	if a.checkAllowedFrom(creds.AllowedFrom, identity, fromAddr) {
 		a.logger.Info("FROM address allowed after refetch (allowed_from was updated)",
 			"user", authenticatedUser,
 			"from", fromAddr)
-		return true
+		return fromAddr, true
 	}
 
 	a.logger.Warn("FROM address not in allowed list (verified with fresh data)",
 		"authenticated", authUser,
 		"from", fromAddr,
 		"allowed", creds.AllowedFrom)
-	return false
+	return "", false
 }
 
-// checkAllowedFrom checks if fromAddr matches the allowed_from list
-func (a *HTTPAuthenticator) checkAllowedFrom(allowedFromAddresses []string, authUser, fromAddr string) bool {
-	// If no specific allowed addresses configured, default to username match
+// SenderIdentity returns the address this login acts as when that differs from
+// the login itself — i.e. a master/token login — and "" otherwise, including
+// when nothing is cached for the user.
+//
+// It reads the cache only and never refetches: it answers "is this session
+// acting as someone else", which must not cost a backend round trip on every
+// message, and a miss simply means no rewrite.
+func (a *HTTPAuthenticator) SenderIdentity(authenticatedUser string) string {
+	entry := a.getCredCached(authenticatedUser)
+	if entry == nil {
+		return ""
+	}
+	authUser := strings.ToLower(strings.TrimSpace(authenticatedUser))
+	if identity := resolveIdentity(authUser, entry.identity); identity != authUser {
+		return identity
+	}
+	return ""
+}
+
+// resolveIdentity returns the address a login acts as: what the backend served,
+// or the login itself when it served nothing.
+func resolveIdentity(authUser, served string) string {
+	if served = strings.ToLower(strings.TrimSpace(served)); served != "" {
+		return served
+	}
+	return authUser
+}
+
+// resolveFrom maps a FROM address that is really the login string onto the
+// identity it stands for. Everything else passes through untouched.
+func resolveFrom(fromAddr, authUser, identity string) string {
+	if fromAddr == authUser && identity != authUser {
+		return identity
+	}
+	return fromAddr
+}
+
+// checkAllowedFrom checks if fromAddr matches the allowed_from list. identity is
+// the address the session acts as — for a plain login that is the AUTH username
+// itself, for a master login the address it stands in for. It must never be the
+// raw login string: a suffixed login is not an address, so falling back to it
+// here would demand an unroutable envelope sender.
+func (a *HTTPAuthenticator) checkAllowedFrom(allowedFromAddresses []string, identity, fromAddr string) bool {
+	// If no specific allowed addresses configured, default to identity match
 	if len(allowedFromAddresses) == 0 {
-		return authUser == fromAddr
+		return identity == fromAddr
 	}
 
 	// Check if from address matches any allowed pattern (exact, wildcard, or regex)
@@ -537,8 +617,10 @@ func (a *HTTPAuthenticator) getCredCached(username string) *credCacheEntry {
 // within the TTL window.
 const maxCredCacheEntries = 10000
 
-// cacheCredentials stores credentials in cache
-func (a *HTTPAuthenticator) cacheCredentials(username string, passwordHashes []string, allowedFromAddresses []string) {
+// cacheCredentials stores credentials in cache. identity is the address the
+// login acts as (AuthResponse.Identity); an empty value means the login is its
+// own identity.
+func (a *HTTPAuthenticator) cacheCredentials(username string, passwordHashes []string, allowedFromAddresses []string, identity string) {
 	a.credCacheMu.Lock()
 	defer a.credCacheMu.Unlock()
 
@@ -558,6 +640,7 @@ func (a *HTTPAuthenticator) cacheCredentials(username string, passwordHashes []s
 	a.credCache[username] = &credCacheEntry{
 		passwordHashes:       passwordHashes,
 		allowedFromAddresses: allowedFromAddresses,
+		identity:             identity,
 		expiresAt:            time.Now().Add(a.credCacheTTL),
 	}
 }

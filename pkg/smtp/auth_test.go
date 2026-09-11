@@ -674,3 +674,201 @@ func TestCanSendAs_Wildcards(t *testing.T) {
 		})
 	}
 }
+
+// === master/token logins (user@domain@SUFFIX) ===
+
+// masterAuthServer serves an /auth response for a master login: hashes keyed by
+// the full login, an identity of the base address, and the base address's own
+// send-as set.
+func masterAuthServer(t *testing.T, hash string, identity string, allowedFrom []string) (*httptest.Server, *int) {
+	t.Helper()
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(AuthResponse{
+			PasswordHashes: []string{hash},
+			AllowedFrom:    allowedFrom,
+			Identity:       identity,
+		})
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &calls
+}
+
+// A master login may present its own login string as the sender. That is not a
+// routable address, so it resolves to the identity the backend reported.
+func TestResolveSender_MasterLoginResolvesToIdentity(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	bcryptHash, _ := bcrypt.GenerateFromPassword([]byte("masterpass"), bcrypt.DefaultCost)
+
+	const login = "user@example.com@MASTER"
+	const identity = "user@example.com"
+	srv, _ := masterAuthServer(t, string(bcryptHash), identity,
+		[]string{identity, "alias@example.com", "*@team.example.com"})
+
+	auth := NewHTTPAuthenticator(srv.URL, "test-auth-token", logger, nil)
+	if ok, err := auth.Authenticate(login, "masterpass"); err != nil || !ok {
+		t.Fatalf("master login authentication failed: %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		from   string
+		want   string
+		wantOK bool
+	}{
+		{"suffixed login resolves to identity", login, identity, true},
+		{"identity itself passes through", identity, identity, true},
+		{"inherited alias passes through", "alias@example.com", "alias@example.com", true},
+		{"inherited wildcard passes through", "someone@team.example.com", "someone@team.example.com", true},
+		{"display name form of the login", "Support <" + login + ">", identity, true},
+		{"unrelated address stays rejected", "stranger@example.com", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := auth.ResolveSender(login, tt.from)
+			if ok != tt.wantOK {
+				t.Fatalf("ResolveSender(%q) ok = %v, want %v", tt.from, ok, tt.wantOK)
+			}
+			if got != tt.want {
+				t.Errorf("ResolveSender(%q) = %q, want %q", tt.from, got, tt.want)
+			}
+		})
+	}
+}
+
+// A master credential authorizes acting as one user, not as anyone: the
+// resolved address still has to pass allowed_from.
+func TestResolveSender_MasterLoginCannotSendAsThirdParty(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	bcryptHash, _ := bcrypt.GenerateFromPassword([]byte("masterpass"), bcrypt.DefaultCost)
+
+	const login = "user@example.com@MASTER"
+	srv, _ := masterAuthServer(t, string(bcryptHash), "user@example.com", []string{"user@example.com"})
+
+	auth := NewHTTPAuthenticator(srv.URL, "test-auth-token", logger, nil)
+	if ok, err := auth.Authenticate(login, "masterpass"); err != nil || !ok {
+		t.Fatalf("master login authentication failed: %v", err)
+	}
+
+	for _, from := range []string{
+		"victim@example.com",
+		"victim@example.com@MASTER", // another user's login, not this session's
+	} {
+		if _, ok := auth.ResolveSender(login, from); ok {
+			t.Errorf("master login must not be allowed to send as %q", from)
+		}
+	}
+}
+
+// A backend that serves no identity (an older rcptd) must behave exactly as
+// before: no rewrite, and the login is its own identity.
+func TestResolveSender_NoIdentityServedMeansNoRewrite(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	bcryptHash, _ := bcrypt.GenerateFromPassword([]byte("testpass"), bcrypt.DefaultCost)
+
+	srv, _ := masterAuthServer(t, string(bcryptHash), "", []string{"user@example.com"})
+	auth := NewHTTPAuthenticator(srv.URL, "test-auth-token", logger, nil)
+	if ok, err := auth.Authenticate("user@example.com", "testpass"); err != nil || !ok {
+		t.Fatalf("authentication failed: %v", err)
+	}
+
+	got, ok := auth.ResolveSender("user@example.com", "user@example.com")
+	if !ok || got != "user@example.com" {
+		t.Errorf("ResolveSender = (%q, %v), want (user@example.com, true)", got, ok)
+	}
+}
+
+// With an empty allowed_from the fallback compares against the identity, not
+// the raw login: a master login would otherwise be required to use its own
+// unroutable login string as the envelope sender.
+func TestResolveSender_EmptyAllowedFromFallsBackToIdentity(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	bcryptHash, _ := bcrypt.GenerateFromPassword([]byte("masterpass"), bcrypt.DefaultCost)
+
+	const login = "user@example.com@MASTER"
+	const identity = "user@example.com"
+	srv, _ := masterAuthServer(t, string(bcryptHash), identity, nil)
+
+	auth := NewHTTPAuthenticator(srv.URL, "test-auth-token", logger, nil)
+	if ok, err := auth.Authenticate(login, "masterpass"); err != nil || !ok {
+		t.Fatalf("master login authentication failed: %v", err)
+	}
+
+	if got, ok := auth.ResolveSender(login, identity); !ok || got != identity {
+		t.Errorf("identity must be allowed with an empty allowed_from, got (%q, %v)", got, ok)
+	}
+	if got, ok := auth.ResolveSender(login, login); !ok || got != identity {
+		t.Errorf("suffixed login must resolve to identity with an empty allowed_from, got (%q, %v)", got, ok)
+	}
+	if _, ok := auth.ResolveSender(login, "other@example.com"); ok {
+		t.Error("an unrelated address must still be denied with an empty allowed_from")
+	}
+}
+
+// CanSendAs keeps its old signature and verdict for plain logins.
+func TestCanSendAs_UnchangedForPlainLogin(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	bcryptHash, _ := bcrypt.GenerateFromPassword([]byte("testpass"), bcrypt.DefaultCost)
+
+	srv, _ := masterAuthServer(t, string(bcryptHash), "user@example.com",
+		[]string{"user@example.com", "alias@example.com"})
+	auth := NewHTTPAuthenticator(srv.URL, "test-auth-token", logger, nil)
+	if ok, err := auth.Authenticate("user@example.com", "testpass"); err != nil || !ok {
+		t.Fatalf("authentication failed: %v", err)
+	}
+
+	if !auth.CanSendAs("user@example.com", "alias@example.com") {
+		t.Error("alias should be allowed")
+	}
+	if auth.CanSendAs("user@example.com", "stranger@example.com") {
+		t.Error("stranger should be denied")
+	}
+}
+
+// SenderIdentity answers "is this session acting as someone else", from cache
+// only: it must never cost a backend round trip, since Session.Mail asks on
+// every message.
+func TestSenderIdentity(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	bcryptHash, _ := bcrypt.GenerateFromPassword([]byte("pw"), bcrypt.DefaultCost)
+
+	t.Run("master login reports the identity", func(t *testing.T) {
+		const login = "user@example.com@MASTER"
+		srv, calls := masterAuthServer(t, string(bcryptHash), "user@example.com", []string{"user@example.com"})
+		auth := NewHTTPAuthenticator(srv.URL, "test-auth-token", logger, nil)
+		if ok, err := auth.Authenticate(login, "pw"); err != nil || !ok {
+			t.Fatalf("authentication failed: %v", err)
+		}
+		before := *calls
+		if got := auth.SenderIdentity(login); got != "user@example.com" {
+			t.Errorf("SenderIdentity = %q, want user@example.com", got)
+		}
+		if *calls != before {
+			t.Errorf("SenderIdentity made %d backend call(s); it must read cache only", *calls-before)
+		}
+	})
+
+	t.Run("plain login reports nothing", func(t *testing.T) {
+		srv, _ := masterAuthServer(t, string(bcryptHash), "user@example.com", []string{"user@example.com"})
+		auth := NewHTTPAuthenticator(srv.URL, "test-auth-token", logger, nil)
+		if ok, err := auth.Authenticate("user@example.com", "pw"); err != nil || !ok {
+			t.Fatalf("authentication failed: %v", err)
+		}
+		if got := auth.SenderIdentity("user@example.com"); got != "" {
+			t.Errorf("SenderIdentity = %q, want empty for a plain login", got)
+		}
+	})
+
+	t.Run("uncached user reports nothing", func(t *testing.T) {
+		srv, calls := masterAuthServer(t, string(bcryptHash), "user@example.com", nil)
+		auth := NewHTTPAuthenticator(srv.URL, "test-auth-token", logger, nil)
+		if got := auth.SenderIdentity("nobody@example.com"); got != "" {
+			t.Errorf("SenderIdentity = %q, want empty for an uncached user", got)
+		}
+		if *calls != 0 {
+			t.Errorf("SenderIdentity must not fetch, made %d call(s)", *calls)
+		}
+	})
+}
