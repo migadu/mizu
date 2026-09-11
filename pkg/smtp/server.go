@@ -852,6 +852,15 @@ func (s *Session) serverType() string {
 	return "unknown"
 }
 
+// junkAction returns the effective junk apply_action for this server,
+// defaulting to "header" when unset.
+func (s *Session) junkAction() string {
+	if s.serverConfig.Junk.ApplyAction != "" {
+		return s.serverConfig.Junk.ApplyAction
+	}
+	return "header"
+}
+
 // Helo is called for the HELO/EHLO command.
 // RFC 5321 requires this to be the first command in an SMTP session.
 func (s *Session) Helo(hostname string) error {
@@ -1919,10 +1928,7 @@ func (s *Session) deliverMessage(ctx context.Context, rawEmail string) error {
 
 	// Apply junk modifications if message is marked as junk
 	if s.isJunk {
-		action := s.serverConfig.Junk.ApplyAction
-		if action == "" {
-			action = "header" // Default action
-		}
+		action := s.junkAction()
 
 		switch action {
 		case "header":
@@ -2000,22 +2006,27 @@ func (s *Session) deliverToRecipient(ctx context.Context, signedEmail string, re
 	// recipient it was sent for.
 	emailForRecipient := addEnvelopeToHeader(signedEmail, recipient)
 
-	err := poster.PostEmailToDestinationWithContext(
-		ctx,
-		emailForRecipient,
-		s.serverConfig.Delivery.URL,
-		s.serverConfig.Delivery.AuthToken,
-		s.serverConfig.Delivery.MaxRetryAttempts,
-		s.isJunk,
-		s.from,
-		recipient,
-		s.traceID,
-		s.authenticatedUser,
-		s.circuitBreaker,
-		s.httpClient,
-		s.Logger,
-		s.metrics,
-	)
+	delivery := poster.Delivery{
+		RawEmail:          emailForRecipient,
+		URL:               s.serverConfig.Delivery.URL,
+		AuthToken:         s.serverConfig.Delivery.AuthToken,
+		MaxRetryAttempts:  s.serverConfig.Delivery.MaxRetryAttempts,
+		MailFrom:          s.from,
+		MailTo:            recipient,
+		TraceID:           s.traceID,
+		AuthenticatedUser: s.authenticatedUser,
+		Origin:            s.serverConfig.Type,
+		ClientIP:          s.remoteAddr,
+		IsJunk:            s.isJunk,
+	}
+	if s.isJunk {
+		delivery.JunkAction = s.junkAction()
+	}
+	if s.spamResult != nil {
+		delivery.Spam = &poster.SpamVerdict{Score: s.spamResult.Score, Action: s.spamResult.Action}
+	}
+
+	err := poster.PostEmailToDestinationWithContext(ctx, delivery, s.circuitBreaker, s.httpClient, s.Logger, s.metrics)
 
 	if err != nil {
 		s.Logger.Error(fmt.Sprintf("Failed to deliver message for recipient %s: %v", recipient, err))

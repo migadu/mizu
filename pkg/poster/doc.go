@@ -117,20 +117,17 @@
 //
 // # Example Usage
 //
-//	err := poster.PostEmailToDestinationWithContext(
-//	    ctx,
-//	    rawEmail,
-//	    "https://backend.example.com/email",
-//	    "api-key-secret",
-//	    3,  // max retry attempts
-//	    false,  // is_junk
-//	    "sender@example.com",
-//	    "recipient@example.com",
-//	    "trace-id-123",
-//	    circuitBreaker,
-//	    httpClient,
-//	    logger,
-//	)
+//	err := poster.PostEmailToDestinationWithContext(ctx, poster.Delivery{
+//	    RawEmail:         rawEmail,
+//	    URL:              "https://backend.example.com/email",
+//	    AuthToken:        "api-key-secret",
+//	    MaxRetryAttempts: 3,
+//	    MailFrom:         "sender@example.com",
+//	    MailTo:           "recipient@example.com",
+//	    TraceID:          "trace-id-123",
+//	    Origin:           "relay",
+//	    ClientIP:         "203.0.113.7",
+//	}, circuitBreaker, httpClient, logger, metrics)
 //	if err != nil {
 //	    var httpErr *poster.HTTPStatusError
 //	    if errors.As(err, &httpErr) {

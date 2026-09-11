@@ -82,11 +82,100 @@ Relevant existing capabilities (so we don't rebuild them):
 | Sender validation (HTTP) & recipient validation (HTTP), LRU-cached                                     | Yes        | `pkg/sender/`, `pkg/recipient/`                       |
 | IP/domain reputation + stats, S3/gossip sync                                                           | Yes        | `pkg/stats/`                                          |
 | Auth abuse blocking (progressive delay, IP/user blocks)                                                | Yes        | `pkg/smtp/auth_rate_limiter.go`                       |
-| Feeds mailqueuer `/ingest` with `X-Trace-Id`, `X-Auth-User`, `X-Junk`, `X-Mizu-Authentication-Results` | Yes        | mizu→mailqueuer contract                              |
+| Feeds mailqueuer `/ingest`: envelope, origin, client IP, auth user, rspamd score/action, junk verdict | Yes        | `pkg/poster` `Delivery`; contract in §2.1             |
 
 **Gaps** mizu does not have: GeoIP/country, per-recipient-domain allow/deny/junk
 lists, external-map lookups, MIME **body** rewriting (footers), hierarchical
 daily counters, forwarding authorization.
+
+### 2.1 mizu → mailqueuer ingest contract (as sent)
+
+mizu makes **one `POST` per envelope recipient** to `[server.delivery] url`.
+The body is the raw RFC 822 message, including the headers mizu stamps into it
+(`X-Envelope-To`, `Received`, and the `X-Mizu-*` set such as
+`X-Mizu-Authentication-Results`). All other metadata travels as **HTTP request
+headers only**. It is never written into the message, so recipients never see it.
+Built by `Delivery.applyHeaders` in `pkg/poster/poster.go`.
+
+| Header (wire casing) | Value                                                       | Sent when                           |
+|----------------------|-------------------------------------------------------------|-------------------------------------|
+| `Content-Type`       | `message/rfc822`                                            | always                              |
+| `Authorization`      | `Bearer <delivery.auth_token>`                              | a token is configured               |
+| `X-Mail-To`          | the single envelope recipient of this POST                  | always                              |
+| `X-Mail-From`        | envelope `MAIL FROM`                                        | sender is not null (`<>`)           |
+| `X-Trace-Id`         | session trace ID, same as the `Received` header's `id`      | always                              |
+| `X-Mail-Origin`      | `relay` or `submission`                                     | always                              |
+| `X-Client-Ip`        | connecting client IP, no port, PROXY-protocol aware         | always                              |
+| `X-Auth-User`        | SMTP AUTH login                                             | authenticated submission            |
+| `X-Junk`             | `yes`                                                       | any check classified the message junk |
+| `X-Junk-Action`      | configured `junk.apply_action`, default `header`            | whenever `X-Junk` is sent           |
+| `X-Spam-Score`       | rspamd score, two decimals (`7.50`)                         | rspamd check ran                    |
+| `X-Spam-Action`      | rspamd action (`no action`, `add header`, `greylist`, …)    | rspamd check ran                    |
+
+Captured from real SMTP sessions against a recording backend. The host, port,
+trace ID, and `Content-Length` vary per message; the header set does not.
+
+Relay, message flagged by rspamd and a matching junk header:
+
+```http
+POST /ingest HTTP/1.1
+Host: 127.0.0.1:49421
+Accept-Encoding: gzip
+Authorization: Bearer delivery-secret
+Content-Length: 488
+Content-Type: message/rfc822
+User-Agent: Go-http-client/1.1
+X-Client-Ip: 127.0.0.1
+X-Junk: yes
+X-Junk-Action: header
+X-Mail-From: alice@sender.example
+X-Mail-Origin: relay
+X-Mail-To: bob@dest.example
+X-Spam-Action: add header
+X-Spam-Score: 7.50
+X-Trace-Id: 0f93c52719187abc
+```
+
+Submission over STARTTLS with AUTH PLAIN, clean message, rspamd disabled:
+
+```http
+POST /ingest HTTP/1.1
+Host: 127.0.0.1:49421
+Accept-Encoding: gzip
+Authorization: Bearer delivery-secret
+Content-Length: 416
+Content-Type: message/rfc822
+User-Agent: Go-http-client/1.1
+X-Auth-User: alice@sender.example
+X-Client-Ip: 127.0.0.1
+X-Mail-From: alice@sender.example
+X-Mail-Origin: submission
+X-Mail-To: bob@dest.example
+X-Trace-Id: 0189652b3f0499d2
+```
+
+A clean relay message with rspamd disabled carries only the always-sent rows:
+no `X-Auth-User`, `X-Junk`, `X-Junk-Action`, `X-Spam-Score` or `X-Spam-Action`.
+
+Notes for mailqueuer:
+
+- **Match header names case-insensitively.** Go canonicalizes names on the wire,
+  so the code's `X-Trace-ID` and `X-Client-IP` arrive as `X-Trace-Id` and
+  `X-Client-Ip`. HTTP header names are case-insensitive (RFC 9110).
+- **`Host`, `Content-Length`, `User-Agent` and `Accept-Encoding` come from Go's
+  HTTP client**, not from mizu. They are not part of the contract.
+- **`X-Junk-Action` is a policy setting, not an outcome.** Only `header` and
+  `subject` change the body, and `reject` is enforced only when a
+  `junk.check_headers` entry matches. Junk flagged by rspamd or DMARC on a
+  server set to `reject` is still delivered, verified by capture with
+  `X-Junk-Action: reject`. Do not read it as "mizu rejected this".
+- **There is no HELO header, by design.** HELO is client-supplied text, and a
+  single control byte in any header value makes Go's HTTP client refuse the
+  whole request. That turns a hostile or buggy HELO into a failed delivery on
+  every retry, so no client-controlled text goes into this contract.
+- mailqueuer does not read `X-Mail-Origin`, `X-Client-Ip`, `X-Spam-Score` or
+  `X-Spam-Action` yet. They are available for the ledger and for the CSV
+  `score` and `action` columns (§3.10).
 
 ---
 
@@ -217,8 +306,11 @@ Legend — **Tier** (A/B/C per §1). **Effort**: rough size.
   - `mailqueuer/internal/ledger/ledger.go` is a richer **25-column SQLite
     ledger** (ingested/delivered/bounced/retrying/dead, plus `auth_spf/dkim/dmarc/
     arc`, `auth_user`, smtp_code, mx_host, trace_id, size, attempt, duration…),
-    populated from the headers mizu already sends to `/ingest`
-    (`X-Mizu-Authentication-Results`, `X-Auth-User`, `X-Trace-Id`).
+    populated from what mizu sends to `/ingest`: `X-Mizu-Authentication-Results`
+    in the message body, and `X-Auth-User` and `X-Trace-Id` as HTTP headers.
+    mizu now also sends `X-Spam-Score`, `X-Spam-Action`, `X-Client-Ip` and
+    `X-Mail-Origin`, which can populate the CSV `score`/`action` columns once
+    mailqueuer reads them. Full contract in §2.1.
 - **Verdict:** **Do not port.** mizu's only responsibility here is to keep
   emitting accurate ingest headers (it already does). Duplicating a per-message
   log in mizu would be redundant. **One dependency to note:** the CSV `country`

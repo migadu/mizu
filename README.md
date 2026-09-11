@@ -335,7 +335,7 @@ QUIT
 3.  **Sender Validation**: Verify authenticated user can send from specified FROM address.
 4.  **Per-User Rate Limiting**: Check per-user email sending limits.
 5.  **Content Validation**: Validate headers, reject missing Message-ID/Date.
-6.  **Synchronous Delivery**: Send to backend with `X-Auth-User` header containing authenticated username.
+6.  **Synchronous Delivery**: Send to backend with `X-Auth-User` header containing authenticated username. The POST also carries `X-Mail-Origin`, `X-Client-IP`, `X-Spam-Score`, `X-Spam-Action`, and `X-Junk-Action` as HTTP request headers (never in the message body); see `pkg/poster.Delivery` for the full contract.
 7.  **SMTP Response**: `250 OK` only if HTTP delivery succeeded.
 
 ## 🎯 Architecture Decisions

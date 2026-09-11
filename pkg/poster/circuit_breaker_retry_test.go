@@ -43,22 +43,15 @@ func TestCircuitBreaker_RetriesContinueWhenOpen(t *testing.T) {
 	httpClient := &http.Client{Timeout: 5 * time.Second}
 
 	// Try to post email with 3 retry attempts
-	err := PostEmailToDestinationWithContext(
-		context.Background(),
-		"Subject: Test\r\n\r\nTest email",
-		backend.URL,
-		"test-key",
-		3, // 3 retry attempts
-		false,
-		"sender@example.com",
-		"recipient@example.com",
-		"test-trace",
-		"",
-		cb,
-		httpClient,
-		slog.New(slog.NewTextHandler(io.Discard, nil)),
-		nil,
-	)
+	err := PostEmailToDestinationWithContext(context.Background(), Delivery{
+		RawEmail:         "Subject: Test\r\n\r\nTest email",
+		URL:              backend.URL,
+		AuthToken:        "test-key",
+		MaxRetryAttempts: 3, // 3 retry attempts
+		MailFrom:         "sender@example.com",
+		MailTo:           "recipient@example.com",
+		TraceID:          "test-trace",
+	}, cb, httpClient, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 
 	// Should succeed even though circuit opened during retries
 	if err != nil {
@@ -101,22 +94,15 @@ func TestCircuitBreaker_AllRetriesFailWithCircuitOpen(t *testing.T) {
 
 	httpClient := &http.Client{Timeout: 5 * time.Second}
 
-	err := PostEmailToDestinationWithContext(
-		context.Background(),
-		"Subject: Test\r\n\r\nTest email",
-		backend.URL,
-		"test-key",
-		3,
-		false,
-		"sender@example.com",
-		"recipient@example.com",
-		"test-trace",
-		"",
-		cb,
-		httpClient,
-		slog.New(slog.NewTextHandler(io.Discard, nil)),
-		nil,
-	)
+	err := PostEmailToDestinationWithContext(context.Background(), Delivery{
+		RawEmail:         "Subject: Test\r\n\r\nTest email",
+		URL:              backend.URL,
+		AuthToken:        "test-key",
+		MaxRetryAttempts: 3,
+		MailFrom:         "sender@example.com",
+		MailTo:           "recipient@example.com",
+		TraceID:          "test-trace",
+	}, cb, httpClient, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 
 	// Should fail after all retries exhausted
 	if err == nil {
@@ -164,22 +150,15 @@ func TestCircuitBreaker_OpensButRecoversInRetryWindow(t *testing.T) {
 	httpClient := &http.Client{Timeout: 5 * time.Second}
 
 	start := time.Now()
-	err := PostEmailToDestinationWithContext(
-		context.Background(),
-		"Subject: Test\r\n\r\nTest email",
-		backend.URL,
-		"test-key",
-		5, // More retries to allow circuit to recover
-		false,
-		"sender@example.com",
-		"recipient@example.com",
-		"test-trace",
-		"",
-		cb,
-		httpClient,
-		slog.New(slog.NewTextHandler(io.Discard, nil)),
-		nil,
-	)
+	err := PostEmailToDestinationWithContext(context.Background(), Delivery{
+		RawEmail:         "Subject: Test\r\n\r\nTest email",
+		URL:              backend.URL,
+		AuthToken:        "test-key",
+		MaxRetryAttempts: 5, // More retries to allow circuit to recover
+		MailFrom:         "sender@example.com",
+		MailTo:           "recipient@example.com",
+		TraceID:          "test-trace",
+	}, cb, httpClient, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 	elapsed := time.Since(start)
 
 	if err != nil {

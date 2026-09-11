@@ -27,15 +27,17 @@ func testConfig() *config.Config {
 // multiple recipients deliver one HTTP POST per recipient.
 func TestMultipleRecipients_DeliveryToBackend(t *testing.T) {
 	var mu sync.Mutex
-	var posts []struct{ from, to, body string }
+	var posts []struct{ from, to, origin, clientIP, body string }
 
 	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		mu.Lock()
-		posts = append(posts, struct{ from, to, body string }{
-			from: r.Header.Get("X-Mail-From"),
-			to:   r.Header.Get("X-Mail-To"),
-			body: string(body),
+		posts = append(posts, struct{ from, to, origin, clientIP, body string }{
+			from:     r.Header.Get("X-Mail-From"),
+			to:       r.Header.Get("X-Mail-To"),
+			origin:   r.Header.Get("X-Mail-Origin"),
+			clientIP: r.Header.Get("X-Client-IP"),
+			body:     string(body),
 		})
 		mu.Unlock()
 		w.WriteHeader(http.StatusOK)
@@ -46,6 +48,7 @@ func TestMultipleRecipients_DeliveryToBackend(t *testing.T) {
 	if len(cfg.Servers) == 0 {
 		cfg.Servers = append(cfg.Servers, config.ServerConfig{ListenAddr: ":25"})
 	}
+	cfg.Servers[0].Type = "relay" // Config validation requires a type; it is forwarded as X-Mail-Origin
 	cfg.Servers[0].Delivery = config.DeliveryConfig{
 		URL:                backendServer.URL,
 		AuthToken:          "test-token",
@@ -66,7 +69,7 @@ func TestMultipleRecipients_DeliveryToBackend(t *testing.T) {
 		statsManager: stats.NewServerRecorder(statsManager, "test", 0, 0),
 		httpClient:   &http.Client{},
 		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
-		remoteAddr:   "192.0.2.1:12345",
+		remoteAddr:   "192.0.2.1", // NewSession stores the bare IP; mirror that here
 		traceID:      "test-trace-123",
 	}
 
@@ -87,6 +90,12 @@ func TestMultipleRecipients_DeliveryToBackend(t *testing.T) {
 		}
 		if p.to != expectedRecipients[i] {
 			t.Errorf("POST %d: expected X-Mail-To '%s', got '%s'", i, expectedRecipients[i], p.to)
+		}
+		if p.origin != "relay" {
+			t.Errorf("POST %d: expected X-Mail-Origin 'relay', got '%s'", i, p.origin)
+		}
+		if p.clientIP != "192.0.2.1" {
+			t.Errorf("POST %d: expected X-Client-IP '192.0.2.1', got '%s'", i, p.clientIP)
 		}
 		if !strings.Contains(p.body, "This is a test email") {
 			t.Errorf("POST %d: expected email body to contain test message", i)

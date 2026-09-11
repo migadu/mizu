@@ -114,6 +114,35 @@ Key packages:
      - States: Closed → Open → HalfOpen
      - When open: Returns `ErrCircuitOpen` (marked as retryable), so retries continue
    - **Zero message loss**: SMTP `250 OK` only after successful HTTP delivery
+   - **Delivery request contract** (`poster.Delivery.applyHeaders`): one `POST`
+     per recipient to `[server.delivery] url`, body = raw RFC 822 message as
+     `Content-Type: message/rfc822`, `Authorization: Bearer <auth_token>`.
+     Per-message metadata travels as **HTTP request headers only**; it is
+     never written into the message body, so recipients never see it:
+     - Always: `X-Mail-To` (this recipient), `X-Trace-ID`, `X-Mail-Origin`
+       (`relay`|`submission`), `X-Client-IP` (no port, PROXY-aware)
+     - When set: `X-Mail-From` (empty for null sender), `X-Auth-User`
+       (authenticated submission)
+     - Junk: `X-Junk: yes` plus `X-Junk-Action` when the message was classified
+       junk. `X-Junk-Action` is the *configured* `junk.apply_action` (default
+       `header`), not an outcome: junk flagged by rspamd or DMARC on a server set
+       to `reject` is still delivered, carrying `X-Junk-Action: reject`
+     - Rspamd: `X-Spam-Score` (`%.2f`) and `X-Spam-Action` (rspamd verdict,
+       e.g. `no action`, `add header`, `greylist`, `reject`) only when the
+       spam check ran; absent when disabled or on fail-open error
+     - `X-Client-IP` is sent regardless of `strip_client_identity`, which
+       governs only the recipient-visible `Received` header
+     - Go canonicalizes names on the wire (`X-Trace-Id`, `X-Client-Ip`), and its
+       client adds `Host`, `Content-Length`, `User-Agent`, `Accept-Encoding`.
+       Captured requests: [docs/rspamd-plugin-migration-plan.md](docs/rspamd-plugin-migration-plan.md) §2.1
+   - **Never put client-supplied text in a delivery request header.** Go's
+     transport rejects the *entire* request when any header value contains a
+     control byte, so a hostile or buggy `HELO` would fail every retry and turn
+     into a silent 451/bounce. A `X-Client-Helo` header was removed for exactly
+     this reason: `parseHelloArgument` (go-smtp) validates no characters, and
+     `validateHeloHostname` rejects only space/tab/CR/LF/NUL and is off by
+     default on submission. Every value in `Delivery` is mizu-generated (config
+     or the parsed socket address); keep it that way, or sanitize first.
    - **Sender MTA retries**: If all attempts fail, sender's MTA retries for 24-48 hours (RFC 5321)
 
 7. **TLS Certificate Management** ([pkg/tls/](pkg/tls/))
