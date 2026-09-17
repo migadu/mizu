@@ -11,9 +11,9 @@ import (
 // ClusterAwareCache wraps an autocert.Cache and only allows the cluster leader
 // to write new certificates. All nodes can read certificates from the cache.
 //
-// This prevents race conditions with Let's Encrypt when multiple nodes
-// simultaneously request certificates for the same domain, which could trigger
-// Let's Encrypt rate limits.
+// This is a backstop, not the leader gate: autocert writes to the cache only
+// after it has obtained a certificate, so refusing the write cannot stop a node
+// from ordering one. acmeTransport does that.
 type ClusterAwareCache struct {
 	underlying autocert.Cache
 	isLeaderF  func() bool
@@ -59,7 +59,7 @@ func (c *ClusterAwareCache) Put(ctx context.Context, name string, data []byte) e
 
 	if !isLeader {
 		c.logger.Warn("cluster cache: certificate request BLOCKED - not cluster leader (leader will handle it)", "name", name)
-		return fmt.Errorf("only cluster leader can request new certificates")
+		return fmt.Errorf("%w: refused to store %s", ErrNotLeader, name)
 	}
 
 	c.logger.Info("cluster cache: cluster leader storing certificate", "name", name)
@@ -79,7 +79,7 @@ func (c *ClusterAwareCache) Delete(ctx context.Context, name string) error {
 
 	if !isLeader {
 		c.logger.Debug("cluster cache: skipping certificate delete (not cluster leader)", "name", name)
-		return fmt.Errorf("only cluster leader can delete certificates")
+		return fmt.Errorf("%w: refused to delete %s", ErrNotLeader, name)
 	}
 
 	c.logger.Info("cluster cache: cluster leader deleting certificate", "name", name)

@@ -690,6 +690,9 @@ func cmdCerts() {
 	}
 }
 
+// renewCertTimeout matches the server's allowance for a synchronous renewal.
+const renewCertTimeout = 11*time.Minute + 30*time.Second
+
 func cmdRenewCert() {
 	// Support both: renew-cert relay.example.com
 	//           and: renew-cert --domain relay.example.com
@@ -707,7 +710,12 @@ func cmdRenewCert() {
 		os.Exit(1)
 	}
 
-	fmt.Printf("Forcing certificate renewal for %s...\n", domain)
+	fmt.Printf("Ordering a new certificate for %s (usually under a minute)...\n", domain)
+
+	// The server answers once the CA has: far longer than the default timeout.
+	if timeout < renewCertTimeout {
+		timeout = renewCertTimeout
+	}
 
 	bodyJSON, _ := json.Marshal(map[string]string{"domain": domain})
 	body := strings.NewReader(string(bodyJSON))
@@ -726,18 +734,30 @@ func cmdRenewCert() {
 		fatal("Failed to parse response: %v", err)
 	}
 
-	if status, ok := result["status"].(string); ok && status == "success" {
-		fmt.Println("✓ Certificate cache cleared successfully")
-		if msg, ok := result["message"].(string); ok {
-			fmt.Printf("  %s\n", msg)
+	printRenewed := func() {
+		if renewed, ok := result["renewed"].([]any); ok {
+			for _, r := range renewed {
+				fmt.Printf("  %v\n", r)
+			}
 		}
-		fmt.Println("  The next TLS connection will trigger a fresh ACME certificate request.")
-		fmt.Printf("  Trigger with: openssl s_client -connect %s:465 -servername %s </dev/null\n", domain, domain)
-	} else {
-		fmt.Println("✗ Certificate renewal failed")
+	}
+
+	switch status, _ := result["status"].(string); status {
+	case "success":
+		fmt.Println("✓ Certificate renewed and in service on this node")
+		printRenewed()
+		fmt.Println("  Other cluster nodes pick it up from shared storage within the hour.")
+	case "partial":
+		fmt.Println("⚠ Certificate renewed for some key types only")
+		printRenewed()
+		fmt.Printf("  Error: %v\n", result["error"])
+		os.Exit(1)
+	default:
+		fmt.Println("✗ Certificate renewal failed - the current certificate is unchanged")
 		if msg, ok := result["error"].(string); ok {
 			fmt.Printf("  Error: %s\n", msg)
 		}
+		os.Exit(1)
 	}
 }
 
@@ -932,8 +952,10 @@ func handleTLSList(ctx context.Context) {
 		status := "Valid"
 		expiryStr := "-"
 		if !cert.Expiry.IsZero() {
+			// Compare instants, not whole days: the division truncates toward
+			// zero, so a cert that expired 11 hours ago is still "0 days" away.
 			daysUntilExpiry := int(time.Until(cert.Expiry).Hours() / 24)
-			if daysUntilExpiry < 0 {
+			if time.Now().After(cert.Expiry) {
 				expiryStr = "EXPIRED"
 				status = "Expired"
 			} else if daysUntilExpiry < 7 {

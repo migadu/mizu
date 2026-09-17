@@ -732,6 +732,10 @@ func (s *Server) flushCacheHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// renewCertTimeout covers a synchronous renewal: autocert allows each of the two
+// orders (ECDSA, RSA) up to five minutes. Normally both finish in well under one.
+const renewCertTimeout = 11 * time.Minute
+
 // renewCertHandler handles /api/renew-cert requests
 func (s *Server) renewCertHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -770,8 +774,26 @@ func (s *Server) renewCertHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The renewal runs to completion before answering, so the caller gets the
+	// CA's verdict (a rate limit, a failed validation) instead of a promise. That
+	// outlasts the server's WriteTimeout, which exists for slow clients.
+	if err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(renewCertTimeout)); err != nil {
+		s.logger.Warn("Cannot extend write deadline for certificate renewal", "error", err)
+	}
+
 	s.logger.Info("Certificate renewal requested", "domain", domain)
 	renewed, err := s.certRenewer.RenewCertificate(domain)
+	if err != nil && len(renewed) > 0 {
+		s.logger.Error("Certificate renewal partially failed", "domain", domain, "renewed", renewed, "error", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"status":  "partial",
+			"error":   err.Error(),
+			"renewed": renewed,
+		})
+		return
+	}
 	if err != nil {
 		s.logger.Error("Certificate renewal failed", "domain", domain, "error", err)
 		w.Header().Set("Content-Type", "application/json")
@@ -787,7 +809,7 @@ func (s *Server) renewCertHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]any{
 		"status":  "success",
-		"message": fmt.Sprintf("Certificate cache cleared for %s — next TLS handshake will trigger fresh ACME request", domain),
+		"message": fmt.Sprintf("New certificate for %s issued, stored and in service", domain),
 		"renewed": renewed,
 	})
 }

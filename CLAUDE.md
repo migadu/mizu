@@ -79,6 +79,17 @@ Key packages:
 2. **Distributed Coordination** ([pkg/cluster/](pkg/cluster/))
    - Uses **hashicorp/memberlist** for P2P gossip protocol
    - Supports leader election for TLS certificate management
+   - **A node elects nobody until its membership is confirmed**
+     (`membershipConfirmed`, [pkg/cluster/memberlist.go](pkg/cluster/memberlist.go)).
+     The leader is the smallest node name, and a node that has not reached its
+     peers is the only name it knows — it would elect itself. With peers
+     configured, `IsLeader()` is false and `GetLeader()` is `""` until another
+     member is seen, or until `LeaderGracePeriod` (1 min) passes with no peer
+     reachable, so a genuinely lone node can still renew certificates.
+   - **memberlist never retries a join.** `rejoinLoop` retries every 15s while
+     the node is alone. Without it, nodes restarted at the same moment (an
+     ansible deploy) each miss the other's listener and stay one-member
+     clusters — each one leader — until the next restart.
    - Shares connection state and rate limits across cluster nodes
    - Message types: `MessageTypeConnectionState`, `MessageTypeRateLimit`
 
@@ -121,6 +132,57 @@ Key packages:
    - Distributed mode: Only cluster leader obtains certificates, stores in S3
    - Uses S3 for certificate storage across instances
    - Alternative: certmagic library for on-demand certificates
+   - **The leader gate is the ACME HTTP transport** (`acmeTransport`,
+     [pkg/tls/acme_transport.go](pkg/tls/acme_transport.go)), not the cache.
+     autocert orders a certificate *first* and writes the cache *afterwards*, so
+     refusing cache writes (`ClusterAwareCache`, kept as a backstop) cannot stop
+     a non-leader ordering: it obtains a cert, fails to store it, and retries
+     every 30-60 min. That loop burned Let's Encrypt's 5-per-week duplicate
+     limit and let every certificate expire (2026-09-17). A non-leader now gets
+     `ErrNotLeader` before any request leaves the node. The same transport logs
+     every ACME error response — autocert retries renewals silently, so this is
+     the only place a 429 or failed validation shows up.
+   - **S3 is the source of truth; never read the local dir first**
+     (`FallbackCache`, [pkg/tls/fallback_cache.go](pkg/tls/fallback_cache.go)).
+     Every node holds a local copy of every cert it has served, so a local-first
+     read never sees the leader's renewal. Local is used only when S3 is
+     unreachable — not when S3 answers "not found". Challenge keys (`+token`,
+     `+http-01`) never touch the local dir: a leftover outlives its 24h validity
+     and shadows the token of the next order during cross-node validation.
+   - **No directory sweep to S3.** Only keys this process failed to write during
+     an S3 outage are pushed later (`SyncPendingToS3`). A local file says nothing
+     about being newer than S3; the former startup sync let a restarted node
+     overwrite renewed certificates with stale ones.
+   - **The leader maintains every configured domain, both key types**
+     (`maintainCertificates`, hourly, first run delayed 2 min for the cluster to
+     converge). autocert only renews what it has loaded, and only loads what it
+     is asked for in a handshake — a sibling node's hostname never reaches the
+     leader. Non-leaders pick certs up from S3: on a handshake once the failed
+     state clears (1 min), or when their own renewal timer re-reads the cache.
+   - **autocert cannot drop a loaded certificate or stop its timers**, so the
+     only reset is replacing the whole `autocert.Manager`
+     (`Manager.reload`, [pkg/tls/renewal.go](pkg/tls/renewal.go)). The replaced
+     instance is *retired* (its `acmeTransport` refuses everything): its renewal
+     timers live on for the life of the process and must never order. `reload`
+     first makes the new instance load everything the old one serves, and keeps
+     the old one if the cache cannot supply it.
+   - **`renew-cert` orders first, replaces after** (`RenewCertificate`). A
+     throwaway instance behind a `hidingCache` orders into the shared cache while
+     the live instance keeps serving; only then `reload`. Never delete the cache
+     entry up front — a failed order (rate limit) would leave the domain with no
+     certificate. The call is synchronous: `/api/renew-cert` extends its write
+     deadline to 11 min and `mizu-admin` its client timeout, so the operator
+     gets the CA's actual answer. Leader only.
+   - **Certs replaced early reach other nodes via `adoptNewerFromCache`**
+     (hourly maintenance tick, every node). autocert re-reads the cache only at
+     a cert's renewal time, so a forced renewal or a hand-placed S3 entry would
+     otherwise be ignored for up to two months. It reloads only when the served
+     cert is *outside* its renewal window — inside it autocert polls the cache
+     itself, and reloading there would replace the instance on every routine
+     renewal.
+   - Recovery when issued certs were lost: autocert's renewal reuses the private
+     key, so a discarded cert is rebuildable from the CT logs (crt.sh) plus the
+     key in the old cache entry — [contrib/recover-cert.sh](contrib/recover-cert.sh).
 
 8. **Email Validation** ([pkg/validation/](pkg/validation/))
    - SPF validation (checks sender IP authorization)

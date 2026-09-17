@@ -4,12 +4,17 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
+
+	"migadu/mizu/pkg/concurrency"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/retry"
@@ -50,20 +55,45 @@ type S3Config struct {
 	SecretKey string
 }
 
+const (
+	// certMaintenanceDelay puts the first maintenance run after the cluster has
+	// settled who the leader is: a node that cannot reach its peers claims no
+	// leader for cluster.Config.LeaderGracePeriod (1 minute by default).
+	certMaintenanceDelay = 2 * time.Minute
+
+	certMaintenanceInterval = time.Hour
+
+	// defaultRenewBefore mirrors autocert's cap on the renewal window.
+	defaultRenewBefore = 30 * 24 * time.Hour
+)
+
 // Manager orchestrates TLS certificate management using Let's Encrypt.
 type Manager struct {
-	autocertManager *autocert.Manager
-	logger          *slog.Logger
-	domains         []string
-	defaultDomain   string
-	syncWorker      *CertSyncWorker
-	tlsConfig       *tls.Config
-	isLeaderF       func() bool
+	current atomic.Pointer[autocertInstance] // replaced by reload
+	renewMu sync.Mutex                       // one RenewCertificate at a time
+
+	// What every autocert instance is built from (see newAutocert).
+	cache          autocert.Cache
+	hostPolicy     autocert.HostPolicy
+	email          string
+	directoryURL   string
+	renewBeforeCfg time.Duration // autocert's RenewBefore; 0 = its default
+	acmeBase       http.RoundTripper
+
+	logger        *slog.Logger
+	domains       []string
+	defaultDomain string
+	syncWorker    *CertSyncWorker
+	tlsConfig     *tls.Config
+	isLeaderF     func() bool
+	renewBefore   time.Duration
+	stopCh        chan struct{}
 }
 
 // NewManager creates a new TLS manager.
-// If isLeaderF is provided and non-nil, only the cluster leader is allowed to
-// request new certificates from Let's Encrypt.
+// If isLeaderF is provided and non-nil, only the cluster leader talks to Let's
+// Encrypt: it keeps every configured domain issued and renewed, and the other
+// nodes take their certificates from the shared cache.
 func NewManager(ctx context.Context, cfg *Config, logger *slog.Logger, isLeaderF ...func() bool) (*Manager, error) {
 	if !cfg.Enabled || cfg.Provider != "letsencrypt" {
 		return nil, nil
@@ -121,25 +151,31 @@ func NewManager(ctx context.Context, cfg *Config, logger *slog.Logger, isLeaderF
 		logger.Info("TLS running in single-instance mode (no cluster leader election)")
 	}
 
-	autocertMgr := &autocert.Manager{
-		Prompt:     autocert.AcceptTOS,
-		HostPolicy: autocert.HostWhitelist(cfg.LetsEncrypt.Domains...),
-		Cache:      cache,
-		Email:      cfg.LetsEncrypt.Email,
+	m := &Manager{
+		cache:        cache,
+		hostPolicy:   autocert.HostWhitelist(cfg.LetsEncrypt.Domains...),
+		email:        cfg.LetsEncrypt.Email,
+		directoryURL: autocert.DefaultACMEDirectory,
+		acmeBase:     http.DefaultTransport,
+		logger:       logger,
+		domains:      cfg.LetsEncrypt.Domains,
+		syncWorker:   syncWorker,
+		isLeaderF:    leaderFunc,
+		renewBefore:  defaultRenewBefore,
+		stopCh:       make(chan struct{}),
 	}
 
 	// Override autocert's 30-day default renewal window when configured.
 	if cfg.LetsEncrypt.RenewBeforeDays > 0 {
-		autocertMgr.RenewBefore = time.Duration(cfg.LetsEncrypt.RenewBeforeDays) * 24 * time.Hour
+		m.renewBeforeCfg = time.Duration(cfg.LetsEncrypt.RenewBeforeDays) * 24 * time.Hour
+		m.renewBefore = min(m.renewBeforeCfg, defaultRenewBefore)
 	}
 
 	// Point at Let's Encrypt staging for testing. Staging certs are signed by an
 	// untrusted root, so clients won't validate them — use only to exercise the
 	// issuance flow without consuming production rate limits.
 	if cfg.LetsEncrypt.Staging {
-		autocertMgr.Client = &acme.Client{
-			DirectoryURL: "https://acme-staging-v02.api.letsencrypt.org/directory",
-		}
+		m.directoryURL = "https://acme-staging-v02.api.letsencrypt.org/directory"
 		logger.Warn("TLS: using Let's Encrypt STAGING environment — issued certificates are NOT trusted by clients")
 	}
 
@@ -147,20 +183,14 @@ func NewManager(ctx context.Context, cfg *Config, logger *slog.Logger, isLeaderF
 	if defaultDomain == "" && len(cfg.LetsEncrypt.Domains) > 0 {
 		defaultDomain = cfg.LetsEncrypt.Domains[0]
 	}
+	m.defaultDomain = defaultDomain
 
-	baseTLSConfig := autocertMgr.TLSConfig()
+	m.current.Store(m.newAutocert(cache))
 
-	m := &Manager{
-		autocertManager: autocertMgr,
-		logger:          logger,
-		domains:         cfg.LetsEncrypt.Domains,
-		defaultDomain:   defaultDomain,
-		syncWorker:      syncWorker,
-		tlsConfig:       nil,
-		isLeaderF:       leaderFunc,
-	}
+	// autocert's config supplies the ALPN protocols (including "acme-tls/1");
+	// GetCertificate is replaced below and always asks the current instance.
+	baseTLSConfig := m.current.Load().mgr.TLSConfig()
 
-	originalGetCert := baseTLSConfig.GetCertificate
 	baseTLSConfig.GetCertificate = func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 		// RFC 4343: DNS names are case-insensitive.
 		serverName := strings.ToLower(hello.ServerName)
@@ -181,7 +211,7 @@ func NewManager(ctx context.Context, cfg *Config, logger *slog.Logger, isLeaderF
 			serverName = strings.ToLower(defaultDomain)
 		}
 
-		if err := autocertMgr.HostPolicy(nil, serverName); err != nil {
+		if err := m.hostPolicy(context.Background(), serverName); err != nil {
 			logger.Debug("TLS: rejected certificate request for unconfigured domain",
 				"domain", serverName,
 				"remote_addr", hello.Conn.RemoteAddr().String(),
@@ -194,7 +224,12 @@ func NewManager(ctx context.Context, cfg *Config, logger *slog.Logger, isLeaderF
 		modifiedHello := *hello
 		modifiedHello.ServerName = serverName
 
-		cert, err := originalGetCert(&modifiedHello)
+		cert, err := m.current.Load().mgr.GetCertificate(&modifiedHello)
+		if errors.Is(err, ErrNotLeader) {
+			logger.Warn("TLS: no usable certificate in the shared cache yet - waiting for the cluster leader to provide it",
+				"server_name", serverName)
+			return nil, fmt.Errorf("%w for %s: %v", ErrCertificateUnavailable, serverName, err)
+		}
 		if err != nil {
 			logger.Error("TLS: failed to get certificate",
 				"server_name", serverName,
@@ -216,6 +251,10 @@ func NewManager(ctx context.Context, cfg *Config, logger *slog.Logger, isLeaderF
 	}
 
 	m.tlsConfig = baseTLSConfig
+
+	if leaderFunc != nil {
+		m.startMaintenance()
+	}
 
 	logger.Info("TLS manager initialized",
 		"domains", cfg.LetsEncrypt.Domains,
@@ -242,126 +281,89 @@ func (m *Manager) TLSConfig() *tls.Config {
 // HTTPHandler returns an HTTP handler for ACME HTTP-01 challenges. Register at
 // /.well-known/acme-challenge/ on the server's port 80 endpoint.
 func (m *Manager) HTTPHandler() http.Handler {
-	if m == nil || m.autocertManager == nil {
+	if m == nil || m.current.Load() == nil {
 		return nil
 	}
-	return m.autocertManager.HTTPHandler(nil)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		m.current.Load().httpHandler.ServeHTTP(w, r)
+	})
 }
 
-// CertificateInfo contains information about a TLS certificate.
-type CertificateInfo struct {
-	Domain          string
-	NotBefore       time.Time
-	NotAfter        time.Time
-	DaysUntilExpiry int
-	IsExpired       bool
-	Error           error
-}
+// startMaintenance runs maintainCertificates shortly after startup and then
+// periodically, so a node that becomes leader later takes the duty over.
+func (m *Manager) startMaintenance() {
+	concurrency.SafeGo(m.logger, "tls-cert-maintenance", func() {
+		timer := time.NewTimer(certMaintenanceDelay)
+		defer timer.Stop()
 
-// GetCertificateInfo retrieves certificate information for a domain.
-func (m *Manager) GetCertificateInfo(domain string) CertificateInfo {
-	info := CertificateInfo{
-		Domain: domain,
-	}
-
-	if m == nil || m.autocertManager == nil {
-		info.Error = fmt.Errorf("TLS manager not initialized")
-		return info
-	}
-
-	hello := &tls.ClientHelloInfo{
-		ServerName: domain,
-	}
-
-	cert, err := m.autocertManager.GetCertificate(hello)
-	if err != nil {
-		info.Error = fmt.Errorf("failed to get certificate: %w", err)
-		return info
-	}
-
-	if cert.Leaf == nil && len(cert.Certificate) > 0 {
-		leaf, err := x509.ParseCertificate(cert.Certificate[0])
-		if err != nil {
-			info.Error = fmt.Errorf("failed to parse certificate: %w", err)
-			return info
+		for {
+			select {
+			case <-timer.C:
+				m.maintainCertificates()
+				timer.Reset(certMaintenanceInterval)
+			case <-m.stopCh:
+				return
+			}
 		}
-		cert.Leaf = leaf
-	}
-
-	if cert.Leaf != nil {
-		info.NotBefore = cert.Leaf.NotBefore
-		info.NotAfter = cert.Leaf.NotAfter
-		info.DaysUntilExpiry = int(time.Until(cert.Leaf.NotAfter).Hours() / 24)
-		info.IsExpired = time.Now().After(cert.Leaf.NotAfter)
-	}
-
-	return info
+	})
 }
 
-// CheckCertificates checks all configured domains and logs their status.
-func (m *Manager) CheckCertificates() {
-	if m == nil || m.autocertManager == nil {
-		return
-	}
-
-	m.logger.Info("checking certificate status for all domains")
-
-	for _, domain := range m.domains {
-		info := m.GetCertificateInfo(domain)
-
-		if info.Error != nil {
-			m.logger.Warn("certificate check failed",
-				"domain", domain,
-				"error", info.Error)
-			continue
-		}
-
-		if info.IsExpired {
-			m.logger.Error("certificate EXPIRED",
-				"domain", domain,
-				"expired_at", info.NotAfter)
-		} else if info.DaysUntilExpiry <= 30 {
-			m.logger.Info("certificate expiring soon",
-				"domain", domain,
-				"days_remaining", info.DaysUntilExpiry)
+// maintainCertificates makes the cluster leader load — and order, if missing or
+// expired — the certificate of every configured domain, for both key types.
+//
+// autocert only manages names it has been asked for in a handshake, and a
+// renewal timer runs only on a node that has loaded the certificate. With ACME
+// restricted to the leader, a name whose traffic never reaches the leader (a
+// sibling node's own hostname) would otherwise never be issued or renewed.
+// Non-leaders skip that part: they take the leader's certificates from the
+// shared cache, on their next handshake or when their own renewal timer fires.
+// Every node then checks for a certificate that was replaced ahead of time.
+func (m *Manager) maintainCertificates() {
+	if m.isLeaderF == nil || m.isLeaderF() {
+		inst := m.current.Load()
+		for _, domain := range m.domains {
+			for _, keyType := range certKeyTypes {
+				cert, err := inst.mgr.GetCertificate(certHello(domain, keyType))
+				if err != nil {
+					m.logger.Error("TLS: certificate unavailable",
+						"domain", domain, "key_type", keyType, "error", err)
+					continue
+				}
+				m.logCertificateStatus(domain, keyType, cert)
+			}
 		}
 	}
+
+	m.adoptNewerFromCache()
 }
 
-// RenewCertificate deletes the cached certificate for a domain so the next
-// TLS handshake triggers a fresh ACME request. Must run on the cluster leader.
-func (m *Manager) RenewCertificate(domain string) ([]string, error) {
-	if m == nil || m.autocertManager == nil {
-		return nil, fmt.Errorf("TLS manager not initialized")
+// logCertificateStatus reports a certificate that autocert should have renewed
+// by now. autocert retries failed renewals without logging, so this — together
+// with acmeTransport's error logging — is what makes a stuck renewal visible.
+func (m *Manager) logCertificateStatus(domain, keyType string, cert *tls.Certificate) {
+	leaf := cert.Leaf
+	if leaf == nil {
+		var err error
+		if leaf, err = x509.ParseCertificate(cert.Certificate[0]); err != nil {
+			m.logger.Warn("TLS: cannot parse certificate", "domain", domain, "key_type", keyType, "error", err)
+			return
+		}
 	}
 
-	if m.isLeaderF != nil && !m.isLeaderF() {
-		return nil, fmt.Errorf("certificate renewal must be performed on the cluster leader node")
+	remaining := time.Until(leaf.NotAfter)
+	switch {
+	case remaining <= 0:
+		m.logger.Error("TLS: certificate EXPIRED - renewal is failing",
+			"domain", domain, "key_type", keyType, "expired_at", leaf.NotAfter)
+	case remaining < m.renewBefore/2:
+		m.logger.Warn("TLS: certificate renewal is overdue",
+			"domain", domain, "key_type", keyType,
+			"days_remaining", int(remaining.Hours()/24),
+			"renew_before_days", int(m.renewBefore.Hours()/24))
+	default:
+		m.logger.Debug("TLS: certificate ok",
+			"domain", domain, "key_type", keyType, "days_remaining", int(remaining.Hours()/24))
 	}
-
-	cache := m.autocertManager.Cache
-	if cache == nil {
-		return nil, fmt.Errorf("no certificate cache configured")
-	}
-
-	if domain == "" {
-		return nil, fmt.Errorf("domain is required")
-	}
-
-	ctx := context.Background()
-	if err := m.autocertManager.HostPolicy(ctx, domain); err != nil {
-		return nil, fmt.Errorf("domain %q not in allowed list: %w", domain, err)
-	}
-
-	m.logger.Info("deleting cached certificate", "domain", domain)
-	if err := cache.Delete(ctx, domain); err != nil {
-		m.logger.Warn("failed to delete cached certificate (may not exist yet)", "domain", domain, "error", err)
-	}
-	_ = cache.Delete(ctx, domain+"+rsa")
-	_ = cache.Delete(ctx, domain+"+ecdsa")
-
-	m.logger.Info("certificate cache cleared — next TLS handshake will trigger fresh ACME request", "domain", domain)
-	return []string{domain}, nil
 }
 
 // Stop gracefully shuts down the TLS manager and its sync worker.
@@ -369,6 +371,8 @@ func (m *Manager) Stop() {
 	if m == nil {
 		return
 	}
+
+	close(m.stopCh)
 
 	if m.syncWorker != nil {
 		m.logger.Info("stopping certificate sync worker")
