@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -21,6 +22,7 @@ type fakeS3 struct {
 	mu      sync.Mutex
 	objects map[string][]byte
 	down    bool
+	delay   time.Duration // how long a read takes before answering
 }
 
 func newFakeS3() *fakeS3 { return &fakeS3{objects: make(map[string][]byte)} }
@@ -38,7 +40,22 @@ func (f *fakeS3) object(key string) ([]byte, bool) {
 	return data, ok
 }
 
-func (f *fakeS3) GetObject(_ context.Context, in *s3.GetObjectInput, _ ...func(*s3.Options)) (*s3.GetObjectOutput, error) {
+func (f *fakeS3) GetObject(ctx context.Context, in *s3.GetObjectInput, _ ...func(*s3.Options)) (*s3.GetObjectOutput, error) {
+	f.mu.Lock()
+	delay := f.delay
+	f.mu.Unlock()
+	if delay > 0 {
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
+	// The AWS SDK surfaces the caller's cancellation the same way.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.down {
@@ -126,13 +143,41 @@ func TestFallbackCacheGetPrefersS3OverStaleLocal(t *testing.T) {
 	}
 }
 
-// S3 answering "not found" is authoritative: a leftover local file is not served.
-func TestFallbackCacheGetS3MissIgnoresLocal(t *testing.T) {
+// A challenge response missing from S3 is spent: answering one from a local
+// leftover would hand the CA the token of an earlier order.
+func TestFallbackCacheGetS3MissIgnoresLocalChallenge(t *testing.T) {
 	cache, _, dir := newTestFallbackCache(t)
-	writeLocal(t, dir, "mx.example.com", "deleted-from-s3")
+	writeLocal(t, dir, "mx.example.com+token", "spent")
 
-	if _, err := cache.Get(context.Background(), "mx.example.com"); err != autocert.ErrCacheMiss {
+	if _, err := cache.Get(context.Background(), "mx.example.com+token"); err != autocert.ErrCacheMiss {
 		t.Errorf("Get error = %v, want ErrCacheMiss", err)
+	}
+}
+
+// F7: a certificate missing from S3 but present locally is served, and put back
+// into S3. Ignoring the local copy leaves a restarted node with no certificate
+// at all - for up to sixty days, since the leader goes on serving from memory
+// and so never notices that it has to re-issue.
+func TestFallbackCacheGetSeedsS3FromLocalCopy(t *testing.T) {
+	cache, s3fake, dir := newTestFallbackCache(t)
+	writeLocal(t, dir, "mx.example.com", "held-locally")
+
+	got, err := cache.Get(context.Background(), "mx.example.com")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if string(got) != "held-locally" {
+		t.Errorf("Get = %q, want the local copy", got)
+	}
+
+	if !cache.NeedsSync() {
+		t.Fatal("the local-only certificate was not queued for S3")
+	}
+	if err := cache.SyncPendingToS3(context.Background()); err != nil {
+		t.Fatalf("SyncPendingToS3: %v", err)
+	}
+	if data, ok := s3fake.object("certs/mx.example.com"); !ok || string(data) != "held-locally" {
+		t.Errorf("S3 copy after sync = %q (present=%v), want it re-seeded", data, ok)
 	}
 }
 
@@ -231,5 +276,195 @@ func TestFallbackCacheSyncLeavesUnrelatedLocalFilesAlone(t *testing.T) {
 	}
 	if _, ok := s3fake.object("certs/mx.example.com+token"); ok {
 		t.Error("a spent local token was uploaded to S3")
+	}
+}
+
+// F1: an unreachable S3 must never look like "no such certificate". autocert
+// orders a new certificate on ErrCacheMiss and propagates any other error, so
+// reporting a miss during an outage makes the leader order duplicates for every
+// certificate it does not happen to hold locally.
+func TestFallbackCacheGetDoesNotReportMissWhenS3IsUnreachable(t *testing.T) {
+	cache, s3fake, _ := newTestFallbackCache(t)
+	s3fake.setDown(true)
+
+	_, err := cache.Get(context.Background(), "mx.example.com")
+	if err == nil {
+		t.Fatal("Get succeeded with S3 down and no local copy")
+	}
+	if err == autocert.ErrCacheMiss {
+		t.Error("Get reported ErrCacheMiss while S3 was unreachable; autocert will order a duplicate")
+	}
+}
+
+// The same applies once the circuit breaker has opened: it means "S3 not asked",
+// never "S3 has nothing".
+func TestFallbackCacheGetDoesNotReportMissWhileBreakerIsOpen(t *testing.T) {
+	cache, s3fake, _ := newTestFallbackCache(t)
+	cache.checkInterval = time.Minute // keep the breaker open once tripped
+	s3fake.setDown(true)
+
+	if _, err := cache.Get(context.Background(), "mx.example.com"); err == nil {
+		t.Fatal("setup: expected the first Get to fail and trip the breaker")
+	}
+
+	_, err := cache.Get(context.Background(), "other.example.com")
+	if err == autocert.ErrCacheMiss {
+		t.Error("Get reported ErrCacheMiss while the breaker was open; autocert will order a duplicate")
+	}
+}
+
+// restartCache builds a second cache over the same directory and S3, as a
+// process restart would.
+func restartCache(t *testing.T, dir string, s3fake *fakeS3) *FallbackCache {
+	t.Helper()
+	logger := discardLogger()
+	cache := NewFallbackCache(dir, &S3Cache{S3Client: s3fake, Bucket: "b", Prefix: "certs/", Logger: logger}, logger)
+	cache.checkInterval = 0
+	return cache
+}
+
+// F4: a certificate stored locally during an S3 outage is the only copy of that
+// key pair. If the record of it being unsynced does not survive a restart, the
+// first read puts S3's older copy back over it and the renewal the operator was
+// told had succeeded is silently undone - unrecoverably, since the key is lost.
+func TestFallbackCachePendingSurvivesRestart(t *testing.T) {
+	cache, s3fake, dir := newTestFallbackCache(t)
+	ctx := context.Background()
+	s3fake.objects["certs/mx.example.com"] = []byte("old")
+
+	s3fake.setDown(true)
+	if err := cache.Put(ctx, "mx.example.com", []byte("new")); err != nil {
+		t.Fatalf("Put during outage: %v", err)
+	}
+	s3fake.setDown(false)
+
+	restarted := restartCache(t, dir, s3fake)
+	if !restarted.NeedsSync() {
+		t.Error("the unsynced certificate was forgotten across the restart")
+	}
+
+	got, err := restarted.Get(ctx, "mx.example.com")
+	if err != nil {
+		t.Fatalf("Get after restart: %v", err)
+	}
+	if string(got) != "new" {
+		t.Errorf("Get after restart = %q, want the locally stored %q", got, "new")
+	}
+	if local, _ := readLocal(t, dir, "mx.example.com"); local != "new" {
+		t.Errorf("local copy after restart = %q, want it intact", local)
+	}
+}
+
+// A pending marker that outlived its certificate must not push a stale copy over
+// a newer one in S3 - the overwrite this PR set out to stop.
+func TestFallbackCacheSyncNeverOverwritesNewerS3Certificate(t *testing.T) {
+	cache, s3fake, dir := newTestFallbackCache(t)
+	ctx := context.Background()
+
+	local := cacheEntry(t, "mx.example.com", false, time.Now().Add(10*24*time.Hour))
+	renewed := cacheEntry(t, "mx.example.com", false, time.Now().Add(80*24*time.Hour))
+
+	s3fake.setDown(true)
+	if err := cache.Put(ctx, "mx.example.com", local); err != nil {
+		t.Fatalf("Put during outage: %v", err)
+	}
+	s3fake.setDown(false)
+
+	// The leader renewed the certificate while this node was cut off.
+	s3fake.objects["certs/mx.example.com"] = renewed
+
+	if err := cache.SyncPendingToS3(ctx); err != nil {
+		t.Fatalf("SyncPendingToS3: %v", err)
+	}
+
+	if data, _ := s3fake.object("certs/mx.example.com"); !bytes.Equal(data, renewed) {
+		t.Error("the stale local copy overwrote the renewed certificate in S3")
+	}
+	if cache.NeedsSync() {
+		t.Error("the superseded key is still queued for upload")
+	}
+	if _ = dir; cache.isPending("mx.example.com") {
+		t.Error("the superseded key is still marked pending")
+	}
+}
+
+// F5: autocert passes the HTTP request's context to Cache.Get when serving an
+// http-01 challenge, so a client that disconnects mid-request makes S3 return
+// "context canceled". Counting that as an outage lets anyone on the network open
+// the circuit breaker at will.
+func TestFallbackCacheCallerCancellationDoesNotTripBreaker(t *testing.T) {
+	cache, _, _ := newTestFallbackCache(t)
+	cache.checkInterval = time.Minute
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := cache.Get(ctx, "mx.example.com"); err == nil {
+		t.Fatal("Get succeeded with a cancelled context")
+	}
+	if !cache.isS3Available() {
+		t.Error("a cancelled caller context opened the S3 circuit breaker")
+	}
+}
+
+// A challenge response is the one thing the other nodes can only get from S3, so
+// it must be attempted even while the breaker is open. Refusing it outright
+// fails the validation for every key type, spending the CA's hourly allowance.
+func TestFallbackCacheChallengePutIgnoresOpenBreaker(t *testing.T) {
+	cache, s3fake, _ := newTestFallbackCache(t)
+	cache.checkInterval = time.Minute
+	ctx := context.Background()
+
+	s3fake.setDown(true)
+	if _, err := cache.Get(ctx, "mx.example.com"); err == nil {
+		t.Fatal("setup: expected the first Get to trip the breaker")
+	}
+	s3fake.setDown(false)
+
+	if err := cache.Put(ctx, "mx.example.com+token", []byte("token")); err != nil {
+		t.Fatalf("challenge Put refused while the breaker was open: %v", err)
+	}
+	if _, ok := s3fake.object("certs/mx.example.com+token"); !ok {
+		t.Error("the challenge response never reached S3")
+	}
+}
+
+// F15: autocert holds one global mutex across Cache.Get, so every concurrent
+// handshake on the node queues behind a slow read. When this node already holds
+// a servable copy, waiting the full S3 timeout for a possibly fresher one costs
+// far more than it can win.
+func TestFallbackCacheSlowS3DoesNotStallWhenLocalCopyExists(t *testing.T) {
+	cache, s3fake, dir := newTestFallbackCache(t)
+	writeLocal(t, dir, "mx.example.com", "local")
+	s3fake.objects["certs/mx.example.com"] = []byte("from-s3")
+	s3fake.delay = 4 * time.Second
+
+	start := time.Now()
+	data, err := cache.Get(context.Background(), "mx.example.com")
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("Get blocked for %v with a servable local copy; every handshake waits behind it", elapsed)
+	}
+	if string(data) != "local" {
+		t.Errorf("Get = %q, want the local copy once S3 proved slow", data)
+	}
+}
+
+// With nothing to serve, waiting is all there is to do: the longer budget stands.
+func TestFallbackCacheSlowS3StillWaitedForWithoutLocalCopy(t *testing.T) {
+	cache, s3fake, _ := newTestFallbackCache(t)
+	s3fake.objects["certs/mx.example.com"] = []byte("from-s3")
+	s3fake.delay = 2 * time.Second
+
+	data, err := cache.Get(context.Background(), "mx.example.com")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if string(data) != "from-s3" {
+		t.Errorf("Get = %q, want the S3 copy", data)
 	}
 }

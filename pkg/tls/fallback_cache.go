@@ -2,9 +2,14 @@ package tls
 
 import (
 	"context"
+	"crypto/x509"
+	"encoding/pem"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -34,6 +39,7 @@ type FallbackCache struct {
 	putMu            sync.Mutex          // serializes writers so a pending sync cannot overwrite a newer Put
 	mu               sync.Mutex          // guards pending
 	pending          map[string]struct{} // keys stored locally that S3 has not received yet
+	pendingDir       string              // holds one marker file per pending key
 	s3Mu             sync.RWMutex
 	s3Available      bool
 	lastS3Check      time.Time
@@ -51,13 +57,59 @@ func NewFallbackCache(localDir string, s3Cache *S3Cache, logger *slog.Logger) *F
 		logger.Warn("certificates will only be stored in S3 - if S3 becomes unavailable, certificate operations will fail")
 	}
 
-	return &FallbackCache{
+	pendingDir := filepath.Join(localDir, pendingSubdir)
+	if err := os.MkdirAll(pendingDir, 0700); err != nil {
+		logger.Warn("cannot create the pending-sync directory - a certificate stored during an S3 outage will be overwritten from S3 on restart",
+			"dir", pendingDir, "error", err)
+	}
+
+	f := &FallbackCache{
 		primary:       s3Cache,
 		fallback:      autocert.DirCache(localDir),
 		logger:        logger,
 		pending:       make(map[string]struct{}),
+		pendingDir:    pendingDir,
 		s3Available:   true,
 		checkInterval: 30 * time.Second,
+	}
+	f.loadPending()
+	return f
+}
+
+// pendingSubdir holds the markers naming keys this node stored locally but has
+// not got into S3 yet. It lives inside the cache directory so it survives a
+// restart: without it the node forgets that its local copy is the newer one and
+// the next read puts S3's older certificate back over it — and over the private
+// key that goes with it, which nothing can then recover.
+const pendingSubdir = ".pending"
+
+func (f *FallbackCache) markerPath(key string) string {
+	// Escaped so a key can never reach outside the directory.
+	return filepath.Join(f.pendingDir, url.PathEscape(key))
+}
+
+func (f *FallbackCache) loadPending() {
+	entries, err := os.ReadDir(f.pendingDir)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			f.logger.Warn("cannot read the pending-sync directory", "dir", f.pendingDir, "error", err)
+		}
+		return
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	for _, entry := range entries {
+		key, err := url.PathUnescape(entry.Name())
+		if err != nil {
+			continue
+		}
+		f.pending[key] = struct{}{}
+	}
+
+	if len(f.pending) > 0 {
+		f.logger.Info("certificates stored locally still awaiting S3 sync", "count", len(f.pending))
 	}
 }
 
@@ -70,6 +122,18 @@ func NewFallbackCache(localDir string, s3Cache *S3Cache, logger *slog.Logger) *F
 func isChallengeKey(key string) bool {
 	return strings.HasSuffix(key, "+token") || strings.HasSuffix(key, "+http-01")
 }
+
+// How long to wait for S3 on a read. autocert holds one global mutex across
+// Cache.Get, so every concurrent handshake on the node queues behind it.
+//
+// The budget is what the wait can win. With no local copy there is nothing to
+// serve without S3, so it is worth waiting out a slow bucket. With one in hand
+// the wait buys only the chance that S3 has something fresher, which the renewal
+// read and the hourly maintenance pass would pick up anyway.
+const (
+	s3GetTimeout          = 5 * time.Second
+	s3GetTimeoutWithLocal = time.Second
+)
 
 func (f *FallbackCache) isS3Available() bool {
 	f.s3Mu.RLock()
@@ -121,9 +185,12 @@ func (f *FallbackCache) markS3Available() {
 	f.consecutiveFails = 0
 }
 
-// Get retrieves a certificate from S3, falling back to the local cache only when
-// S3 cannot be reached. S3 operations have a 5-second timeout to prevent blocking
-// TLS handshakes.
+// Get retrieves a certificate from S3, falling back to the local copy only when
+// S3 cannot be consulted.
+//
+// The three answers S3 can give are kept apart. "Here it is" and "I do not have
+// it" are authoritative. "I could not be reached" is not, and must never reach
+// autocert as ErrCacheMiss — see ErrStorageUnavailable.
 func (f *FallbackCache) Get(ctx context.Context, key string) ([]byte, error) {
 	// A pending key was written while S3 was down: the local copy is the newer one.
 	if f.isPending(key) {
@@ -132,35 +199,122 @@ func (f *FallbackCache) Get(ctx context.Context, key string) ([]byte, error) {
 	}
 
 	if !f.isS3Available() {
-		f.logger.Debug("FallbackCache: S3 unavailable (circuit breaker) - using local cache", "name", key)
-		return f.fallback.Get(ctx, key)
+		f.logger.Debug("FallbackCache: S3 not consulted (circuit breaker open)", "name", key)
+		return f.localAfterS3Failure(ctx, key, errors.New("circuit breaker open"))
 	}
 
-	s3Ctx, s3Cancel := context.WithTimeout(ctx, 5*time.Second)
+	// Read the local copy first to decide how long S3 is worth waiting for. It is
+	// only ever the fallback: an answer from S3 still wins, which is what keeps a
+	// node from serving a stale certificate the leader has already renewed.
+	local, localErr := f.fallback.Get(ctx, key)
+	timeout := s3GetTimeout
+	if localErr == nil {
+		timeout = s3GetTimeoutWithLocal
+	}
+
+	s3Ctx, s3Cancel := context.WithTimeout(ctx, timeout)
 	defer s3Cancel()
 
 	data, err := f.primary.Get(s3Ctx, key)
-	if err == nil {
+	switch {
+	case err == nil:
 		f.markS3Available()
-		if !isChallengeKey(key) {
-			if putErr := f.fallback.Put(ctx, key, data); putErr != nil {
-				f.logger.Warn("FallbackCache: failed to sync certificate to local cache", "name", key, "error", putErr)
-			}
-		}
+		f.writeThrough(ctx, key, data)
+		return data, nil
+
+	case err == autocert.ErrCacheMiss:
+		f.markS3Available()
+		return f.localSeedingS3(ctx, key)
+
+	case localErr == nil && errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil:
+		f.logger.Warn("FallbackCache: S3 too slow - serving the local copy",
+			"name", key, "waited", timeout)
+		f.markS3Unavailable()
+		return local, nil
+
+	case callerGaveUp(ctx, err):
+		// autocert hands Cache.Get the HTTP request's context when it serves an
+		// http-01 challenge, so a client that disconnects mid-request produces
+		// this. Counting it as an outage would let anyone open the breaker.
+		f.logger.Debug("FallbackCache: S3 Get abandoned by the caller", "name", key, "error", err)
+		return nil, err
+
+	default:
+		f.logger.Warn("FallbackCache: S3 Get failed (marking S3 unavailable) - trying local cache",
+			"name", key, "error", err)
+		f.markS3Unavailable()
+		return f.localAfterS3Failure(ctx, key, err)
+	}
+}
+
+// callerGaveUp reports whether an S3 error is the caller's own cancellation
+// rather than a fault of the store. s3GetTimeout firing is ours, and does count
+// as an outage; only a context the caller had already given up on does not.
+func callerGaveUp(ctx context.Context, err error) bool {
+	return ctx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded))
+}
+
+// localAfterS3Failure answers from the local copy when S3 could not be
+// consulted, and reports ErrStorageUnavailable when there is none. It never
+// reports ErrCacheMiss: that would tell autocert the certificate does not exist.
+func (f *FallbackCache) localAfterS3Failure(ctx context.Context, key string, cause error) ([]byte, error) {
+	data, err := f.fallback.Get(ctx, key)
+	if err == nil {
+		f.logger.Debug("FallbackCache: serving local copy while S3 is unavailable", "name", key)
 		return data, nil
 	}
+	if err != autocert.ErrCacheMiss {
+		return nil, fmt.Errorf("%w for %s: %v (local cache: %v)", ErrStorageUnavailable, key, cause, err)
+	}
+	return nil, fmt.Errorf("%w for %s: %v", ErrStorageUnavailable, key, cause)
+}
 
-	// S3 answered and the key is not there. A local copy is a leftover (deleted
-	// by an admin, or a spent challenge response) and must not be served.
-	if err == autocert.ErrCacheMiss {
-		f.markS3Available()
-		f.logger.Debug("FallbackCache: certificate not found in S3 (cache miss)", "name", key)
+// localSeedingS3 answers an authoritative "S3 does not have it" from the local
+// copy, and queues that copy for upload.
+//
+// S3 losing an entry it once had - an admin deleting it, a lifecycle rule, a
+// changed prefix - otherwise takes every restarted node down for the domain
+// until the certificate's own renewal comes round, because the leader keeps
+// serving from memory and never learns it must re-issue. The local copy cannot
+// be hiding a newer one here: S3 has nothing to hide.
+//
+// Challenge responses are exempt. One that S3 does not have is spent, and
+// answering from a leftover hands the CA the token of an earlier order.
+func (f *FallbackCache) localSeedingS3(ctx context.Context, key string) ([]byte, error) {
+	if isChallengeKey(key) {
+		f.logger.Debug("FallbackCache: challenge response not in S3 (cache miss)", "name", key)
 		return nil, autocert.ErrCacheMiss
 	}
 
-	f.logger.Warn("FallbackCache: S3 Get failed (marking S3 unavailable) - using local cache", "name", key, "error", err)
-	f.markS3Unavailable()
-	return f.fallback.Get(ctx, key)
+	data, err := f.fallback.Get(ctx, key)
+	if err != nil {
+		f.logger.Debug("FallbackCache: certificate not found in S3 or locally (cache miss)", "name", key)
+		return nil, autocert.ErrCacheMiss
+	}
+
+	f.logger.Warn("FallbackCache: certificate missing from S3 - serving the local copy and restoring it",
+		"name", key)
+	f.setPending(key, true)
+	return data, nil
+}
+
+// writeThrough keeps the local copy in step with what S3 served, so the node can
+// still answer handshakes if S3 becomes unreachable.
+func (f *FallbackCache) writeThrough(ctx context.Context, key string, data []byte) {
+	if isChallengeKey(key) {
+		return
+	}
+
+	f.putMu.Lock()
+	defer f.putMu.Unlock()
+
+	// A Put that landed while the S3 read was in flight is the newer copy.
+	if f.isPending(key) {
+		return
+	}
+	if err := f.fallback.Put(ctx, key, data); err != nil {
+		f.logger.Warn("FallbackCache: failed to sync certificate to local cache", "name", key, "error", err)
+	}
 }
 
 // Put stores a certificate, trying S3 first (source of truth), then falling back to local cache.
@@ -170,7 +324,10 @@ func (f *FallbackCache) Put(ctx context.Context, key string, data []byte) error 
 
 	var s3Err error
 
-	if f.isS3Available() {
+	// A challenge response reaches the validating node only through S3, so it is
+	// attempted even when the breaker is open: a refusal here fails the
+	// validation outright, and the breaker may well be stale.
+	if f.isS3Available() || isChallengeKey(key) {
 		s3Err = f.primary.Put(ctx, key, data)
 		if s3Err == nil {
 			f.markS3Available()
@@ -244,10 +401,19 @@ func (f *FallbackCache) isPending(key string) bool {
 func (f *FallbackCache) setPending(key string, pending bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
 	if pending {
 		f.pending[key] = struct{}{}
-	} else {
-		delete(f.pending, key)
+		if err := os.WriteFile(f.markerPath(key), nil, 0600); err != nil {
+			f.logger.Warn("cannot record that a certificate awaits S3 sync - a restart would overwrite it from S3",
+				"name", key, "error", err)
+		}
+		return
+	}
+
+	delete(f.pending, key)
+	if err := os.Remove(f.markerPath(key)); err != nil && !os.IsNotExist(err) {
+		f.logger.Warn("cannot clear the pending-sync marker", "name", key, "error", err)
 	}
 }
 
@@ -312,6 +478,12 @@ func (f *FallbackCache) syncKeyToS3(ctx context.Context, key string) error {
 		return err
 	}
 
+	if f.supersededInS3(ctx, key, data) {
+		f.logger.Info("dropping a pending upload: S3 already holds a newer certificate", "name", key)
+		f.setPending(key, false)
+		return nil
+	}
+
 	if err := f.primary.Put(ctx, key, data); err != nil {
 		f.markS3Unavailable()
 		return err
@@ -320,4 +492,49 @@ func (f *FallbackCache) syncKeyToS3(ctx context.Context, key string) error {
 	f.markS3Available()
 	f.setPending(key, false)
 	return nil
+}
+
+// supersededInS3 reports whether S3 holds a strictly newer certificate under the
+// same key, which a pending upload must not overwrite: a marker can outlive its
+// certificate (a crash between the upload and clearing it), and uploading a
+// stale copy over a renewal is the overwrite this cache exists to prevent.
+//
+// Anything that is not a parsable certificate - the ACME account key above all -
+// is never treated as superseded, so it still syncs.
+func (f *FallbackCache) supersededInS3(ctx context.Context, key string, local []byte) bool {
+	localExpiry, err := entryNotAfter(local)
+	if err != nil {
+		return false
+	}
+
+	remote, err := f.primary.Get(ctx, key)
+	if err != nil {
+		return false
+	}
+
+	remoteExpiry, err := entryNotAfter(remote)
+	if err != nil {
+		return false
+	}
+
+	return remoteExpiry.After(localExpiry)
+}
+
+// entryNotAfter returns the expiry of the first certificate in a cache entry.
+func entryNotAfter(data []byte) (time.Time, error) {
+	for rest := data; len(rest) > 0; {
+		var block *pem.Block
+		if block, rest = pem.Decode(rest); block == nil {
+			break
+		}
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		leaf, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return time.Time{}, err
+		}
+		return leaf.NotAfter, nil
+	}
+	return time.Time{}, errors.New("cache entry holds no certificate")
 }

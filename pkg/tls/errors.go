@@ -21,6 +21,13 @@ var (
 	// appear in the shared cache instead of ordering its own.
 	ErrNotLeader = errors.New("tls: not cluster leader - ACME requests are made by the leader only")
 
+	// ErrStorageUnavailable is returned when the certificate store could not be
+	// consulted at all. It must never be reported as autocert.ErrCacheMiss:
+	// autocert reads a miss as proof that no certificate exists and orders a new
+	// one, so a miss during an S3 outage spends the duplicate-certificate limit
+	// on certificates that are sitting in the bucket.
+	ErrStorageUnavailable = errors.New("tls: certificate storage unavailable")
+
 	// errInstanceRetired is returned for any ACME request from an autocert
 	// instance that has been replaced (see autocertInstance).
 	errInstanceRetired = errors.New("tls: autocert instance retired")
