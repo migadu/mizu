@@ -53,6 +53,14 @@
 // smallest ID becomes the leader. If the leader fails, a new leader is
 // automatically elected.
 //
+// A node that has peers configured claims no leader until it has seen another
+// member: alone, the smallest ID it knows is its own. If no peer can be reached
+// within Config.LeaderGracePeriod (1 minute) it proceeds as a single-node
+// cluster, so a node whose peers are down can still do leader work. While it is
+// alone it retries the join every Config.RejoinInterval (15 seconds) - memberlist
+// does not, and nodes started at the same moment can otherwise miss each other
+// for good.
+//
 // # Security
 //
 // Communication between nodes is encrypted using AES-256-GCM with a

@@ -1,0 +1,415 @@
+package tls
+
+import (
+	"bytes"
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"net/http"
+	"slices"
+	"strings"
+	"time"
+
+	"golang.org/x/crypto/acme"
+	"golang.org/x/crypto/acme/autocert"
+	"golang.org/x/net/idna"
+)
+
+// certKeyTypes are the key types autocert keeps a separate certificate for.
+var certKeyTypes = []string{"ecdsa", "rsa"}
+
+// asciiDomain returns the form autocert files a name under. autocert runs
+// idna.Lookup.ToASCII before it builds a cache key, so a Unicode domain is
+// stored as punycode; reading it back under the Unicode spelling finds nothing.
+func asciiDomain(domain string) string {
+	name := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(domain)), ".")
+	if ascii, err := idna.Lookup.ToASCII(name); err == nil {
+		return ascii
+	}
+	return name
+}
+
+// certHello builds the ClientHello that makes autocert select the certificate of
+// the given key type: it picks by what the client can verify, and treats a hello
+// offering no ECDSA cipher suite as RSA-only.
+func certHello(domain, keyType string) *tls.ClientHelloInfo {
+	hello := &tls.ClientHelloInfo{ServerName: asciiDomain(domain)}
+	if keyType == "ecdsa" {
+		hello.CipherSuites = []uint16{tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256}
+	}
+	return hello
+}
+
+// certCacheKey returns the key autocert stores the certificate under.
+func certCacheKey(domain, keyType string) string {
+	if keyType == "rsa" {
+		return asciiDomain(domain) + "+rsa"
+	}
+	return asciiDomain(domain)
+}
+
+// autocertInstance is one autocert.Manager together with the transport that can
+// cut it off from the CA.
+//
+// autocert keeps every certificate it has loaded in memory and offers no way to
+// drop one, so making it read the cache again means replacing the whole manager
+// (Manager.reload). Its renewal timers cannot be stopped either — stopRenew is
+// unexported and nothing reachable calls it — so a replaced manager keeps them
+// for the life of the process.
+//
+// retire bounds what they can do, it does not make them free. A retired manager
+// can never order: its transport refuses everything. Its timers still wake and
+// still read the shared cache, which is a real S3 GET, before rescheduling to
+// the renewed certificate's own renewal time. So the cost of a reload is one
+// leaked manager, its certificates in memory, and a cache read per certificate
+// per renewal period — bounded by how often reload runs, which is why a steady
+// state must never reload.
+type autocertInstance struct {
+	mgr         *autocert.Manager
+	httpHandler http.Handler
+	transport   *acmeTransport
+}
+
+func (i *autocertInstance) retire() { i.transport.retired.Store(true) }
+
+// newAutocert builds an autocert instance over the given cache.
+func (m *Manager) newAutocert(cache autocert.Cache) *autocertInstance {
+	m.instancesCreated.Add(1)
+	transport := &acmeTransport{base: m.acmeBase, isLeaderF: m.isLeaderF, logger: m.logger}
+	mgr := &autocert.Manager{
+		Prompt:      autocert.AcceptTOS,
+		HostPolicy:  m.hostPolicy,
+		Cache:       cache,
+		Email:       m.email,
+		RenewBefore: m.renewBeforeCfg,
+		// All ACME traffic goes through acmeTransport, which is what actually
+		// keeps non-leaders from ordering certificates (see its doc comment).
+		Client: &acme.Client{
+			DirectoryURL: m.directoryURL,
+			HTTPClient:   &http.Client{Transport: transport},
+		},
+	}
+	// HTTPHandler is also what enables autocert's http-01 fallback.
+	return &autocertInstance{mgr: mgr, httpHandler: mgr.HTTPHandler(nil), transport: transport}
+}
+
+// reload replaces the autocert instance with a fresh one, which reads every
+// certificate from the cache again. It is the only way to make autocert let go
+// of a certificate it holds in memory.
+//
+// The new instance must first load everything the old one is serving. A cache
+// entry that has gone missing or bad would otherwise turn a working certificate
+// into a failed handshake; in that case the old instance stays.
+func (m *Manager) reload(reason string) error {
+	// Serialized: two reloads at once both read the same current instance, and
+	// the one that stores second replaces the other's without retiring it -
+	// leaving an autocert manager nothing points at, with its renewal timers
+	// armed and its ACME transport still live.
+	m.reloadMu.Lock()
+	defer m.reloadMu.Unlock()
+
+	old := m.current.Load()
+
+	// Everything in service has to be loadable from the cache before the swap,
+	// checked against the cache directly: asking autocert would order.
+	//
+	// Decided before the replacement is built. An instance cannot be disposed of
+	// — autocert gives no way to stop its renewal timers — so building one to
+	// find out whether it is wanted leaks one on every attempt, and this is
+	// reached hourly from adoptNewerFromCache.
+	verified := make([]certRecord, 0, len(m.domains)*len(certKeyTypes))
+	for _, rec := range m.servedRecords() {
+		if time.Now().After(rec.leaf.NotAfter) {
+			continue
+		}
+
+		leaf, err := m.cachedLeaf(context.Background(), rec.domain, rec.keyType)
+		if err != nil {
+			return fmt.Errorf("cache entry for %s (%s) is not loadable, keeping the certificates in memory: %w",
+				rec.domain, rec.keyType, err)
+		}
+		verified = append(verified, certRecord{domain: rec.domain, keyType: rec.keyType, leaf: leaf})
+	}
+
+	m.current.Store(m.newAutocert(m.cache))
+	old.retire()
+
+	// What the new instance will load is known already, so the record and the
+	// exported expiry follow the swap instead of waiting for the next pass.
+	for _, rec := range verified {
+		m.recordServed(rec.domain, rec.keyType, rec.leaf)
+	}
+
+	m.logger.Info("TLS: certificates reloaded from the cache", "reason", reason)
+	return nil
+}
+
+// hidingCache reports the hidden keys as missing, so that an autocert instance
+// reading through it orders those certificates instead of loading them.
+type hidingCache struct {
+	autocert.Cache
+	hidden map[string]struct{}
+}
+
+func (c *hidingCache) Get(ctx context.Context, key string) ([]byte, error) {
+	if _, ok := c.hidden[key]; ok {
+		return nil, autocert.ErrCacheMiss
+	}
+	return c.Cache.Get(ctx, key)
+}
+
+// RenewCertificate orders a new certificate for a domain and puts it into
+// service. Must run on the cluster leader.
+//
+// keyTypes selects what to order; no argument means both. Both draw on the same
+// duplicate-certificate budget, so after a partial failure the operator must be
+// able to retry only the key type that was refused - ordering both again spends
+// a slot on a certificate issued minutes earlier, which with one slot left is
+// the slot the failing key type needed.
+//
+// The order comes first and nothing is removed up front: a throwaway autocert
+// instance that cannot see the current certificate orders the replacement into
+// the shared cache while the live instance keeps serving. If the order fails — a
+// rate limit, a failed validation — the domain is left exactly as it was.
+//
+// ctx gives the caller a way out. The call blocks until the CA answers, so an
+// operator may well give up part-way; without this the remaining key types were
+// still ordered, and a re-run afterwards ordered everything again. An order
+// already in flight is allowed to finish — abandoning one after the CA has
+// issued the certificate would waste it.
+func (m *Manager) RenewCertificate(ctx context.Context, domain string, keyTypes ...string) ([]string, error) {
+	if m == nil || m.current.Load() == nil {
+		return nil, fmt.Errorf("TLS manager not initialized")
+	}
+
+	if m.isLeaderF != nil && !m.isLeaderF() {
+		return nil, fmt.Errorf("certificate renewal must be performed on the cluster leader node")
+	}
+
+	domain = asciiDomain(domain)
+	if domain == "" {
+		return nil, fmt.Errorf("domain is required")
+	}
+
+	if err := m.hostPolicy(ctx, domain); err != nil {
+		return nil, fmt.Errorf("domain %q not in allowed list: %w", domain, err)
+	}
+
+	keyTypes, err := resolveKeyTypes(keyTypes)
+	if err != nil {
+		return nil, err
+	}
+
+	if !m.renewMu.TryLock() {
+		return nil, fmt.Errorf("another certificate renewal is in progress")
+	}
+	defer m.renewMu.Unlock()
+
+	hidden := make(map[string]struct{}, len(keyTypes))
+	for _, keyType := range keyTypes {
+		hidden[certCacheKey(domain, keyType)] = struct{}{}
+	}
+	orderer := m.newAutocert(&hidingCache{Cache: m.cache, hidden: hidden})
+	defer orderer.retire()
+
+	var renewed []string
+	var errs []error
+
+	for _, keyType := range keyTypes {
+		if err := ctx.Err(); err != nil {
+			errs = append(errs, fmt.Errorf("%s: not ordered, the caller gave up: %w", keyType, err))
+			break
+		}
+
+		m.logger.Info("TLS: ordering replacement certificate", "domain", domain, "key_type", keyType)
+
+		cert, err := orderer.mgr.GetCertificate(certHello(domain, keyType))
+		if err == nil {
+			// autocert ignores a failed cache write on this path. A certificate
+			// that did not reach the cache is lost at the reload below.
+			//
+			// Checked with a context the caller cannot cancel: the order was
+			// allowed to finish precisely so the issuance would not be wasted,
+			// and validating the result against a dead context would throw away
+			// exactly what was being protected.
+			err = m.verifyCached(context.WithoutCancel(ctx), domain, keyType, cert)
+		}
+		if err != nil {
+			m.logger.Error("TLS: certificate renewal failed", "domain", domain, "key_type", keyType, "error", err)
+			errs = append(errs, fmt.Errorf("%s: %w", keyType, err))
+			continue
+		}
+
+		// Recorded here rather than left to the reload below, which only carries
+		// over what was already in service: a domain renewed before this node
+		// ever served it - a newly configured one, or any renewal in the first
+		// couple of minutes after boot - would otherwise stay unrecorded, absent
+		// from the metric and invisible to adoptNewerFromCache.
+		m.recordServed(domain, keyType, cert.Leaf)
+
+		renewed = append(renewed, fmt.Sprintf("%s (%s, expires %s)",
+			domain, keyType, cert.Leaf.NotAfter.UTC().Format(time.RFC3339)))
+	}
+
+	if len(renewed) == 0 {
+		return nil, errors.Join(errs...)
+	}
+
+	// Whatever was issued is put into service even when the caller has gone; the
+	// errors still say what was left undone.
+
+	if err := m.reload("certificate renewed on request: " + domain); err != nil {
+		errs = append(errs, fmt.Errorf("%w: %v", ErrNotInService, err))
+	}
+	return renewed, errors.Join(errs...)
+}
+
+// resolveKeyTypes validates a requested set of key types, defaulting to all.
+func resolveKeyTypes(requested []string) ([]string, error) {
+	if len(requested) == 0 {
+		return certKeyTypes, nil
+	}
+
+	resolved := make([]string, 0, len(requested))
+	for _, keyType := range requested {
+		if !slices.Contains(certKeyTypes, keyType) {
+			return nil, fmt.Errorf("unknown key type %q, want one of %v", keyType, certKeyTypes)
+		}
+		// Asking twice would place two orders for the same certificate, which is
+		// the spend this argument exists to avoid.
+		if !slices.Contains(resolved, keyType) {
+			resolved = append(resolved, keyType)
+		}
+	}
+	return resolved, nil
+}
+
+// verifyCached checks that the newly issued certificate reached the cache, since
+// autocert ignores a failed cache write on this path and the reload that follows
+// would lose it.
+//
+// Anything at least as fresh counts: the live instance's own renewal timer can
+// store a newer certificate for the same name while this order is in flight, and
+// that satisfies the intent as well as our own bytes would.
+func (m *Manager) verifyCached(ctx context.Context, domain, keyType string, cert *tls.Certificate) error {
+	cached, err := m.cachedLeaf(ctx, domain, keyType)
+	if err != nil {
+		return fmt.Errorf("certificate was issued but is not in the cache: %w", err)
+	}
+	if bytes.Equal(cached.Raw, cert.Certificate[0]) {
+		return nil
+	}
+	if cached.NotAfter.Before(cert.Leaf.NotAfter) {
+		return fmt.Errorf("certificate was issued but the cache still holds an older one (expires %s, ordered %s)",
+			cached.NotAfter.UTC().Format(time.RFC3339), cert.Leaf.NotAfter.UTC().Format(time.RFC3339))
+	}
+	return nil
+}
+
+// cachedLeaf returns the leaf of the cache entry for a domain, provided autocert
+// would accept the entry: key and leaf belong together, the key type is the
+// requested one, and the certificate is valid now, for this name.
+func (m *Manager) cachedLeaf(ctx context.Context, domain, keyType string) (*x509.Certificate, error) {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	data, err := m.cache.Get(ctx, certCacheKey(domain, keyType))
+	if err != nil {
+		return nil, err
+	}
+
+	leaf, err := parseCacheEntry(data)
+	if err != nil {
+		return nil, err
+	}
+
+	if isRSA := leaf.PublicKeyAlgorithm == x509.RSA; isRSA != (keyType == "rsa") {
+		return nil, fmt.Errorf("cache entry holds a %s certificate", leaf.PublicKeyAlgorithm)
+	}
+	if err := leaf.VerifyHostname(asciiDomain(domain)); err != nil {
+		return nil, err
+	}
+	if now := time.Now(); now.Before(leaf.NotBefore) || now.After(leaf.NotAfter) {
+		return nil, fmt.Errorf("cache entry is not valid now (%s - %s)", leaf.NotBefore, leaf.NotAfter)
+	}
+	return leaf, nil
+}
+
+// parseCacheEntry returns the leaf of an autocert cache entry, accepting exactly
+// what autocert's own cacheGet accepts.
+//
+// The rules matter because this decides whether a reload may go ahead: an entry
+// accepted here but refused there swaps in an instance that cannot load the
+// certificate, and on the leader that turns into an order which overwrites the
+// entry. tls.X509KeyPair alone is laxer - it finds the key and the chain
+// anywhere in the buffer, so it accepts `cat fullchain.pem privkey.pem` and
+// tolerates trailing bytes, while autocert refuses both.
+func parseCacheEntry(data []byte) (*x509.Certificate, error) {
+	priv, pub := pem.Decode(data)
+	if priv == nil || !strings.Contains(priv.Type, "PRIVATE") {
+		return nil, errors.New("cache entry does not begin with a private key")
+	}
+
+	var chain []byte
+	for len(pub) > 0 {
+		var block *pem.Block
+		if block, pub = pem.Decode(pub); block == nil {
+			break
+		}
+		chain = append(chain, block.Bytes...)
+	}
+	if len(pub) > 0 {
+		return nil, errors.New("cache entry has trailing data after the certificate chain")
+	}
+
+	// The whole chain, not just the leaf: autocert's validCert parses every
+	// certificate in the entry and rejects it if any one of them is corrupt, so
+	// judging the entry by its leaf alone would pass something autocert refuses.
+	certs, err := x509.ParseCertificates(chain)
+	if err != nil {
+		return nil, err
+	}
+	if len(certs) == 0 {
+		return nil, errors.New("cache entry holds no certificate")
+	}
+
+	// Confirms the certificate belongs to the key in the same entry.
+	if _, err := tls.X509KeyPair(data, data); err != nil {
+		return nil, err
+	}
+
+	return certs[0], nil
+}
+
+// adoptNewerFromCache reloads autocert when the cache holds a newer certificate
+// than the one being served and autocert is not going to notice by itself.
+//
+// autocert reads the cache again only when a certificate's renewal time comes.
+// That covers the routine case — the leader renews, the other nodes find the
+// result when their own timers fire — but not a certificate replaced early: one
+// renewed on request (RenewCertificate runs on the leader only) or put into the
+// cache by hand. Without this, every other node would go on serving the old one
+// until its renewal time, up to two months away.
+func (m *Manager) adoptNewerFromCache() {
+	for _, rec := range m.servedRecords() {
+		// Inside the renewal window autocert is already polling the cache.
+		if time.Until(rec.leaf.NotAfter) <= m.renewBefore {
+			continue
+		}
+
+		cached, err := m.cachedLeaf(context.Background(), rec.domain, rec.keyType)
+		if err != nil || !cached.NotAfter.After(rec.leaf.NotAfter) {
+			continue
+		}
+
+		reason := fmt.Sprintf("cache holds a newer certificate for %s (%s)", rec.domain, rec.keyType)
+		if err := m.reload(reason); err != nil {
+			m.logger.Warn("TLS: newer certificate in the cache not adopted",
+				"domain", rec.domain, "key_type", rec.keyType, "error", err)
+		}
+		return
+	}
+}

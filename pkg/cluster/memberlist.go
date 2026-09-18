@@ -62,6 +62,13 @@ type Cluster struct {
 	leaderMtx sync.RWMutex
 	metrics   *metrics.Metrics // optional; publishes the cluster leader gauge
 
+	// Membership confirmation (see membershipConfirmed)
+	peers             []string
+	startedAt         time.Time
+	leaderGracePeriod time.Duration
+	rejoinInterval    time.Duration
+	sawPeer           bool // guarded by leaderMtx; true once another member has been seen
+
 	// Lifecycle
 	done         chan struct{} // Closed on Shutdown to stop background goroutines
 	shutdownOnce sync.Once     // Ensures Shutdown runs exactly once
@@ -77,7 +84,19 @@ type Config struct {
 	Logger        *slog.Logger
 	StateDelegate StateDelegate
 	EventDelegate EventDelegate
+
+	// LeaderGracePeriod is how long a node that has peers configured but has not
+	// reached any of them waits before it may act as leader (default 1 minute).
+	LeaderGracePeriod time.Duration
+	// RejoinInterval is how often a node that is alone retries joining its
+	// configured peers (default 15 seconds).
+	RejoinInterval time.Duration
 }
+
+const (
+	defaultLeaderGracePeriod = time.Minute
+	defaultRejoinInterval    = 15 * time.Second
+)
 
 // NewCluster creates a new cluster instance with memberlist
 func NewCluster(cfg Config) (*Cluster, error) {
@@ -86,10 +105,20 @@ func NewCluster(cfg Config) (*Cluster, error) {
 	}
 
 	cluster := &Cluster{
-		logger:        cfg.Logger,
-		stateDelegate: cfg.StateDelegate,
-		eventDelegate: cfg.EventDelegate,
-		done:          make(chan struct{}),
+		logger:            cfg.Logger,
+		stateDelegate:     cfg.StateDelegate,
+		eventDelegate:     cfg.EventDelegate,
+		done:              make(chan struct{}),
+		peers:             cfg.Peers,
+		startedAt:         time.Now(),
+		leaderGracePeriod: cfg.LeaderGracePeriod,
+		rejoinInterval:    cfg.RejoinInterval,
+	}
+	if cluster.leaderGracePeriod <= 0 {
+		cluster.leaderGracePeriod = defaultLeaderGracePeriod
+	}
+	if cluster.rejoinInterval <= 0 {
+		cluster.rejoinInterval = defaultRejoinInterval
 	}
 
 	// Create memberlist configuration
@@ -161,6 +190,11 @@ func NewCluster(cfg Config) (*Cluster, error) {
 			cfg.Logger.Warn("Failed to join some peers", "error", err)
 			// Don't fail completely - we might be the first node
 		}
+
+		// memberlist never retries a join. Without this, nodes restarted at the
+		// same moment can each miss the other's listener and stay one-member
+		// clusters - every one of them leader - until the next restart.
+		concurrency.SafeGo(cfg.Logger, "cluster-rejoin", cluster.rejoinLoop)
 	}
 
 	// Initialize leader election
@@ -323,7 +357,8 @@ func (c *Cluster) Shutdown() error {
 // --- Leader Election ---
 
 // IsLeader returns true if this node is the cluster leader
-// Leader is determined by lexicographic ordering of node names (deterministic)
+// Leader is determined by lexicographic ordering of node names (deterministic).
+// No node is leader while its membership is unconfirmed (see membershipConfirmed).
 func (c *Cluster) IsLeader() bool {
 	c.leaderMtx.RLock()
 	defer c.leaderMtx.RUnlock()
@@ -356,6 +391,28 @@ func (c *Cluster) updateLeader() {
 		return
 	}
 
+	if !c.canLead(len(members)) {
+		// Stand down rather than keep a stale claim: whoever can still see a
+		// majority is entitled to lead, and this node cannot tell whether that
+		// is happening on the other side of a partition.
+		hadLeader := c.leader
+		c.leader = ""
+		m := c.metrics
+		localName := c.ml.LocalNode().Name
+		c.leaderMtx.Unlock()
+
+		if hadLeader != "" {
+			c.logger.Warn("cluster: too few members visible to elect a leader - standing down",
+				"previous_leader", hadLeader,
+				"visible_members", len(members),
+				"configured_peers", len(c.peers))
+		}
+		if m != nil && m.ClusterLeader != nil {
+			m.ClusterLeader.WithLabelValues(localName).Set(0)
+		}
+		return
+	}
+
 	// Sort members by node name lexicographically
 	sort.Slice(members, func(i, j int) bool {
 		return members[i].Name < members[j].Name
@@ -383,6 +440,77 @@ func (c *Cluster) updateLeader() {
 			v = 1.0
 		}
 		m.ClusterLeader.WithLabelValues(localName).Set(v)
+	}
+}
+
+// canLead reports whether this node's view of the cluster is good enough to act
+// as leader. Must be called with leaderMtx held.
+//
+// Leadership is the only thing standing between a node and the certificate
+// authority, so a node that cannot see the cluster must not claim it. Two
+// different situations have to be told apart:
+//
+//   - It has never seen a peer. It is the only member it knows of, and the
+//     smallest name in a list of one is its own, so it would elect itself on no
+//     evidence. It waits. After leaderGracePeriod it proceeds anyway: a node
+//     whose peers really are absent — a fresh cluster, a single-node install
+//     with stale config — must still be able to obtain certificates.
+//
+//   - It has seen the cluster and now sees less of it. That is a partition or a
+//     mass failure, and it cannot tell which. A majority is required, so that at
+//     most one side of a partition has a leader. The minority keeps serving what
+//     it holds; only issuing and renewing stop, and those have weeks of slack.
+func (c *Cluster) canLead(numMembers int) bool {
+	if len(c.peers) == 0 {
+		return true
+	}
+
+	if c.sawPeer {
+		return numMembers >= c.quorum()
+	}
+
+	switch {
+	case numMembers > 1:
+		c.logger.Info("cluster membership confirmed", "members", numMembers)
+		c.sawPeer = true
+		return true
+	case time.Since(c.startedAt) >= c.leaderGracePeriod:
+		c.logger.Warn("no configured peer reachable - proceeding as a single-node cluster",
+			"peers", c.peers,
+			"waited", c.leaderGracePeriod)
+		return true
+	default:
+		return false
+	}
+}
+
+// quorum is the number of visible members a leader needs: a majority of the
+// configured cluster, counting this node.
+func (c *Cluster) quorum() int {
+	return (len(c.peers)+1)/2 + 1
+}
+
+// rejoinLoop retries joining the configured peers for as long as this node is
+// alone. Once it knows any other member, gossip keeps the rest in sync.
+func (c *Cluster) rejoinLoop() {
+	ticker := time.NewTicker(c.rejoinInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.done:
+			return
+		case <-ticker.C:
+			if c.ml.NumMembers() > 1 {
+				continue
+			}
+			if n, err := c.ml.Join(c.peers); err != nil {
+				c.logger.Debug("cluster rejoin failed", "peers", c.peers, "error", err)
+			} else {
+				c.logger.Info("rejoined cluster", "contacted_peers", n)
+				c.updateLeader()
+			}
+		}
 	}
 }
 

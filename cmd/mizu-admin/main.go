@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -690,11 +691,27 @@ func cmdCerts() {
 	}
 }
 
+// renewCertTimeout matches the server's allowance for a synchronous renewal.
+const renewCertTimeout = 11*time.Minute + 30*time.Second
+
+// httpStatusError is a non-2xx reply. Callers match on the status: the body is
+// written by the ACME server and cannot be pattern-matched safely (an
+// authorization URL carries a numeric id that may contain any digits).
+type httpStatusError struct {
+	StatusCode int
+	Body       []byte
+}
+
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("HTTP %d: %s", e.StatusCode, e.Body)
+}
+
 func cmdRenewCert() {
 	// Support both: renew-cert relay.example.com
 	//           and: renew-cert --domain relay.example.com
 	fs := flag.NewFlagSet("renew-cert", flag.ExitOnError)
 	domainFlag := fs.String("domain", "", "domain to renew")
+	keyTypeFlag := fs.String("key-type", "", "key type to renew: ecdsa or rsa (default both)")
 	fs.Parse(flag.Args()[1:])
 
 	domain := *domainFlag
@@ -702,43 +719,110 @@ func cmdRenewCert() {
 		domain = fs.Arg(0)
 	}
 	if domain == "" {
-		fmt.Fprintf(os.Stderr, "Usage: mizu-admin renew-cert <domain>\n")
+		fmt.Fprintf(os.Stderr, "Usage: mizu-admin renew-cert [--key-type ecdsa|rsa] <domain>\n")
 		fmt.Fprintf(os.Stderr, "\nExample: mizu-admin renew-cert relay.example.com\n")
 		os.Exit(1)
 	}
 
-	fmt.Printf("Forcing certificate renewal for %s...\n", domain)
+	what := "a new certificate"
+	if *keyTypeFlag != "" {
+		what = fmt.Sprintf("a new %s certificate", *keyTypeFlag)
+	}
+	fmt.Printf("Ordering %s for %s (usually under a minute)...\n", what, domain)
 
-	bodyJSON, _ := json.Marshal(map[string]string{"domain": domain})
-	body := strings.NewReader(string(bodyJSON))
-	resp, err := httpPost("/api/renew-cert", body)
+	// The server answers once the CA has: far longer than the default timeout.
+	if timeout < renewCertTimeout {
+		timeout = renewCertTimeout
+	}
+
+	request := map[string]string{"domain": domain}
+	if *keyTypeFlag != "" {
+		request["key_type"] = *keyTypeFlag
+	}
+	bodyJSON, _ := json.Marshal(request)
+
+	resp, err := httpPost("/api/renew-cert", strings.NewReader(string(bodyJSON)))
+	lines, exitCode := renewCertResult(resp, err)
+	for _, line := range lines {
+		fmt.Println(line)
+	}
+	os.Exit(exitCode)
+}
+
+// renewCertResult turns the server's reply into what to print and an exit code.
+func renewCertResult(body []byte, err error) ([]string, int) {
 	if err != nil {
-		if strings.Contains(err.Error(), "404") {
-			fmt.Println("✗ Certificate renewal endpoint not available")
-			fmt.Println("  Ensure mizu-server is running with TLS (letsencrypt) enabled")
-			os.Exit(1)
+		var statusErr *httpStatusError
+		if errors.As(err, &statusErr) {
+			switch statusErr.StatusCode {
+			case http.StatusNotFound, http.StatusNotImplemented:
+				return []string{
+					"✗ Certificate renewal endpoint not available",
+					"  Ensure mizu-server is running with TLS (letsencrypt) enabled",
+				}, 1
+			}
+			return []string{
+				"✗ Certificate renewal failed - the current certificate is unchanged",
+				"  " + renewCertError(statusErr.Body, statusErr.Error()),
+			}, 1
 		}
-		fatal("Failed to renew certificate: %v", err)
+		return []string{
+			"✗ Certificate renewal failed - the current certificate is unchanged",
+			"  " + err.Error(),
+		}, 1
 	}
 
-	var result map[string]any
-	if err := json.Unmarshal(resp, &result); err != nil {
-		fatal("Failed to parse response: %v", err)
+	var result struct {
+		Status  string   `json:"status"`
+		Error   string   `json:"error"`
+		Renewed []string `json:"renewed"`
+	}
+	if jsonErr := json.Unmarshal(body, &result); jsonErr != nil {
+		return []string{fmt.Sprintf("✗ Could not read the server's reply: %v", jsonErr)}, 1
 	}
 
-	if status, ok := result["status"].(string); ok && status == "success" {
-		fmt.Println("✓ Certificate cache cleared successfully")
-		if msg, ok := result["message"].(string); ok {
-			fmt.Printf("  %s\n", msg)
+	lines := make([]string, 0, len(result.Renewed)+3)
+	switch result.Status {
+	case "success":
+		lines = append(lines, "✓ Certificate renewed and in service on this node")
+		for _, renewed := range result.Renewed {
+			lines = append(lines, "  "+renewed)
 		}
-		fmt.Println("  The next TLS connection will trigger a fresh ACME certificate request.")
-		fmt.Printf("  Trigger with: openssl s_client -connect %s:465 -servername %s </dev/null\n", domain, domain)
-	} else {
-		fmt.Println("✗ Certificate renewal failed")
-		if msg, ok := result["error"].(string); ok {
-			fmt.Printf("  Error: %s\n", msg)
+		return append(lines, "  Other cluster nodes pick it up from shared storage within the hour."), 0
+
+	case "partial":
+		lines = append(lines, "⚠ Certificate renewed for some key types only")
+		for _, renewed := range result.Renewed {
+			lines = append(lines, "  "+renewed)
 		}
+		return append(lines, "  "+result.Error), 1
+
+	case "stored":
+		lines = append(lines, "⚠ Certificate issued and stored, but not in service on that node")
+		for _, renewed := range result.Renewed {
+			lines = append(lines, "  "+renewed)
+		}
+		lines = append(lines, "  "+result.Error)
+		return append(lines, "  The certificate is safe - do not re-run this, it would spend another issuance."), 1
+
+	default:
+		return []string{
+			"✗ Certificate renewal failed - the current certificate is unchanged",
+			"  " + renewCertError(body, string(body)),
+		}, 1
 	}
+}
+
+// renewCertError pulls the message out of an error reply, falling back to the
+// raw text when it is not the JSON we expect.
+func renewCertError(body []byte, fallback string) string {
+	var reply struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(body, &reply); err == nil && reply.Error != "" {
+		return reply.Error
+	}
+	return fallback
 }
 
 func cmdFlushCache() {
@@ -932,8 +1016,10 @@ func handleTLSList(ctx context.Context) {
 		status := "Valid"
 		expiryStr := "-"
 		if !cert.Expiry.IsZero() {
+			// Compare instants, not whole days: the division truncates toward
+			// zero, so a cert that expired 11 hours ago is still "0 days" away.
 			daysUntilExpiry := int(time.Until(cert.Expiry).Hours() / 24)
-			if daysUntilExpiry < 0 {
+			if time.Now().After(cert.Expiry) {
 				expiryStr = "EXPIRED"
 				status = "Expired"
 			} else if daysUntilExpiry < 7 {
@@ -986,8 +1072,10 @@ func handleTLSDelete(ctx context.Context) {
 	}
 
 	fmt.Printf("Deleting certificate for domain: %s\n", domain)
-	fmt.Println("Warning: This will remove the certificate from storage.")
-	fmt.Println("The server will automatically request a new certificate on next use.")
+	fmt.Println("Warning: This removes the certificate from shared storage only.")
+	fmt.Println("Running servers keep serving it from memory, and a node that still")
+	fmt.Println("holds a local copy will put it back. To replace a certificate, use:")
+	fmt.Printf("  mizu-admin renew-cert %s\n", domain)
 	fmt.Println()
 
 	// Compute keys for both ECDSA and RSA variants at the cert storage prefix.
@@ -1311,7 +1399,7 @@ func httpPost(path string, data io.Reader) ([]byte, error) {
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+		return nil, &httpStatusError{StatusCode: resp.StatusCode, Body: body}
 	}
 
 	return body, nil

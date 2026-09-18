@@ -260,3 +260,142 @@ func TestLeaderElection_LeaderFailover(t *testing.T) {
 		t.Errorf("Expected new leader to be 'node-b', got '%s'", c2.GetLeader())
 	}
 }
+
+// waitFor polls cond until it holds or the timeout passes.
+func waitFor(timeout time.Duration, cond func() bool) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return true
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return cond()
+}
+
+// A node that cannot reach its configured peers is the only member it knows of.
+// It must not elect itself on that view until the grace period has passed.
+func TestLeaderElection_UnreachablePeersDelayLeadership(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	c, err := NewCluster(Config{
+		NodeName:          "node-a",
+		BindAddr:          "127.0.0.1",
+		BindPort:          17960,
+		Peers:             []string{"127.0.0.1:17961"}, // nothing listens here
+		Logger:            logger,
+		LeaderGracePeriod: 1500 * time.Millisecond,
+		RejoinInterval:    time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("Failed to create cluster: %v", err)
+	}
+	defer c.Shutdown()
+
+	if c.IsLeader() || c.GetLeader() != "" {
+		t.Errorf("lone node claimed a leader before confirming membership: leader=%q", c.GetLeader())
+	}
+
+	// Its peers really are down: it has to be able to act alone eventually.
+	if !waitFor(5*time.Second, c.IsLeader) {
+		t.Errorf("lone node never became leader after the grace period")
+	}
+}
+
+// Regression: memberlist never retries a join, so nodes started at the same
+// moment could miss each other and each remain a single-node cluster - each one
+// leader - until restarted.
+func TestLeaderElection_RejoinsAfterMissedJoin(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	// node-b starts first; its only peer is not up yet, so the initial join fails.
+	c2, err := NewCluster(Config{
+		NodeName:          "node-b",
+		BindAddr:          "127.0.0.1",
+		BindPort:          17963,
+		Peers:             []string{"127.0.0.1:17962"},
+		Logger:            logger,
+		LeaderGracePeriod: time.Hour,
+		RejoinInterval:    200 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("Failed to create cluster 2: %v", err)
+	}
+	defer c2.Shutdown()
+
+	if c2.IsLeader() {
+		t.Fatalf("node-b elected itself while alone")
+	}
+
+	// node-a comes up without knowing node-b: only node-b's retry can connect them.
+	c1, err := NewCluster(Config{
+		NodeName: "node-a",
+		BindAddr: "127.0.0.1",
+		BindPort: 17962,
+		Peers:    []string{},
+		Logger:   logger,
+	})
+	if err != nil {
+		t.Fatalf("Failed to create cluster 1: %v", err)
+	}
+	defer c1.Shutdown()
+
+	if !waitFor(5*time.Second, func() bool { return c2.GetLeader() == "node-a" }) {
+		t.Fatalf("node-b never rejoined: members=%d leader=%q", c2.NumMembers(), c2.GetLeader())
+	}
+	if c2.IsLeader() {
+		t.Errorf("node-b is leader, want node-a")
+	}
+	if !c1.IsLeader() {
+		t.Errorf("node-a is not leader")
+	}
+}
+
+// Confirmation was a one-way latch, so a node that had once seen the cluster
+// went on electing itself after losing sight of it. A partition therefore gave
+// both sides a leader, and with leadership the only thing standing between a
+// node and Let's Encrypt, both sides order - which is the rate-limit exhaustion
+// this whole change exists to prevent.
+func TestLeaderElection_IsolatedNodeStandsDown(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	c1, err := NewCluster(Config{
+		NodeName: "node-a", BindAddr: "127.0.0.1", BindPort: 17970,
+		Peers: []string{"127.0.0.1:17971"}, Logger: logger,
+		LeaderGracePeriod: time.Hour, RejoinInterval: 200 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("Failed to create cluster 1: %v", err)
+	}
+	defer c1.Shutdown()
+
+	c2, err := NewCluster(Config{
+		NodeName: "node-b", BindAddr: "127.0.0.1", BindPort: 17971,
+		Peers: []string{"127.0.0.1:17970"}, Logger: logger,
+		LeaderGracePeriod: time.Hour, RejoinInterval: 200 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("Failed to create cluster 2: %v", err)
+	}
+	defer c2.Shutdown()
+
+	if !waitFor(5*time.Second, func() bool { return c2.NumMembers() == 2 && c1.IsLeader() }) {
+		t.Fatalf("setup: cluster did not form (c1.leader=%q members=%d)", c1.GetLeader(), c1.NumMembers())
+	}
+
+	// node-a disappears. node-b is left alone with a peer it cannot reach.
+	c1.Shutdown()
+
+	if !waitFor(10*time.Second, func() bool { return c2.NumMembers() == 1 }) {
+		t.Fatalf("setup: node-b still sees %d members", c2.NumMembers())
+	}
+
+	// It must not appoint itself: from here it cannot tell a dead peer from a
+	// partition, and the other side may still be serving with a leader.
+	if c2.IsLeader() {
+		t.Error("the isolated node elected itself; a partition would give the cluster two leaders")
+	}
+	if leader := c2.GetLeader(); leader != "" {
+		t.Errorf("GetLeader = %q, want no leader while the cluster cannot be seen", leader)
+	}
+}

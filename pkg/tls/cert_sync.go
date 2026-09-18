@@ -8,7 +8,9 @@ import (
 	"migadu/mizu/pkg/concurrency"
 )
 
-// CertSyncWorker manages periodic synchronization of certificates from local cache to S3.
+// CertSyncWorker periodically pushes certificates that were stored locally during
+// an S3 outage. There is no startup sync: what is pending is known only to the
+// process that wrote it, and a certificate lost that way is simply re-ordered.
 type CertSyncWorker struct {
 	fallbackCache    *FallbackCache
 	syncInterval     time.Duration
@@ -34,10 +36,6 @@ func (w *CertSyncWorker) Start() {
 	concurrency.SafeGo(w.logger, "cert-sync-worker", func() {
 		defer close(w.doneCh)
 
-		// One-time startup sync: push local certs to S3 if they're missing there.
-		w.logger.Info("certificate sync worker: running startup sync from local cache to S3")
-		w.runStartupSync()
-
 		ticker := time.NewTicker(w.syncInterval)
 		defer ticker.Stop()
 
@@ -51,17 +49,6 @@ func (w *CertSyncWorker) Start() {
 			}
 		}
 	})
-}
-
-func (w *CertSyncWorker) runStartupSync() {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-
-	if err := w.fallbackCache.SyncAllToS3(ctx); err != nil {
-		w.logger.Warn("certificate sync worker: startup sync had errors", "error", err)
-	} else {
-		w.logger.Info("certificate sync worker: startup sync complete")
-	}
 }
 
 func (w *CertSyncWorker) Stop(timeout time.Duration) {
@@ -78,8 +65,6 @@ func (w *CertSyncWorker) Stop(timeout time.Duration) {
 
 // runSync performs a single sync operation with escalating severity on
 // consecutive failures so persistent S3 issues are impossible to miss.
-// Only syncs when there are local-only certs to avoid downloading all certs
-// from S3 on every tick.
 func (w *CertSyncWorker) runSync() {
 	if !w.fallbackCache.NeedsSync() {
 		w.logger.Debug("certificate sync: no sync needed, skipping")
@@ -90,7 +75,7 @@ func (w *CertSyncWorker) runSync() {
 	defer cancel()
 
 	w.logger.Debug("running certificate sync")
-	if err := w.fallbackCache.SyncAllToS3(ctx); err != nil {
+	if err := w.fallbackCache.SyncPendingToS3(ctx); err != nil {
 		w.consecutiveFails++
 
 		switch {

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"migadu/mizu/pkg/concurrency"
 	"migadu/mizu/pkg/logging"
+	tlsmgr "migadu/mizu/pkg/tls"
 	"net"
 	"net/http"
 	"time"
@@ -50,7 +51,9 @@ type CacheFlusher interface {
 
 // CertRenewer defines an interface for components that can renew TLS certificates
 type CertRenewer interface {
-	RenewCertificate(domain string) ([]string, error)
+	// keyTypes selects which key types to order; none means all of them. The
+	// context lets a caller that has gone away stop the work it asked for.
+	RenewCertificate(ctx context.Context, domain string, keyTypes ...string) ([]string, error)
 }
 
 // IPUnblocker defines an interface for components that can remove IPs from reputation tracking
@@ -732,6 +735,10 @@ func (s *Server) flushCacheHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// renewCertTimeout covers a synchronous renewal: autocert allows each of the two
+// orders (ECDSA, RSA) up to five minutes. Normally both finish in well under one.
+const renewCertTimeout = 11 * time.Minute
+
 // renewCertHandler handles /api/renew-cert requests
 func (s *Server) renewCertHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -750,15 +757,28 @@ func (s *Server) renewCertHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	domain := r.URL.Query().Get("domain")
+	keyType := r.URL.Query().Get("key_type")
+
 	if domain == "" {
 		// Try reading from JSON body
 		var body struct {
-			Domain string `json:"domain"`
+			Domain  string `json:"domain"`
+			KeyType string `json:"key_type"`
 		}
 		if r.Body != nil {
 			json.NewDecoder(io.LimitReader(r.Body, 1024)).Decode(&body)
 			domain = body.Domain
+			// The query wins: taking both would ask for the same key type twice,
+			// and each ask is an order against the duplicate-certificate limit.
+			if keyType == "" {
+				keyType = body.KeyType
+			}
 		}
+	}
+
+	var keyTypes []string
+	if keyType != "" {
+		keyTypes = append(keyTypes, keyType)
 	}
 	if domain == "" {
 		w.Header().Set("Content-Type", "application/json")
@@ -770,8 +790,44 @@ func (s *Server) renewCertHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.logger.Info("Certificate renewal requested", "domain", domain)
-	renewed, err := s.certRenewer.RenewCertificate(domain)
+	// The renewal runs to completion before answering, so the caller gets the
+	// CA's verdict (a rate limit, a failed validation) instead of a promise. That
+	// outlasts the server's WriteTimeout, which exists for slow clients.
+	// Both deadlines: the write one so the answer can still be delivered, and the
+	// read one because the server's ReadTimeout otherwise bounds the whole
+	// request once anything reads from the connection — which would cancel
+	// r.Context() mid-order and abandon a certificate the CA has already issued.
+	controller := http.NewResponseController(w)
+	if err := controller.SetWriteDeadline(time.Now().Add(renewCertTimeout)); err != nil {
+		s.logger.Warn("Cannot extend write deadline for certificate renewal", "error", err)
+	}
+	if err := controller.SetReadDeadline(time.Now().Add(renewCertTimeout)); err != nil {
+		s.logger.Warn("Cannot extend read deadline for certificate renewal", "error", err)
+	}
+
+	s.logger.Info("Certificate renewal requested", "domain", domain, "key_types", keyTypes)
+	// r.Context() is cancelled when the client disconnects, which is what an
+	// operator's Ctrl-C looks like from here.
+	renewed, err := s.certRenewer.RenewCertificate(r.Context(), domain, keyTypes...)
+	if err != nil && len(renewed) > 0 {
+		// Everything asked for was issued and stored, but this node could not
+		// load it. That is not the same as a key type failing to issue, and an
+		// operator told the wrong one would retry and spend the CA's budget.
+		status := "partial"
+		if errors.Is(err, tlsmgr.ErrNotInService) {
+			status = "stored"
+		}
+
+		s.logger.Error("Certificate renewal incomplete", "domain", domain, "status", status, "renewed", renewed, "error", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"status":  status,
+			"error":   err.Error(),
+			"renewed": renewed,
+		})
+		return
+	}
 	if err != nil {
 		s.logger.Error("Certificate renewal failed", "domain", domain, "error", err)
 		w.Header().Set("Content-Type", "application/json")
@@ -787,7 +843,7 @@ func (s *Server) renewCertHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]any{
 		"status":  "success",
-		"message": fmt.Sprintf("Certificate cache cleared for %s — next TLS handshake will trigger fresh ACME request", domain),
+		"message": fmt.Sprintf("New certificate for %s issued, stored and in service", domain),
 		"renewed": renewed,
 	})
 }
