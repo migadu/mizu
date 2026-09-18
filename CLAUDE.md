@@ -192,7 +192,7 @@ Key packages:
      as `expiry > 0 and expiry - time() < N`.
    - Recovery when issued certs were lost: autocert's renewal reuses the private
      key, so a discarded cert is rebuildable from the CT logs (crt.sh) plus the
-     key in the old cache entry — [contrib/recover-cert.sh](contrib/recover-cert.sh).
+     key in the old cache entry — [scripts/recover-cert.sh](scripts/recover-cert.sh).
 
 8. **Email Validation** ([pkg/validation/](pkg/validation/))
    - SPF validation (checks sender IP authorization)

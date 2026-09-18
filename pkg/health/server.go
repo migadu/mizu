@@ -50,7 +50,8 @@ type CacheFlusher interface {
 
 // CertRenewer defines an interface for components that can renew TLS certificates
 type CertRenewer interface {
-	RenewCertificate(domain string) ([]string, error)
+	// keyTypes selects which key types to order; none means all of them.
+	RenewCertificate(domain string, keyTypes ...string) ([]string, error)
 }
 
 // IPUnblocker defines an interface for components that can remove IPs from reputation tracking
@@ -754,14 +755,23 @@ func (s *Server) renewCertHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	domain := r.URL.Query().Get("domain")
+	var keyTypes []string
+	if keyType := r.URL.Query().Get("key_type"); keyType != "" {
+		keyTypes = append(keyTypes, keyType)
+	}
+
 	if domain == "" {
 		// Try reading from JSON body
 		var body struct {
-			Domain string `json:"domain"`
+			Domain  string `json:"domain"`
+			KeyType string `json:"key_type"`
 		}
 		if r.Body != nil {
 			json.NewDecoder(io.LimitReader(r.Body, 1024)).Decode(&body)
 			domain = body.Domain
+			if body.KeyType != "" {
+				keyTypes = append(keyTypes, body.KeyType)
+			}
 		}
 	}
 	if domain == "" {
@@ -781,8 +791,8 @@ func (s *Server) renewCertHandler(w http.ResponseWriter, r *http.Request) {
 		s.logger.Warn("Cannot extend write deadline for certificate renewal", "error", err)
 	}
 
-	s.logger.Info("Certificate renewal requested", "domain", domain)
-	renewed, err := s.certRenewer.RenewCertificate(domain)
+	s.logger.Info("Certificate renewal requested", "domain", domain, "key_types", keyTypes)
+	renewed, err := s.certRenewer.RenewCertificate(domain, keyTypes...)
 	if err != nil && len(renewed) > 0 {
 		s.logger.Error("Certificate renewal partially failed", "domain", domain, "renewed", renewed, "error", err)
 		w.Header().Set("Content-Type", "application/json")

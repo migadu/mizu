@@ -15,6 +15,10 @@
 # private key never leaves this machine.
 set -eu
 
+# The output holds a private key: never let it exist group- or world-readable,
+# not even for the moment between writing it and fixing its mode.
+umask 077
+
 [ $# -eq 3 ] || { echo "usage: $0 <cache-file> <domain> <out-file>" >&2; exit 2; }
 file=$1
 domain=$2
@@ -39,12 +43,21 @@ get() { # get <url> <out>; crt.sh throttles bursts, so pace and retry
 	return 1
 }
 pubhash() { openssl pkey -pubin -outform DER 2>/dev/null | openssl dgst -sha256 | sed 's/.*= *//'; }
+fingerprint() { openssl x509 -in "$1" -noout -fingerprint -sha256 | sed 's/.*=//'; }
 is_pem() { openssl x509 -in "$1" -noout 2>/dev/null; }
+
+# Matches one SAN exactly. -checkhost would be clearer but LibreSSL has no such
+# option, and this script has to run on whatever openssl the host ships.
+covers_domain() {
+	esc=$(printf '%s' "$domain" | sed 's/[].[*^$\\]/\\&/g')
+	openssl x509 -in "$1" -noout -text | tr ',' '\n' | grep -Eq "^[[:space:]]*DNS:$esc[[:space:]]*$"
+}
 
 # Split the cache file: block 1 is the private key, the rest is the chain.
 awk -v d="$tmp" '/-----BEGIN /{n++} n{print > (d "/blk" n ".pem")}' "$file"
 grep -q "PRIVATE KEY" "$tmp/blk1.pem" || { echo "$file: first PEM block is not a private key" >&2; exit 1; }
 want=$(openssl pkey -in "$tmp/blk1.pem" -pubout 2>/dev/null | pubhash)
+current_fp=$(fingerprint "$tmp/blk2.pem")
 old_end=$(openssl x509 -in "$tmp/blk2.pem" -noout -enddate | cut -d= -f2)
 echo "cache file key:  $want"
 echo "current cert:    expires $old_end"
@@ -63,8 +76,11 @@ for id in $ids; do
 		continue
 	fi
 	# Exact name match only: the query also returns certs that merely contain it.
-	openssl x509 -in "$tmp/c.pem" -noout -checkhost "$domain" | grep -q "does match" || continue
+	covers_domain "$tmp/c.pem" || continue
 	[ "$(openssl x509 -in "$tmp/c.pem" -noout -pubkey | pubhash)" = "$want" ] || continue
+	# The certificate already in the cache file shares the key and will match.
+	# Recovering it over itself changes nothing and would report success.
+	[ "$(fingerprint "$tmp/c.pem")" != "$current_fp" ] || continue
 	openssl x509 -in "$tmp/c.pem" -noout -checkend 604800 >/dev/null || continue
 	leaf=$tmp/leaf.pem
 	cp "$tmp/c.pem" "$leaf"
@@ -73,32 +89,45 @@ for id in $ids; do
 done
 [ -n "$leaf" ] || { echo "no CT certificate matches the key in $file - nothing to recover, wait for the rate limit" >&2; exit 1; }
 
-# Chain: reuse the file's existing intermediates when the issuer is unchanged,
-# otherwise walk the AIA "CA Issuers" links.
-cat "$tmp/blk1.pem" "$leaf" >"$out"
+# Assembled inside the temp directory, which mktemp created 0700, and moved into
+# place only once it is complete: a failure part-way through must not leave a
+# private key lying around under whatever umask the caller happened to have.
+staged=$tmp/out.pem
+cat "$tmp/blk1.pem" "$leaf" >"$staged"
 if [ "$(openssl x509 -in "$leaf" -noout -issuer_hash)" = "$(openssl x509 -in "$tmp/blk2.pem" -noout -issuer_hash)" ]; then
 	n=3
-	while [ -f "$tmp/blk$n.pem" ]; do cat "$tmp/blk$n.pem" >>"$out"; n=$((n + 1)); done
+	intermediates=0
+	while [ -f "$tmp/blk$n.pem" ]; do
+		cat "$tmp/blk$n.pem" >>"$staged"
+		intermediates=$((intermediates + 1))
+		n=$((n + 1))
+	done
 	echo "chain:           reused from existing file (same issuer)"
 else
 	cur=$leaf
-	n=0
-	while [ $n -lt 4 ]; do
+	intermediates=0
+	while [ $intermediates -lt 4 ]; do
 		url=$(openssl x509 -in "$cur" -noout -text | sed -n 's/.*CA Issuers - URI:\(.*\)/\1/p' | head -1)
 		[ -n "$url" ] || break
-		get "$url" "$tmp/i$n.der"
-		openssl x509 -inform DER -in "$tmp/i$n.der" -out "$tmp/i$n.pem" 2>/dev/null || cp "$tmp/i$n.der" "$tmp/i$n.pem"
+		get "$url" "$tmp/i$intermediates.der"
+		openssl x509 -inform DER -in "$tmp/i$intermediates.der" -out "$tmp/i$intermediates.pem" 2>/dev/null || cp "$tmp/i$intermediates.der" "$tmp/i$intermediates.pem"
 		# Stop before a self-signed root; servers do not send those.
-		[ "$(openssl x509 -in "$tmp/i$n.pem" -noout -subject_hash)" != "$(openssl x509 -in "$tmp/i$n.pem" -noout -issuer_hash)" ] || break
-		cat "$tmp/i$n.pem" >>"$out"
-		cur=$tmp/i$n.pem
-		n=$((n + 1))
+		[ "$(openssl x509 -in "$tmp/i$intermediates.pem" -noout -subject_hash)" != "$(openssl x509 -in "$tmp/i$intermediates.pem" -noout -issuer_hash)" ] || break
+		cat "$tmp/i$intermediates.pem" >>"$staged"
+		cur=$tmp/i$intermediates.pem
+		intermediates=$((intermediates + 1))
 	done
-	echo "chain:           rebuilt from AIA ($n intermediates)"
+	echo "chain:           rebuilt from AIA ($intermediates intermediates)"
 fi
-chmod 600 "$out"
+
+# Outlook and Exchange Online abort the handshake on a leaf-only chain, so a
+# certificate without its intermediates is not worth installing.
+[ "$intermediates" -gt 0 ] || { echo "no intermediates found - refusing to write a leaf-only chain" >&2; exit 1; }
 
 # Final check: the key in the new file must match its leaf.
-got=$(awk '/-----BEGIN CERT/{n++} n==1' "$out" | openssl x509 -noout -pubkey | pubhash)
-[ "$got" = "$want" ] || { echo "BUG: key/leaf mismatch in $out" >&2; rm -f "$out"; exit 1; }
+got=$(awk '/-----BEGIN CERT/{n++} n==1' "$staged" | openssl x509 -noout -pubkey | pubhash)
+[ "$got" = "$want" ] || { echo "BUG: key/leaf mismatch in $staged" >&2; exit 1; }
+
+chmod 600 "$staged"
+mv "$staged" "$out"
 echo "wrote $out"

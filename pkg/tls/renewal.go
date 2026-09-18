@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -137,14 +138,20 @@ func (c *hidingCache) Get(ctx context.Context, key string) ([]byte, error) {
 	return c.Cache.Get(ctx, key)
 }
 
-// RenewCertificate orders a new certificate for a domain (both key types) and
-// puts it into service. Must run on the cluster leader.
+// RenewCertificate orders a new certificate for a domain and puts it into
+// service. Must run on the cluster leader.
+//
+// keyTypes selects what to order; no argument means both. Both draw on the same
+// duplicate-certificate budget, so after a partial failure the operator must be
+// able to retry only the key type that was refused - ordering both again spends
+// a slot on a certificate issued minutes earlier, which with one slot left is
+// the slot the failing key type needed.
 //
 // The order comes first and nothing is removed up front: a throwaway autocert
 // instance that cannot see the current certificate orders the replacement into
 // the shared cache while the live instance keeps serving. If the order fails — a
 // rate limit, a failed validation — the domain is left exactly as it was.
-func (m *Manager) RenewCertificate(domain string) ([]string, error) {
+func (m *Manager) RenewCertificate(domain string, keyTypes ...string) ([]string, error) {
 	if m == nil || m.current.Load() == nil {
 		return nil, fmt.Errorf("TLS manager not initialized")
 	}
@@ -162,13 +169,18 @@ func (m *Manager) RenewCertificate(domain string) ([]string, error) {
 		return nil, fmt.Errorf("domain %q not in allowed list: %w", domain, err)
 	}
 
+	keyTypes, err := resolveKeyTypes(keyTypes)
+	if err != nil {
+		return nil, err
+	}
+
 	if !m.renewMu.TryLock() {
 		return nil, fmt.Errorf("another certificate renewal is in progress")
 	}
 	defer m.renewMu.Unlock()
 
-	hidden := make(map[string]struct{}, len(certKeyTypes))
-	for _, keyType := range certKeyTypes {
+	hidden := make(map[string]struct{}, len(keyTypes))
+	for _, keyType := range keyTypes {
 		hidden[certCacheKey(domain, keyType)] = struct{}{}
 	}
 	orderer := m.newAutocert(&hidingCache{Cache: m.cache, hidden: hidden})
@@ -177,7 +189,7 @@ func (m *Manager) RenewCertificate(domain string) ([]string, error) {
 	var renewed []string
 	var errs []error
 
-	for _, keyType := range certKeyTypes {
+	for _, keyType := range keyTypes {
 		m.logger.Info("TLS: ordering replacement certificate", "domain", domain, "key_type", keyType)
 
 		cert, err := orderer.mgr.GetCertificate(certHello(domain, keyType))
@@ -206,14 +218,38 @@ func (m *Manager) RenewCertificate(domain string) ([]string, error) {
 	return renewed, errors.Join(errs...)
 }
 
-// verifyCached checks that the cache holds exactly the given certificate.
+// resolveKeyTypes validates a requested set of key types, defaulting to all.
+func resolveKeyTypes(requested []string) ([]string, error) {
+	if len(requested) == 0 {
+		return certKeyTypes, nil
+	}
+
+	for _, keyType := range requested {
+		if !slices.Contains(certKeyTypes, keyType) {
+			return nil, fmt.Errorf("unknown key type %q, want one of %v", keyType, certKeyTypes)
+		}
+	}
+	return requested, nil
+}
+
+// verifyCached checks that the newly issued certificate reached the cache, since
+// autocert ignores a failed cache write on this path and the reload that follows
+// would lose it.
+//
+// Anything at least as fresh counts: the live instance's own renewal timer can
+// store a newer certificate for the same name while this order is in flight, and
+// that satisfies the intent as well as our own bytes would.
 func (m *Manager) verifyCached(domain, keyType string, cert *tls.Certificate) error {
 	cached, err := m.cachedLeaf(context.Background(), domain, keyType)
 	if err != nil {
 		return fmt.Errorf("certificate was issued but is not in the cache: %w", err)
 	}
-	if !bytes.Equal(cached.Raw, cert.Certificate[0]) {
-		return fmt.Errorf("certificate was issued but the cache holds a different one")
+	if bytes.Equal(cached.Raw, cert.Certificate[0]) {
+		return nil
+	}
+	if cached.NotAfter.Before(cert.Leaf.NotAfter) {
+		return fmt.Errorf("certificate was issued but the cache still holds an older one (expires %s, ordered %s)",
+			cached.NotAfter.UTC().Format(time.RFC3339), cert.Leaf.NotAfter.UTC().Format(time.RFC3339))
 	}
 	return nil
 }

@@ -142,7 +142,9 @@ func TestMaintainCertificatesWithoutMetrics(t *testing.T) {
 func TestRenewCertificateRefreshesExportedExpiry(t *testing.T) {
 	const domain = "mx.example.com"
 	cache := newMemCache()
-	seedCerts(t, cache, domain, time.Now().Add(20*24*time.Hour))
+	// Outside the renewal window, so autocert's own timers stay quiet and the
+	// only certificate ordered here is the one this test asks for.
+	seedCerts(t, cache, domain, time.Now().Add(80*24*time.Hour))
 
 	mx := metrics.New("tlsexpiry_afterrenew")
 	m := newTestManager(cache, newFakeCA(t), always(true), domain)

@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync/atomic"
 )
 
@@ -21,9 +22,11 @@ const maxACMEErrorBody = 4096
 // Let's Encrypt's duplicate-certificate limit for every node, leader included.
 // Refusing the requests themselves means a non-leader cannot reach the CA.
 //
-// It also logs every ACME error response. autocert retries failed renewals
-// silently, so without this a rate limit or failed validation stays invisible
-// until the certificate expires.
+// It also logs what the ACME server refuses. autocert retries failed renewals
+// silently, so without this a rate limit or a failed validation stays invisible
+// until the certificate expires. A failed validation is not an HTTP error - the
+// CA answers 200 with an authorization whose status is "invalid" - so successful
+// JSON replies are inspected too.
 type acmeTransport struct {
 	base      http.RoundTripper
 	isLeaderF func() bool // nil in single-instance mode: never gated
@@ -44,13 +47,9 @@ func (t *acmeTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 
-	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxACMEErrorBody))
-		// Hand the bytes back: the ACME client parses the problem document itself.
-		resp.Body = struct {
-			io.Reader
-			io.Closer
-		}{io.MultiReader(bytes.NewReader(body), resp.Body), resp.Body}
+	switch {
+	case resp.StatusCode >= 400:
+		body := t.peekBody(resp)
 
 		// A stale nonce is routine and retried transparently by the ACME client.
 		level := slog.LevelWarn
@@ -62,7 +61,34 @@ func (t *acmeTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 			"url", req.URL.String(),
 			"retry_after", resp.Header.Get("Retry-After"),
 			"body", string(body))
+
+	case isACMEJSON(resp):
+		if body := t.peekBody(resp); bytes.Contains(body, []byte(`"status":"invalid"`)) ||
+			bytes.Contains(body, []byte(`"status": "invalid"`)) {
+			t.logger.Warn("TLS: ACME validation failed - the CA could not verify this domain",
+				"url", req.URL.String(),
+				"body", string(body))
+		}
 	}
 
 	return resp, nil
+}
+
+// peekBody reads the start of a response and hands the bytes back, so the ACME
+// client still parses the document itself.
+func (t *acmeTransport) peekBody(resp *http.Response) []byte {
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxACMEErrorBody))
+	resp.Body = struct {
+		io.Reader
+		io.Closer
+	}{io.MultiReader(bytes.NewReader(body), resp.Body), resp.Body}
+	return body
+}
+
+// isACMEJSON reports whether a reply is one of the CA's JSON documents, as
+// opposed to an issued certificate chain, which must not be read here.
+func isACMEJSON(resp *http.Response) bool {
+	contentType := resp.Header.Get("Content-Type")
+	return strings.HasPrefix(contentType, "application/json") ||
+		strings.HasPrefix(contentType, "application/problem+json")
 }

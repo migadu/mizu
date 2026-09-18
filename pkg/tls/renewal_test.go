@@ -516,3 +516,50 @@ func TestCachedLeafMatchesWhatAutocertAccepts(t *testing.T) {
 		})
 	}
 }
+
+// F8: both key types of a domain draw on the same duplicate-certificate budget.
+// When one succeeds and the other is refused, the operator has to be able to
+// retry just the one that failed; ordering both again spends a slot on a
+// certificate issued minutes earlier, and with one slot left that is the slot
+// the failing key type needed.
+func TestRenewCertificateOrdersOnlyTheRequestedKeyType(t *testing.T) {
+	const domain = "mx.example.com"
+	cache := newMemCache()
+	// Comfortably outside the renewal window: autocert arms a timer for every
+	// certificate it loads, and one inside the window orders on its own.
+	seedCerts(t, cache, domain, time.Now().Add(80*24*time.Hour))
+
+	ca := newFakeCA(t)
+	m := newTestManager(cache, ca, always(true), domain)
+	m.maintainCertificates()
+	beforeECDSA := mustServedLeaf(t, m, domain, "ecdsa")
+
+	renewed, err := m.RenewCertificate(domain, "rsa")
+	if err != nil {
+		t.Fatalf("RenewCertificate: %v", err)
+	}
+	if len(renewed) != 1 {
+		t.Errorf("renewed %v, want only the requested key type", renewed)
+	}
+	if n := ca.issued.Load(); n != 1 {
+		t.Errorf("CA issued %d certificates, want 1", n)
+	}
+	if after := mustServedLeaf(t, m, domain, "ecdsa"); !bytes.Equal(after.Raw, beforeECDSA.Raw) {
+		t.Error("the ECDSA certificate was re-ordered although only RSA was asked for")
+	}
+}
+
+// A key type asked for by a name that is not one is refused rather than quietly
+// turned into "both".
+func TestRenewCertificateRejectsUnknownKeyType(t *testing.T) {
+	const domain = "mx.example.com"
+	ca := newFakeCA(t)
+	m := newTestManager(newMemCache(), ca, always(true), domain)
+
+	if _, err := m.RenewCertificate(domain, "ed25519"); err == nil {
+		t.Error("RenewCertificate accepted a key type it cannot order")
+	}
+	if n := ca.issued.Load(); n != 0 {
+		t.Errorf("CA issued %d certificates for an unknown key type", n)
+	}
+}

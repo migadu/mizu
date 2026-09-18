@@ -8,12 +8,16 @@ import (
 	"golang.org/x/crypto/acme/autocert"
 )
 
-// ClusterAwareCache wraps an autocert.Cache and only allows the cluster leader
-// to write new certificates. All nodes can read certificates from the cache.
+// ClusterAwareCache wraps an autocert.Cache and keeps deletions to the cluster
+// leader. All nodes can read, and all nodes can store.
 //
-// This is a backstop, not the leader gate: autocert writes to the cache only
-// after it has obtained a certificate, so refusing the write cannot stop a node
-// from ordering one. acmeTransport does that.
+// It is not the leader gate — acmeTransport is. autocert writes to the cache
+// only once it holds a certificate, so refusing the write cannot prevent an
+// order; it can only throw away the result. With ordering gated upstream, a node
+// that holds a certificate was entitled to order it, and refusing to store it
+// after a leadership change mid-order discards something the CA has already
+// issued and counted. Deletion stays gated: it destroys shared state that no
+// other node can recover.
 type ClusterAwareCache struct {
 	underlying autocert.Cache
 	isLeaderF  func() bool
@@ -53,22 +57,20 @@ func (c *ClusterAwareCache) Get(ctx context.Context, name string) ([]byte, error
 }
 
 func (c *ClusterAwareCache) Put(ctx context.Context, name string, data []byte) error {
-	isLeader := c.isLeaderF()
-
-	c.logger.Info("cluster cache: Put certificate request", "name", name, "is_leader", isLeader)
-
-	if !isLeader {
-		c.logger.Warn("cluster cache: certificate request BLOCKED - not cluster leader (leader will handle it)", "name", name)
-		return fmt.Errorf("%w: refused to store %s", ErrNotLeader, name)
+	if isLeader := c.isLeaderF(); !isLeader {
+		// Ordering is gated upstream, so this is a certificate obtained while
+		// this node was still leader. Storing it is what keeps it from being
+		// paid for and thrown away.
+		c.logger.Warn("cluster cache: storing a certificate obtained before this node stopped being leader", "name", name)
 	}
 
-	c.logger.Info("cluster cache: cluster leader storing certificate", "name", name)
+	c.logger.Info("cluster cache: storing certificate", "name", name)
 	if err := c.underlying.Put(ctx, name, data); err != nil {
 		c.logger.Error("cluster cache: failed to store certificate", "name", name, "error", err)
 		return err
 	}
 
-	c.logger.Info("cluster cache: certificate stored by leader", "name", name)
+	c.logger.Info("cluster cache: certificate stored", "name", name)
 	return nil
 }
 

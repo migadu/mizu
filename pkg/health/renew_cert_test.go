@@ -13,12 +13,14 @@ import (
 )
 
 type fakeRenewer struct {
-	delay   time.Duration
-	renewed []string
-	err     error
+	delay    time.Duration
+	renewed  []string
+	err      error
+	keyTypes []string // what the handler asked for
 }
 
-func (f *fakeRenewer) RenewCertificate(string) ([]string, error) {
+func (f *fakeRenewer) RenewCertificate(_ string, keyTypes ...string) ([]string, error) {
+	f.keyTypes = keyTypes
 	time.Sleep(f.delay)
 	return f.renewed, f.err
 }
@@ -72,5 +74,36 @@ func TestRenewCertHandlerReportsPartialAndFailedRenewals(t *testing.T) {
 	status, body = postRenew(t, renewCertServer(t, failed, time.Second).URL)
 	if status != http.StatusInternalServerError || body["status"] != "error" {
 		t.Errorf("failed renewal: status = %d, body = %v", status, body)
+	}
+}
+
+// F8: the operator has to be able to retry the key type that failed without
+// re-ordering the one that succeeded, so the endpoint carries the selection.
+func TestRenewCertHandlerPassesKeyTypeThrough(t *testing.T) {
+	renewer := &fakeRenewer{renewed: []string{"mx.example.com (rsa)"}}
+	srv := renewCertServer(t, renewer, time.Second)
+
+	resp, err := http.Post(srv.URL, "application/json",
+		strings.NewReader(`{"domain":"mx.example.com","key_type":"rsa"}`))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	resp.Body.Close()
+
+	if len(renewer.keyTypes) != 1 || renewer.keyTypes[0] != "rsa" {
+		t.Errorf("renewer asked for %v, want [rsa]", renewer.keyTypes)
+	}
+}
+
+// With no selection it stays "both", which is what an unqualified renewal means.
+func TestRenewCertHandlerDefaultsToEveryKeyType(t *testing.T) {
+	renewer := &fakeRenewer{renewed: []string{"mx.example.com (ecdsa)", "mx.example.com (rsa)"}}
+	srv := renewCertServer(t, renewer, time.Second)
+
+	if _, body := postRenew(t, srv.URL); body["status"] != "success" {
+		t.Fatalf("renewal failed: %v", body)
+	}
+	if len(renewer.keyTypes) != 0 {
+		t.Errorf("renewer asked for %v, want every key type", renewer.keyTypes)
 	}
 }

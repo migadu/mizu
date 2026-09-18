@@ -287,3 +287,65 @@ func TestMaintainCertificatesOrdersMissingCertOnLeader(t *testing.T) {
 		t.Error("leader made no ACME request for a missing certificate")
 	}
 }
+
+// F9: a failed challenge is not an HTTP error. The CA answers 200 with an
+// authorization whose status is "invalid", autocert discards the resulting error
+// and retries silently, and the first sign is a cause-less "renewal is overdue"
+// warning about fifteen days later. An operator following CLAUDE.md greps for an
+// ACME error, finds none, and concludes renewal is healthy.
+func TestACMETransportLogsFailedValidation(t *testing.T) {
+	const authz = `{"status":"invalid","identifier":{"type":"dns","value":"mx.example.com"},` +
+		`"challenges":[{"type":"tls-alpn-01","status":"invalid","error":{` +
+		`"type":"urn:ietf:params:acme:error:connection",` +
+		`"detail":"203.0.113.4: Timeout during connect (likely firewall problem)"}}]}`
+
+	base := &countingTransport{resp: func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(authz)),
+		}, nil
+	}}
+
+	var logs bytes.Buffer
+	transport := &acmeTransport{base: base, logger: slog.New(slog.NewTextHandler(&logs, nil))}
+
+	req, _ := http.NewRequest(http.MethodPost, "https://acme.invalid/authz/1", nil)
+	resp, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip: %v", err)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != authz {
+		t.Errorf("body after logging = %q, want it intact for the ACME client", body)
+	}
+	for _, want := range []string{"level=WARN", "Timeout during connect"} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("log output missing %q:\n%s", want, logs.String())
+		}
+	}
+}
+
+// A certificate chain is not JSON and must not be read into memory looking for
+// a status, nor mistaken for one.
+func TestACMETransportIgnoresNonJSONSuccess(t *testing.T) {
+	base := &countingTransport{resp: func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/pem-certificate-chain"}},
+			Body:       io.NopCloser(strings.NewReader("-----BEGIN CERTIFICATE-----\ninvalid\n-----END CERTIFICATE-----\n")),
+		}, nil
+	}}
+
+	var logs bytes.Buffer
+	transport := &acmeTransport{base: base, logger: slog.New(slog.NewTextHandler(&logs, nil))}
+
+	req, _ := http.NewRequest(http.MethodPost, "https://acme.invalid/cert/1", nil)
+	if _, err := transport.RoundTrip(req); err != nil {
+		t.Fatalf("RoundTrip: %v", err)
+	}
+	if strings.Contains(logs.String(), "level=WARN") {
+		t.Errorf("a certificate download was logged as a failure:\n%s", logs.String())
+	}
+}
