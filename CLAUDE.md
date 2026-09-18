@@ -272,10 +272,18 @@ Key packages:
      empty bucket from putting its own key over the leader's.
    - **Known limitation: a replaced autocert instance leaks.** `stopRenew` is
      unexported and nothing reachable calls it, so a reload's renewal timers live
-     until the process ends. They cannot order (the transport is retired) and
-     settle into one cache read per certificate per renewal period, so the cost
-     is bounded by how often reload runs — which is why a steady state must never
-     reload (`TestMaintenanceDoesNotAccumulateAutocertInstances`).
+     until the process ends. Retiring stops them *ordering*, not waking: each
+     does a cache read (a real S3 GET) per certificate per renewal period.
+     The cost is therefore the number of instances ever built
+     (`Manager.instancesCreated`), which must stay bounded by operator actions:
+     a steady state never reloads
+     (`TestMaintenanceDoesNotAccumulateAutocertInstances`), and a reload that
+     cannot go ahead builds nothing (`TestFailedReloadCreatesNoInstance`) —
+     without that, `adoptNewerFromCache`'s hourly retry leaked one an hour
+     whenever one served certificate was newer in the cache and another was
+     unloadable. Removing the limitation itself needs either a fork of
+     `x/crypto/acme/autocert` exporting `stopRenew`, or serving from our own
+     cache-backed store and using autocert only to obtain certificates.
    - Recovery when issued certs were lost: autocert's renewal reuses the private
      key, so a discarded cert is rebuildable from the CT logs (crt.sh) plus the
      key in the old cache entry — [scripts/recover-cert.sh](scripts/recover-cert.sh).

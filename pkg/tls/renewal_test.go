@@ -741,3 +741,32 @@ func TestUnicodeDomainUsesTheSameCacheKeyAsAutocert(t *testing.T) {
 		t.Errorf("cachedLeaf could not find the certificate autocert would use: %v", err)
 	}
 }
+
+// A reload that cannot go ahead must not leave anything behind. autocert offers
+// no way to stop a manager's renewal timers, so every instance created is one
+// kept for the life of the process; building one before deciding whether to use
+// it means a reload that keeps failing leaks one per attempt. adoptNewerFromCache
+// retries every hour, so a cache the leader cannot fully supply - one entry gone
+// while another is newer - turns that into an unbounded leak.
+func TestFailedReloadCreatesNoInstance(t *testing.T) {
+	const domain = "mx.example.com"
+	cache := newMemCache()
+	seedCerts(t, cache, domain, time.Now().Add(80*24*time.Hour))
+
+	m := newTestManager(cache, &countingTransport{resp: refuseAll}, always(false), domain)
+	m.maintainCertificates()
+
+	// The certificate in service is no longer loadable from the cache.
+	cache.Delete(context.Background(), certCacheKey(domain, "rsa"))
+
+	created := m.instancesCreated.Load()
+	for i := 0; i < 24; i++ {
+		if err := m.reload("hourly retry"); err == nil {
+			t.Fatal("reload succeeded although a served certificate is unloadable")
+		}
+	}
+
+	if leaked := m.instancesCreated.Load() - created; leaked != 0 {
+		t.Errorf("24 failed reloads created %d autocert instances, each kept until the process ends", leaked)
+	}
+}

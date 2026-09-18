@@ -80,7 +80,11 @@ type Manager struct {
 	renewMu  sync.Mutex                       // one RenewCertificate at a time
 	reloadMu sync.Mutex                       // one reload at a time
 	stopOnce sync.Once                        // Stop is idempotent
-	served   sync.Map                         // cache key -> certRecord; see recordServed
+	// instancesCreated counts autocert managers built over this Manager's life.
+	// Every one of them is kept until the process ends (see autocertInstance),
+	// so this is the size of that leak.
+	instancesCreated atomic.Int64
+	served           sync.Map // cache key -> certRecord; see recordServed
 
 	// What every autocert instance is built from (see newAutocert).
 	cache          autocert.Cache

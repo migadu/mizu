@@ -77,6 +77,7 @@ func (i *autocertInstance) retire() { i.transport.retired.Store(true) }
 
 // newAutocert builds an autocert instance over the given cache.
 func (m *Manager) newAutocert(cache autocert.Cache) *autocertInstance {
+	m.instancesCreated.Add(1)
 	transport := &acmeTransport{base: m.acmeBase, isLeaderF: m.isLeaderF, logger: m.logger}
 	mgr := &autocert.Manager{
 		Prompt:      autocert.AcceptTOS,
@@ -111,10 +112,14 @@ func (m *Manager) reload(reason string) error {
 	defer m.reloadMu.Unlock()
 
 	old := m.current.Load()
-	next := m.newAutocert(m.cache)
 
 	// Everything in service has to be loadable from the cache before the swap,
 	// checked against the cache directly: asking autocert would order.
+	//
+	// Decided before the replacement is built. An instance cannot be disposed of
+	// — autocert gives no way to stop its renewal timers — so building one to
+	// find out whether it is wanted leaks one on every attempt, and this is
+	// reached hourly from adoptNewerFromCache.
 	verified := make([]certRecord, 0, len(m.domains)*len(certKeyTypes))
 	for _, rec := range m.servedRecords() {
 		if time.Now().After(rec.leaf.NotAfter) {
@@ -123,14 +128,13 @@ func (m *Manager) reload(reason string) error {
 
 		leaf, err := m.cachedLeaf(context.Background(), rec.domain, rec.keyType)
 		if err != nil {
-			next.retire()
 			return fmt.Errorf("cache entry for %s (%s) is not loadable, keeping the certificates in memory: %w",
 				rec.domain, rec.keyType, err)
 		}
 		verified = append(verified, certRecord{domain: rec.domain, keyType: rec.keyType, leaf: leaf})
 	}
 
-	m.current.Store(next)
+	m.current.Store(m.newAutocert(m.cache))
 	old.retire()
 
 	// What the new instance will load is known already, so the record and the
