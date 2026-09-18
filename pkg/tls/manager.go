@@ -64,14 +64,22 @@ const (
 
 	certMaintenanceInterval = time.Hour
 
+	// Used instead when a pass left a domain without a certificate: until the
+	// next one the node exports an expiry of 0 for it, and the gap usually
+	// clears in seconds (the leader issuing a newly configured domain, a node
+	// catching up after a restart).
+	certMaintenanceRetryInterval = 5 * time.Minute
+
 	// defaultRenewBefore mirrors autocert's cap on the renewal window.
 	defaultRenewBefore = 30 * 24 * time.Hour
 )
 
 // Manager orchestrates TLS certificate management using Let's Encrypt.
 type Manager struct {
-	current atomic.Pointer[autocertInstance] // replaced by reload
-	renewMu sync.Mutex                       // one RenewCertificate at a time
+	current  atomic.Pointer[autocertInstance] // replaced by reload
+	renewMu  sync.Mutex                       // one RenewCertificate at a time
+	reloadMu sync.Mutex                       // one reload at a time
+	served   sync.Map                         // cache key -> certRecord; see recordServed
 
 	// What every autocert instance is built from (see newAutocert).
 	cache          autocert.Cache
@@ -248,6 +256,10 @@ func NewManager(ctx context.Context, cfg *Config, logger *slog.Logger, isLeaderF
 				"domain", serverName,
 				"chain_length", len(cert.Certificate))
 		}
+		if !isALPNChallenge && cert.Leaf != nil {
+			m.recordServed(serverName, keyTypeOf(cert.Leaf), cert.Leaf)
+		}
+
 		logger.Debug("TLS: certificate provided successfully", "domain", serverName)
 		return cert, nil
 	}
@@ -305,8 +317,11 @@ func (m *Manager) startMaintenance() {
 		for {
 			select {
 			case <-timer.C:
-				m.maintainCertificates()
-				timer.Reset(certMaintenanceInterval)
+				next := certMaintenanceInterval
+				if !m.maintainCertificates() {
+					next = certMaintenanceRetryInterval
+				}
+				timer.Reset(next)
 			case <-m.stopCh:
 				return
 			}
@@ -325,9 +340,12 @@ func (m *Manager) startMaintenance() {
 // leader (a sibling node's own hostname) would otherwise never be issued or
 // renewed. On every other node the ACME transport refuses the order, leaving the
 // walk a read of the shared cache.
-func (m *Manager) maintainCertificates() {
+//
+// Reports whether every configured certificate is in service.
+func (m *Manager) maintainCertificates() bool {
 	inst := m.current.Load()
 	isLeader := m.isLeaderF == nil || m.isLeaderF()
+	complete := true
 
 	for _, domain := range m.domains {
 		for _, keyType := range certKeyTypes {
@@ -335,7 +353,8 @@ func (m *Manager) maintainCertificates() {
 			if err != nil {
 				// Report "nothing to serve" rather than leaving the last good
 				// value in place, where it would read as a healthy certificate.
-				m.observeCertificate(domain, keyType, nil)
+				m.forgetServed(domain, keyType)
+				complete = false
 				if isLeader {
 					m.logger.Error("TLS: certificate unavailable",
 						"domain", domain, "key_type", keyType, "error", err)
@@ -346,12 +365,64 @@ func (m *Manager) maintainCertificates() {
 				continue
 			}
 
-			m.observeCertificate(domain, keyType, leaf)
+			m.recordServed(domain, keyType, leaf)
 			m.logCertificateStatus(domain, keyType, leaf)
 		}
 	}
 
 	m.adoptNewerFromCache()
+	return complete
+}
+
+// certRecord is the certificate this node is currently handing out for one
+// domain and key type.
+type certRecord struct {
+	domain  string
+	keyType string
+	leaf    *x509.Certificate
+}
+
+// recordServed notes a certificate this node has just handed out or loaded, and
+// exports its expiry.
+//
+// This record is what reload and adoptNewerFromCache read to learn what is in
+// service. They must not ask autocert: its GetCertificate orders a certificate
+// when it does not have one, so on the leader a question becomes an ACME order.
+// Repeating the last observation is free, which keeps this cheap enough for the
+// handshake path — where it also keeps the exported expiry live between the
+// hourly maintenance passes.
+func (m *Manager) recordServed(domain, keyType string, leaf *x509.Certificate) {
+	key := certCacheKey(domain, keyType)
+	if prev, ok := m.served.Load(key); ok && prev.(certRecord).leaf == leaf {
+		return
+	}
+
+	m.served.Store(key, certRecord{domain: domain, keyType: keyType, leaf: leaf})
+	m.observeCertificate(domain, keyType, leaf)
+}
+
+// forgetServed records that this node has nothing to serve for a domain.
+func (m *Manager) forgetServed(domain, keyType string) {
+	m.served.Delete(certCacheKey(domain, keyType))
+	m.observeCertificate(domain, keyType, nil)
+}
+
+// servedRecords returns what this node is handing out, across all domains.
+func (m *Manager) servedRecords() []certRecord {
+	var records []certRecord
+	m.served.Range(func(_, value any) bool {
+		records = append(records, value.(certRecord))
+		return true
+	})
+	return records
+}
+
+// keyTypeOf names the certificate key type autocert files a leaf under.
+func keyTypeOf(leaf *x509.Certificate) string {
+	if leaf.PublicKeyAlgorithm == x509.RSA {
+		return "rsa"
+	}
+	return "ecdsa"
 }
 
 // SetMetrics attaches the metrics instance so certificate expiry is exported.

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"net/http"
@@ -82,25 +83,42 @@ func (m *Manager) newAutocert(cache autocert.Cache) *autocertInstance {
 // entry that has gone missing or bad would otherwise turn a working certificate
 // into a failed handshake; in that case the old instance stays.
 func (m *Manager) reload(reason string) error {
+	// Serialized: two reloads at once both read the same current instance, and
+	// the one that stores second replaces the other's without retiring it -
+	// leaving an autocert manager nothing points at, with its renewal timers
+	// armed and its ACME transport still live.
+	m.reloadMu.Lock()
+	defer m.reloadMu.Unlock()
+
 	old := m.current.Load()
 	next := m.newAutocert(m.cache)
 
-	for _, domain := range m.domains {
-		for _, keyType := range certKeyTypes {
-			hello := certHello(domain, keyType)
-			if _, err := old.mgr.GetCertificate(hello); err != nil {
-				continue
-			}
-			if _, err := next.mgr.GetCertificate(hello); err != nil {
-				next.retire()
-				return fmt.Errorf("cache entry for %s (%s) is not loadable, keeping the certificates in memory: %w",
-					domain, keyType, err)
-			}
+	// Everything in service has to be loadable from the cache before the swap,
+	// checked against the cache directly: asking autocert would order.
+	verified := make([]certRecord, 0, len(m.domains)*len(certKeyTypes))
+	for _, rec := range m.servedRecords() {
+		if time.Now().After(rec.leaf.NotAfter) {
+			continue
 		}
+
+		leaf, err := m.cachedLeaf(context.Background(), rec.domain, rec.keyType)
+		if err != nil {
+			next.retire()
+			return fmt.Errorf("cache entry for %s (%s) is not loadable, keeping the certificates in memory: %w",
+				rec.domain, rec.keyType, err)
+		}
+		verified = append(verified, certRecord{domain: rec.domain, keyType: rec.keyType, leaf: leaf})
 	}
 
 	m.current.Store(next)
 	old.retire()
+
+	// What the new instance will load is known already, so the record and the
+	// exported expiry follow the swap instead of waiting for the next pass.
+	for _, rec := range verified {
+		m.recordServed(rec.domain, rec.keyType, rec.leaf)
+	}
+
 	m.logger.Info("TLS: certificates reloaded from the cache", "reason", reason)
 	return nil
 }
@@ -212,17 +230,9 @@ func (m *Manager) cachedLeaf(ctx context.Context, domain, keyType string) (*x509
 		return nil, err
 	}
 
-	// An entry is the private key followed by the chain; X509KeyPair finds each
-	// in the same buffer and verifies that they match.
-	pair, err := tls.X509KeyPair(data, data)
+	leaf, err := parseCacheEntry(data)
 	if err != nil {
 		return nil, err
-	}
-	leaf := pair.Leaf
-	if leaf == nil {
-		if leaf, err = x509.ParseCertificate(pair.Certificate[0]); err != nil {
-			return nil, err
-		}
 	}
 
 	if isRSA := leaf.PublicKeyAlgorithm == x509.RSA; isRSA != (keyType == "rsa") {
@@ -237,6 +247,44 @@ func (m *Manager) cachedLeaf(ctx context.Context, domain, keyType string) (*x509
 	return leaf, nil
 }
 
+// parseCacheEntry returns the leaf of an autocert cache entry, accepting exactly
+// what autocert's own cacheGet accepts.
+//
+// The rules matter because this decides whether a reload may go ahead: an entry
+// accepted here but refused there swaps in an instance that cannot load the
+// certificate, and on the leader that turns into an order which overwrites the
+// entry. tls.X509KeyPair alone is laxer - it finds the key and the chain
+// anywhere in the buffer, so it accepts `cat fullchain.pem privkey.pem` and
+// tolerates trailing bytes, while autocert refuses both.
+func parseCacheEntry(data []byte) (*x509.Certificate, error) {
+	priv, pub := pem.Decode(data)
+	if priv == nil || !strings.Contains(priv.Type, "PRIVATE") {
+		return nil, errors.New("cache entry does not begin with a private key")
+	}
+
+	var chain [][]byte
+	for len(pub) > 0 {
+		var block *pem.Block
+		if block, pub = pem.Decode(pub); block == nil {
+			break
+		}
+		chain = append(chain, block.Bytes)
+	}
+	if len(pub) > 0 {
+		return nil, errors.New("cache entry has trailing data after the certificate chain")
+	}
+	if len(chain) == 0 {
+		return nil, errors.New("cache entry holds no certificate")
+	}
+
+	// Confirms the certificate belongs to the key in the same entry.
+	if _, err := tls.X509KeyPair(data, data); err != nil {
+		return nil, err
+	}
+
+	return x509.ParseCertificate(chain[0])
+}
+
 // adoptNewerFromCache reloads autocert when the cache holds a newer certificate
 // than the one being served and autocert is not going to notice by itself.
 //
@@ -247,29 +295,22 @@ func (m *Manager) cachedLeaf(ctx context.Context, domain, keyType string) (*x509
 // cache by hand. Without this, every other node would go on serving the old one
 // until its renewal time, up to two months away.
 func (m *Manager) adoptNewerFromCache() {
-	inst := m.current.Load()
-
-	for _, domain := range m.domains {
-		for _, keyType := range certKeyTypes {
-			served, err := inst.mgr.GetCertificate(certHello(domain, keyType))
-			if err != nil || served.Leaf == nil {
-				continue
-			}
-			// Inside the renewal window autocert is already polling the cache.
-			if time.Until(served.Leaf.NotAfter) <= m.renewBefore {
-				continue
-			}
-
-			cached, err := m.cachedLeaf(context.Background(), domain, keyType)
-			if err != nil || !cached.NotAfter.After(served.Leaf.NotAfter) {
-				continue
-			}
-
-			reason := fmt.Sprintf("cache holds a newer certificate for %s (%s)", domain, keyType)
-			if err := m.reload(reason); err != nil {
-				m.logger.Warn("TLS: newer certificate in the cache not adopted", "domain", domain, "key_type", keyType, "error", err)
-			}
-			return
+	for _, rec := range m.servedRecords() {
+		// Inside the renewal window autocert is already polling the cache.
+		if time.Until(rec.leaf.NotAfter) <= m.renewBefore {
+			continue
 		}
+
+		cached, err := m.cachedLeaf(context.Background(), rec.domain, rec.keyType)
+		if err != nil || !cached.NotAfter.After(rec.leaf.NotAfter) {
+			continue
+		}
+
+		reason := fmt.Sprintf("cache holds a newer certificate for %s (%s)", rec.domain, rec.keyType)
+		if err := m.reload(reason); err != nil {
+			m.logger.Warn("TLS: newer certificate in the cache not adopted",
+				"domain", rec.domain, "key_type", rec.keyType, "error", err)
+		}
+		return
 	}
 }

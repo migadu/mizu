@@ -42,14 +42,22 @@ func refuseAll(*http.Request) (*http.Response, error) {
 
 // memCache is an in-memory autocert.Cache that records the keys read from it.
 type memCache struct {
-	mu   sync.Mutex
-	data map[string][]byte
-	gets []string
+	mu        sync.Mutex
+	data      map[string][]byte
+	gets      []string
+	beforeGet func(key string) // test hook, called outside the lock
 }
 
 func newMemCache() *memCache { return &memCache{data: make(map[string][]byte)} }
 
 func (c *memCache) Get(_ context.Context, key string) ([]byte, error) {
+	c.mu.Lock()
+	hook := c.beforeGet
+	c.mu.Unlock()
+	if hook != nil {
+		hook(key)
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.gets = append(c.gets, key)

@@ -256,6 +256,7 @@ func TestAdoptNewerFromCache(t *testing.T) {
 	seedCerts(t, cache, domain, time.Now().Add(70*24*time.Hour))
 
 	m := newTestManager(cache, &countingTransport{resp: refuseAll}, always(false), domain)
+	m.maintainCertificates() // loads the certificates and records what is served
 	old := mustServedLeaf(t, m, domain, "ecdsa")
 
 	newer := cacheEntry(t, domain, false, time.Now().Add(89*24*time.Hour))
@@ -280,7 +281,7 @@ func TestAdoptNewerFromCacheLeavesRoutineRenewalsToAutocert(t *testing.T) {
 	seedCerts(t, cache, domain, time.Now().Add(10*24*time.Hour))
 
 	m := newTestManager(cache, &countingTransport{resp: refuseAll}, always(false), domain)
-	mustServedLeaf(t, m, domain, "ecdsa")
+	m.maintainCertificates()
 	instance := m.current.Load()
 
 	cache.Put(context.Background(), certCacheKey(domain, "ecdsa"),
@@ -300,6 +301,7 @@ func TestReloadKeepsMemoryWhenCacheEntryIsGone(t *testing.T) {
 	seedCerts(t, cache, domain, time.Now().Add(70*24*time.Hour))
 
 	m := newTestManager(cache, &countingTransport{resp: refuseAll}, always(false), domain)
+	m.maintainCertificates()
 	before := mustServedLeaf(t, m, domain, "rsa")
 	instance := m.current.Load()
 
@@ -329,5 +331,188 @@ func TestRetiredInstanceCannotOrder(t *testing.T) {
 	}
 	if n := base.calls.Load(); n != 0 {
 		t.Errorf("retired instance sent %d request(s) to the CA", n)
+	}
+}
+
+// F3: autocert's GetCertificate orders a certificate when it does not have one,
+// so using it to ask "what are we serving?" places real ACME orders. On the
+// leader that turned reload and the hourly adopt check into order loops for
+// every domain whose certificate was missing - inside the synchronous
+// renew-cert call, and against a rate limit that was already exhausted.
+func TestReloadAndAdoptNeverOrderCertificates(t *testing.T) {
+	const seeded, missing = "a.example.com", "b.example.com"
+
+	for _, tc := range []struct {
+		name string
+		run  func(*Manager)
+	}{
+		{"reload", func(m *Manager) {
+			if err := m.reload("test"); err != nil {
+				t.Errorf("reload: %v", err)
+			}
+		}},
+		{"adoptNewerFromCache", func(m *Manager) { m.adoptNewerFromCache() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cache := newMemCache()
+			seedCerts(t, cache, seeded, time.Now().Add(80*24*time.Hour))
+
+			ca := newFakeCA(t)
+			m := newTestManager(cache, ca, always(true), seeded, missing)
+
+			tc.run(m)
+
+			if n := ca.issued.Load(); n != 0 {
+				t.Errorf("%s placed %d ACME order(s); it must only read", tc.name, n)
+			}
+		})
+	}
+}
+
+// entryLeaf parses the leaf out of an autocert cache entry, expired or not.
+func entryLeaf(t *testing.T, data []byte) *x509.Certificate {
+	t.Helper()
+	for rest := data; len(rest) > 0; {
+		var block *pem.Block
+		if block, rest = pem.Decode(rest); block == nil {
+			break
+		}
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		leaf, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return leaf
+	}
+	t.Fatal("no certificate in entry")
+	return nil
+}
+
+// F2: autocert keeps handing out a certificate that has expired - it never
+// re-checks what is already in memory - but refuses to load one from the cache.
+// Counting such a certificate as "in service" made it block every reload, so in
+// exactly the state this PR addresses (some domains expired, the CA refusing
+// more) a successful renewal of another domain was never put into service and
+// was reported to the operator as a partial failure.
+func TestReloadIgnoresExpiredCertificateHeldInMemory(t *testing.T) {
+	const stuck, renewed = "stuck.example.com", "renewed.example.com"
+
+	cache := newMemCache()
+	seedCerts(t, cache, renewed, time.Now().Add(80*24*time.Hour))
+	expired := cacheEntry(t, stuck, false, time.Now().Add(-time.Hour))
+	cache.Put(context.Background(), certCacheKey(stuck, "ecdsa"), expired)
+
+	m := newTestManager(cache, &countingTransport{resp: refuseAll}, always(false), stuck, renewed)
+	m.maintainCertificates()
+	// This node loaded stuck.example.com before it expired and is still serving it.
+	m.recordServed(stuck, "ecdsa", entryLeaf(t, expired))
+
+	if err := m.reload("renewed " + renewed); err != nil {
+		t.Fatalf("reload refused over an unrelated expired certificate: %v", err)
+	}
+	if leaf := mustServedLeaf(t, m, renewed, "ecdsa"); leaf == nil {
+		t.Error("the renewed certificate is not in service")
+	}
+}
+
+// F6: reload swaps the instance and retires the one it replaced. Two running at
+// once both read the same current instance, so whichever stores second replaces
+// the other's instance without retiring it - leaving an autocert manager that
+// nothing points at, still holding every renewal timer and an ACME transport
+// that is not cut off. That is precisely the duplicate ordering the retire
+// mechanism exists to prevent. The window is real: the hourly maintenance pass
+// calls reload through adoptNewerFromCache while renew-cert is inside its own.
+func TestReloadIsSerialized(t *testing.T) {
+	const domain = "mx.example.com"
+	cache := newMemCache()
+	seedCerts(t, cache, domain, time.Now().Add(80*24*time.Hour))
+
+	m := newTestManager(cache, &countingTransport{resp: refuseAll}, always(false), domain)
+	m.maintainCertificates()
+
+	var inside atomic.Int32
+	var overlapped atomic.Bool
+	cache.mu.Lock()
+	cache.beforeGet = func(string) {
+		if inside.Add(1) > 1 {
+			overlapped.Store(true)
+		}
+		time.Sleep(20 * time.Millisecond)
+		inside.Add(-1)
+	}
+	cache.mu.Unlock()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := m.reload("concurrent"); err != nil {
+				t.Errorf("reload: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if overlapped.Load() {
+		t.Error("two reloads ran at once; one autocert instance was replaced without being retired")
+	}
+}
+
+// reorderEntry rewrites a cache entry with the certificate before the key, the
+// order `cat fullchain.pem privkey.pem` produces.
+func reorderEntry(t *testing.T, data []byte) []byte {
+	t.Helper()
+	var blocks []*pem.Block
+	for rest := data; len(rest) > 0; {
+		var b *pem.Block
+		if b, rest = pem.Decode(rest); b == nil {
+			break
+		}
+		blocks = append(blocks, b)
+	}
+	if len(blocks) < 2 {
+		t.Fatalf("entry has %d PEM blocks", len(blocks))
+	}
+
+	var out bytes.Buffer
+	for i := len(blocks) - 1; i >= 0; i-- {
+		if err := pem.Encode(&out, blocks[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return out.Bytes()
+}
+
+// F12: cachedLeaf decides whether a reload can go ahead and whether the cache
+// holds something newer, so it has to accept exactly what autocert accepts.
+// tls.X509KeyPair is laxer: autocert insists the private key is the first PEM
+// block and that nothing trails the last one. Accepting an entry autocert then
+// refuses makes the leader silently order a replacement and overwrite the entry
+// an operator placed by hand - spending the rate limit they were working around.
+func TestCachedLeafMatchesWhatAutocertAccepts(t *testing.T) {
+	const domain = "mx.example.com"
+	valid := cacheEntry(t, domain, false, time.Now().Add(80*24*time.Hour))
+
+	for name, entry := range map[string][]byte{
+		"certificate before key": reorderEntry(t, valid),
+		"trailing bytes":         append(append([]byte{}, valid...), '\n', '\n'),
+	} {
+		t.Run(name, func(t *testing.T) {
+			cache := newMemCache()
+			cache.Put(context.Background(), certCacheKey(domain, "ecdsa"), entry)
+			m := newTestManager(cache, &countingTransport{resp: refuseAll}, always(false), domain)
+
+			// Establish what autocert does with it, rather than assuming.
+			if _, err := m.current.Load().mgr.GetCertificate(certHello(domain, "ecdsa")); err == nil {
+				t.Skip("autocert accepts this entry after all; nothing to match")
+			}
+
+			if _, err := m.cachedLeaf(context.Background(), domain, "ecdsa"); err == nil {
+				t.Error("cachedLeaf accepted an entry autocert refuses to load")
+			}
+		})
 	}
 }

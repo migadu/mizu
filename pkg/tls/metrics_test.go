@@ -134,3 +134,56 @@ func TestMaintainCertificatesWithoutMetrics(t *testing.T) {
 	m := newTestManager(cache, &countingTransport{resp: refuseAll}, always(false), domain)
 	m.maintainCertificates()
 }
+
+// F13: the exported expiry claims to be "the certificate this node would serve".
+// Written only by the hourly pass, it kept the old value after a forced renewal,
+// so the alert in the README went on paging for an hour after the operator had
+// already fixed the certificate.
+func TestRenewCertificateRefreshesExportedExpiry(t *testing.T) {
+	const domain = "mx.example.com"
+	cache := newMemCache()
+	seedCerts(t, cache, domain, time.Now().Add(20*24*time.Hour))
+
+	mx := metrics.New("tlsexpiry_afterrenew")
+	m := newTestManager(cache, newFakeCA(t), always(true), domain)
+	m.SetMetrics(mx)
+	m.maintainCertificates()
+
+	before := expiryGauge(t, mx, domain, "ecdsa")
+
+	if _, err := m.RenewCertificate(domain); err != nil {
+		t.Fatalf("RenewCertificate: %v", err)
+	}
+
+	after := expiryGauge(t, mx, domain, "ecdsa")
+	if after == before {
+		t.Errorf("exported expiry still %v after a renewal; it no longer matches what the node serves", after)
+	}
+	if want := float64(mustServedLeaf(t, m, domain, "ecdsa").NotAfter.Unix()); after != want {
+		t.Errorf("exported expiry = %v, want the served certificate's %v", after, want)
+	}
+}
+
+// A pass that could not put every certificate into service must be retried
+// sooner than the hourly cadence: until it is, the node exports 0 for those
+// domains and the expiry alert fires on a state that usually clears in seconds
+// (the leader issuing a newly configured domain, a node still catching up after
+// a restart).
+func TestMaintainCertificatesReportsWhetherEverythingIsInService(t *testing.T) {
+	const domain = "mx.example.com"
+	cache := newMemCache()
+
+	m := newTestManager(cache, &countingTransport{resp: refuseAll}, always(false), domain)
+	if m.maintainCertificates() {
+		t.Error("reported everything in service with no certificate at all")
+	}
+
+	seedCerts(t, cache, domain, time.Now().Add(80*24*time.Hour))
+	// autocert remembers a failed order for a minute and answers from that state
+	// without consulting the cache, which is why the retry interval is longer
+	// than that. A fresh instance is what the node looks like once it lapses.
+	m.current.Store(m.newAutocert(m.cache))
+	if !m.maintainCertificates() {
+		t.Error("reported a gap although both certificates are in service")
+	}
+}
