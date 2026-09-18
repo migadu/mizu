@@ -136,14 +136,14 @@ func (ca *fakeCA) issue(req *http.Request) string {
 
 func always(v bool) func() bool { return func() bool { return v } }
 
-// servedLeaf returns the leaf the manager currently serves for a key type.
-func servedLeaf(t *testing.T, m *Manager, domain, keyType string) *x509.Certificate {
+// mustServedLeaf returns the leaf the manager currently serves for a key type.
+func mustServedLeaf(t *testing.T, m *Manager, domain, keyType string) *x509.Certificate {
 	t.Helper()
-	cert, err := m.current.Load().mgr.GetCertificate(certHello(domain, keyType))
+	leaf, err := servedLeaf(m.current.Load(), domain, keyType)
 	if err != nil {
-		t.Fatalf("GetCertificate(%s, %s): %v", domain, keyType, err)
+		t.Fatalf("servedLeaf(%s, %s): %v", domain, keyType, err)
 	}
-	return cert.Leaf
+	return leaf
 }
 
 // seedCerts stores a valid certificate of each key type and returns the entries.
@@ -171,7 +171,7 @@ func TestRenewCertificateOrdersAndServesNewCertificate(t *testing.T) {
 
 	before := map[string]*x509.Certificate{}
 	for _, keyType := range certKeyTypes {
-		before[keyType] = servedLeaf(t, m, domain, keyType)
+		before[keyType] = mustServedLeaf(t, m, domain, keyType)
 	}
 	oldInstance := m.current.Load()
 
@@ -184,7 +184,7 @@ func TestRenewCertificateOrdersAndServesNewCertificate(t *testing.T) {
 	}
 
 	for _, keyType := range certKeyTypes {
-		after := servedLeaf(t, m, domain, keyType)
+		after := mustServedLeaf(t, m, domain, keyType)
 		if bytes.Equal(after.Raw, before[keyType].Raw) {
 			t.Errorf("%s: still serving the old certificate", keyType)
 		}
@@ -212,7 +212,7 @@ func TestRenewCertificateFailedOrderChangesNothing(t *testing.T) {
 	entries := seedCerts(t, cache, domain, time.Now().Add(80*24*time.Hour))
 
 	m := newTestManager(cache, &countingTransport{resp: refuseAll}, always(true), domain)
-	before := servedLeaf(t, m, domain, "ecdsa")
+	before := mustServedLeaf(t, m, domain, "ecdsa")
 	instance := m.current.Load()
 
 	if _, err := m.RenewCertificate(domain); err == nil {
@@ -227,7 +227,7 @@ func TestRenewCertificateFailedOrderChangesNothing(t *testing.T) {
 	if m.current.Load() != instance {
 		t.Error("autocert was reloaded after a failed renewal")
 	}
-	if after := servedLeaf(t, m, domain, "ecdsa"); !bytes.Equal(after.Raw, before.Raw) {
+	if after := mustServedLeaf(t, m, domain, "ecdsa"); !bytes.Equal(after.Raw, before.Raw) {
 		t.Error("served certificate changed after a failed renewal")
 	}
 }
@@ -256,14 +256,14 @@ func TestAdoptNewerFromCache(t *testing.T) {
 	seedCerts(t, cache, domain, time.Now().Add(70*24*time.Hour))
 
 	m := newTestManager(cache, &countingTransport{resp: refuseAll}, always(false), domain)
-	old := servedLeaf(t, m, domain, "ecdsa")
+	old := mustServedLeaf(t, m, domain, "ecdsa")
 
 	newer := cacheEntry(t, domain, false, time.Now().Add(89*24*time.Hour))
 	cache.Put(context.Background(), certCacheKey(domain, "ecdsa"), newer)
 
 	m.adoptNewerFromCache()
 
-	got := servedLeaf(t, m, domain, "ecdsa")
+	got := mustServedLeaf(t, m, domain, "ecdsa")
 	if bytes.Equal(got.Raw, old.Raw) {
 		t.Fatal("still serving the old certificate")
 	}
@@ -280,7 +280,7 @@ func TestAdoptNewerFromCacheLeavesRoutineRenewalsToAutocert(t *testing.T) {
 	seedCerts(t, cache, domain, time.Now().Add(10*24*time.Hour))
 
 	m := newTestManager(cache, &countingTransport{resp: refuseAll}, always(false), domain)
-	servedLeaf(t, m, domain, "ecdsa")
+	mustServedLeaf(t, m, domain, "ecdsa")
 	instance := m.current.Load()
 
 	cache.Put(context.Background(), certCacheKey(domain, "ecdsa"),
@@ -300,7 +300,7 @@ func TestReloadKeepsMemoryWhenCacheEntryIsGone(t *testing.T) {
 	seedCerts(t, cache, domain, time.Now().Add(70*24*time.Hour))
 
 	m := newTestManager(cache, &countingTransport{resp: refuseAll}, always(false), domain)
-	before := servedLeaf(t, m, domain, "rsa")
+	before := mustServedLeaf(t, m, domain, "rsa")
 	instance := m.current.Load()
 
 	cache.Delete(context.Background(), certCacheKey(domain, "rsa"))
@@ -311,7 +311,7 @@ func TestReloadKeepsMemoryWhenCacheEntryIsGone(t *testing.T) {
 	if m.current.Load() != instance {
 		t.Error("instance was replaced")
 	}
-	if after := servedLeaf(t, m, domain, "rsa"); !bytes.Equal(after.Raw, before.Raw) {
+	if after := mustServedLeaf(t, m, domain, "rsa"); !bytes.Equal(after.Raw, before.Raw) {
 		t.Error("served certificate changed")
 	}
 }

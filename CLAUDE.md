@@ -180,6 +180,16 @@ Key packages:
      cert is *outside* its renewal window — inside it autocert polls the cache
      itself, and reloading there would replace the instance on every routine
      renewal.
+   - **`mizu_tls_cert_expiry_seconds{domain,key_type}`** is set from the same
+     maintenance walk, on *every* node (the ordering half is leader-only; the
+     walk is not). The value is the Unix expiry of the certificate that node
+     would actually hand out — no extra probing — or `0` when it has none.
+     Labelled by key type because the ECDSA and RSA certificates of one domain
+     expire at different times (nine days apart in production); `min by (domain)`
+     collapses them. An expired *cache* entry also reads as 0, since autocert
+     refuses to load one (`validCert`), while an expired certificate already in
+     autocert's memory reports its real past expiry — so never write the alert
+     as `expiry > 0 and expiry - time() < N`.
    - Recovery when issued certs were lost: autocert's renewal reuses the private
      key, so a discarded cert is rebuildable from the CT logs (crt.sh) plus the
      key in the old cache entry — [contrib/recover-cert.sh](contrib/recover-cert.sh).

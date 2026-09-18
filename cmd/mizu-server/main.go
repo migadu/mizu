@@ -154,6 +154,9 @@ func main() {
 
 		// Start ACME challenge servers (only for Let's Encrypt)
 		if tlsMgr != nil {
+			// Publishes mizu_tls_cert_expiry_seconds from the maintenance walk.
+			tlsMgr.SetMetrics(metricsInstance)
+
 			logger.Info("TLS manager initialized successfully - starting ACME challenge servers")
 			// Start HTTPS server on port 443 for TLS-ALPN-01 challenges (primary method).
 			// Without this, autocert still attempts tls-alpn-01 first and fails the

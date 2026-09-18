@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"migadu/mizu/pkg/concurrency"
+	"migadu/mizu/pkg/metrics"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/retry"
@@ -80,6 +81,7 @@ type Manager struct {
 	renewBeforeCfg time.Duration // autocert's RenewBefore; 0 = its default
 	acmeBase       http.RoundTripper
 
+	metrics       atomic.Pointer[metrics.Metrics] // nil until SetMetrics
 	logger        *slog.Logger
 	domains       []string
 	defaultDomain string
@@ -252,9 +254,10 @@ func NewManager(ctx context.Context, cfg *Config, logger *slog.Logger, isLeaderF
 
 	m.tlsConfig = baseTLSConfig
 
-	if leaderFunc != nil {
-		m.startMaintenance()
-	}
+	// Runs in single-instance mode too: there every node is its own leader, and
+	// certificates should be ready before the first message arrives rather than
+	// issued during a handshake.
+	m.startMaintenance()
 
 	logger.Info("TLS manager initialized",
 		"domains", cfg.LetsEncrypt.Domains,
@@ -291,6 +294,9 @@ func (m *Manager) HTTPHandler() http.Handler {
 
 // startMaintenance runs maintainCertificates shortly after startup and then
 // periodically, so a node that becomes leader later takes the duty over.
+//
+// Nothing runs before certMaintenanceDelay, so mizu_tls_cert_expiry_seconds
+// appears a couple of minutes after boot.
 func (m *Manager) startMaintenance() {
 	concurrency.SafeGo(m.logger, "tls-cert-maintenance", func() {
 		timer := time.NewTimer(certMaintenanceDelay)
@@ -308,48 +314,91 @@ func (m *Manager) startMaintenance() {
 	})
 }
 
-// maintainCertificates makes the cluster leader load — and order, if missing or
-// expired — the certificate of every configured domain, for both key types.
+// maintainCertificates walks every configured domain, for both key types, and
+// records what this node would actually serve — the expiry each node reports in
+// mizu_tls_cert_expiry_seconds is therefore the certificate a client would get
+// from it, not a fact about the cluster.
 //
-// autocert only manages names it has been asked for in a handshake, and a
-// renewal timer runs only on a node that has loaded the certificate. With ACME
-// restricted to the leader, a name whose traffic never reaches the leader (a
-// sibling node's own hostname) would otherwise never be issued or renewed.
-// Non-leaders skip that part: they take the leader's certificates from the
-// shared cache, on their next handshake or when their own renewal timer fires.
-// Every node then checks for a certificate that was replaced ahead of time.
+// On the leader the same walk issues and renews. autocert only manages names it
+// has been asked for in a handshake, and a renewal timer runs only on a node
+// that has loaded the certificate, so a name whose traffic never reaches the
+// leader (a sibling node's own hostname) would otherwise never be issued or
+// renewed. On every other node the ACME transport refuses the order, leaving the
+// walk a read of the shared cache.
 func (m *Manager) maintainCertificates() {
-	if m.isLeaderF == nil || m.isLeaderF() {
-		inst := m.current.Load()
-		for _, domain := range m.domains {
-			for _, keyType := range certKeyTypes {
-				cert, err := inst.mgr.GetCertificate(certHello(domain, keyType))
-				if err != nil {
+	inst := m.current.Load()
+	isLeader := m.isLeaderF == nil || m.isLeaderF()
+
+	for _, domain := range m.domains {
+		for _, keyType := range certKeyTypes {
+			leaf, err := servedLeaf(inst, domain, keyType)
+			if err != nil {
+				// Report "nothing to serve" rather than leaving the last good
+				// value in place, where it would read as a healthy certificate.
+				m.observeCertificate(domain, keyType, nil)
+				if isLeader {
 					m.logger.Error("TLS: certificate unavailable",
 						"domain", domain, "key_type", keyType, "error", err)
-					continue
+				} else {
+					m.logger.Warn("TLS: no usable certificate - waiting for the cluster leader to supply one",
+						"domain", domain, "key_type", keyType, "error", err)
 				}
-				m.logCertificateStatus(domain, keyType, cert)
+				continue
 			}
+
+			m.observeCertificate(domain, keyType, leaf)
+			m.logCertificateStatus(domain, keyType, leaf)
 		}
 	}
 
 	m.adoptNewerFromCache()
 }
 
+// SetMetrics attaches the metrics instance so certificate expiry is exported.
+// Optional: without it the manager simply records nothing.
+func (m *Manager) SetMetrics(mx *metrics.Metrics) {
+	if m == nil {
+		return
+	}
+	m.metrics.Store(mx)
+}
+
+// observeCertificate records when the certificate this node would serve for a
+// domain expires. A nil leaf means there is none, recorded as 0 — far enough in
+// the past that the usual "expires within N days" alert fires on it.
+func (m *Manager) observeCertificate(domain, keyType string, leaf *x509.Certificate) {
+	mx := m.metrics.Load()
+	if mx == nil || mx.TLSCertExpiry == nil {
+		return
+	}
+
+	var expiry float64
+	if leaf != nil {
+		expiry = float64(leaf.NotAfter.Unix())
+	}
+	mx.TLSCertExpiry.WithLabelValues(domain, keyType).Set(expiry)
+}
+
+// servedLeaf returns the leaf of the certificate inst would hand out for a
+// domain and key type.
+func servedLeaf(inst *autocertInstance, domain, keyType string) (*x509.Certificate, error) {
+	cert, err := inst.mgr.GetCertificate(certHello(domain, keyType))
+	if err != nil {
+		return nil, err
+	}
+	if cert.Leaf != nil {
+		return cert.Leaf, nil
+	}
+	if len(cert.Certificate) == 0 {
+		return nil, fmt.Errorf("certificate for %s (%s) carries no chain", domain, keyType)
+	}
+	return x509.ParseCertificate(cert.Certificate[0])
+}
+
 // logCertificateStatus reports a certificate that autocert should have renewed
 // by now. autocert retries failed renewals without logging, so this — together
 // with acmeTransport's error logging — is what makes a stuck renewal visible.
-func (m *Manager) logCertificateStatus(domain, keyType string, cert *tls.Certificate) {
-	leaf := cert.Leaf
-	if leaf == nil {
-		var err error
-		if leaf, err = x509.ParseCertificate(cert.Certificate[0]); err != nil {
-			m.logger.Warn("TLS: cannot parse certificate", "domain", domain, "key_type", keyType, "error", err)
-			return
-		}
-	}
-
+func (m *Manager) logCertificateStatus(domain, keyType string, leaf *x509.Certificate) {
 	remaining := time.Until(leaf.NotAfter)
 	switch {
 	case remaining <= 0:

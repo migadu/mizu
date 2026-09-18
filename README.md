@@ -219,6 +219,19 @@ mizu-admin -server http://localhost:8080 -config config.toml stats
 - `mizu_circuit_breaker_state`: Circuit breaker state
 - `mizu_rate_limit_exceeded`: Rate limit violations
 - `mizu_smtp_spf_checks`, `mizu_smtp_dkim_checks`, `mizu_smtp_dmarc_checks`, `mizu_smtp_arc_checks`: Validation results
+- `mizu_tls_cert_expiry_seconds{domain,key_type}`: Unix timestamp at which the
+  certificate **this node would serve** expires; `0` means it has none. Each node
+  reports what it would actually hand out, so a node left behind on a stale
+  certificate is visible on its own series. Alert on the remaining lifetime:
+
+  ```promql
+  # Any node, any domain, less than a week left (0 included: it is far in the past)
+  min by (instance, domain, key_type) (mizu_tls_cert_expiry_seconds) - time() < 7 * 86400
+  ```
+
+  Do not guard the expression with `> 0`: a node with no usable certificate
+  reports exactly 0, which is the case most worth paging on. Values first appear
+  about two minutes after start, when the first maintenance pass runs.
 
 ## 🔧 Admin CLI
 

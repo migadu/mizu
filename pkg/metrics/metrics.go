@@ -51,6 +51,9 @@ type Metrics struct {
 	StatsEventsProcessed    prometheus.Counter
 	StatsEventsDropped      prometheus.Counter
 
+	// TLS certificate metrics
+	TLSCertExpiry *prometheus.GaugeVec // Labels: domain, key_type
+
 	// Cluster metrics
 	ClusterMembers        prometheus.Gauge
 	ClusterLeader         *prometheus.GaugeVec
@@ -285,6 +288,14 @@ func New(namespace string) *Metrics {
 			Name:      "events_dropped_total",
 			Help:      "Total number of stats events dropped due to full channel",
 		}),
+
+		// TLS certificate metrics
+		TLSCertExpiry: promauto.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Subsystem: "tls",
+			Name:      "cert_expiry_seconds",
+			Help:      "Unix timestamp at which the certificate this node would serve for a domain expires; 0 means no usable certificate. Subtract time() for the remaining lifetime.",
+		}, []string{"domain", "key_type"}),
 
 		// Cluster metrics
 		ClusterMembers: promauto.NewGauge(prometheus.GaugeOpts{
