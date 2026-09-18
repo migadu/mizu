@@ -412,7 +412,13 @@ func main() {
 		statsManager.Stop()
 	}
 
-	// Phase 4: Stop metrics server
+	// Phase 4: Stop TLS maintenance and the certificate sync worker
+	if tlsMgr != nil {
+		logger.Info("Stopping TLS certificate manager...")
+		tlsMgr.Stop()
+	}
+
+	// Phase 5: Stop metrics server
 	if metricsServer != nil {
 		logger.Info("Stopping metrics server...")
 		if err := metricsServer.Shutdown(context.Background()); err != nil {
@@ -420,7 +426,7 @@ func main() {
 		}
 	}
 
-	// Phase 5: Stop health server
+	// Phase 6: Stop health server
 	if healthServer != nil {
 		logger.Info("Stopping health server...")
 		healthServer.Stop(context.Background())

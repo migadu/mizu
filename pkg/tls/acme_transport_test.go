@@ -51,7 +51,13 @@ type memCache struct {
 
 func newMemCache() *memCache { return &memCache{data: make(map[string][]byte)} }
 
-func (c *memCache) Get(_ context.Context, key string) ([]byte, error) {
+func (c *memCache) Get(ctx context.Context, key string) ([]byte, error) {
+	// A real cache reaches the network and honours the context; the S3-backed one
+	// does, so this one must too or it hides context bugs.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	c.mu.Lock()
 	hook := c.beforeGet
 	c.mu.Unlock()

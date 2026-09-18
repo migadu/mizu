@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"golang.org/x/crypto/acme/autocert"
 )
@@ -58,9 +59,20 @@ func (c *ClusterAwareCache) Get(ctx context.Context, name string) ([]byte, error
 
 func (c *ClusterAwareCache) Put(ctx context.Context, name string, data []byte) error {
 	if isLeader := c.isLeaderF(); !isLeader {
-		// Ordering is gated upstream, so this is a certificate obtained while
-		// this node was still leader. Storing it is what keeps it from being
-		// paid for and thrown away.
+		// Only a certificate may be stored by a non-leader. Ordering is gated at
+		// the transport, so a certificate in hand was obtained while this node
+		// was still leader, and refusing it would throw away an issuance the CA
+		// has already charged for.
+		//
+		// The account key and challenge responses are not like that. autocert
+		// generates the account key and writes it *before* it registers, so this
+		// is the only thing standing between a node coming up against an empty
+		// bucket and its own key landing on top of the leader's - leaving the
+		// cluster with two ACME accounts once the leader restarts.
+		if !isCertificateKey(name) {
+			c.logger.Warn("cluster cache: refusing to store shared ACME state - not cluster leader", "name", name)
+			return fmt.Errorf("%w: refused to store %s", ErrNotLeader, name)
+		}
 		c.logger.Warn("cluster cache: storing a certificate obtained before this node stopped being leader", "name", name)
 	}
 
@@ -72,6 +84,12 @@ func (c *ClusterAwareCache) Put(ctx context.Context, name string, data []byte) e
 
 	c.logger.Info("cluster cache: certificate stored", "name", name)
 	return nil
+}
+
+// isCertificateKey reports whether a cache key holds an issued certificate,
+// as opposed to the ACME account key or a challenge response.
+func isCertificateKey(key string) bool {
+	return !isChallengeKey(key) && !strings.HasPrefix(key, "acme_account")
 }
 
 func (c *ClusterAwareCache) Delete(ctx context.Context, name string) error {

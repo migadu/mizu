@@ -79,6 +79,7 @@ type Manager struct {
 	current  atomic.Pointer[autocertInstance] // replaced by reload
 	renewMu  sync.Mutex                       // one RenewCertificate at a time
 	reloadMu sync.Mutex                       // one reload at a time
+	stopOnce sync.Once                        // Stop is idempotent
 	served   sync.Map                         // cache key -> certRecord; see recordServed
 
 	// What every autocert instance is built from (see newAutocert).
@@ -349,7 +350,7 @@ func (m *Manager) maintainCertificates() bool {
 
 	for _, domain := range m.domains {
 		for _, keyType := range certKeyTypes {
-			leaf, err := servedLeaf(inst, domain, keyType)
+			leaf, err := m.currentLeaf(inst, isLeader, domain, keyType)
 			if err != nil {
 				// Report "nothing to serve" rather than leaving the last good
 				// value in place, where it would read as a healthy certificate.
@@ -450,6 +451,22 @@ func (m *Manager) observeCertificate(domain, keyType string, leaf *x509.Certific
 	mx.TLSCertExpiry.WithLabelValues(domain, keyType).Set(expiry)
 }
 
+// currentLeaf returns the certificate this node would serve for a domain.
+//
+// Only the leader asks autocert, whose GetCertificate orders what it does not
+// have — which is the point of the walk there. Elsewhere that order is refused,
+// and the refusal is not free: autocert keeps the failed attempt for a minute
+// and answers every handshake for that name from it without reading the cache,
+// so a certificate the leader publishes in the meantime is ignored and the next
+// pass poisons it again. It also costs an RSA keygen per domain per pass. A
+// non-leader has nothing to order, so it reads the cache instead.
+func (m *Manager) currentLeaf(inst *autocertInstance, isLeader bool, domain, keyType string) (*x509.Certificate, error) {
+	if isLeader {
+		return servedLeaf(inst, domain, keyType)
+	}
+	return m.cachedLeaf(context.Background(), domain, keyType)
+}
+
 // servedLeaf returns the leaf of the certificate inst would hand out for a
 // domain and key type.
 func servedLeaf(inst *autocertInstance, domain, keyType string) (*x509.Certificate, error) {
@@ -492,12 +509,14 @@ func (m *Manager) Stop() {
 		return
 	}
 
-	close(m.stopCh)
+	m.stopOnce.Do(func() {
+		close(m.stopCh)
 
-	if m.syncWorker != nil {
-		m.logger.Info("stopping certificate sync worker")
-		m.syncWorker.Stop(10 * time.Second)
-	}
+		if m.syncWorker != nil {
+			m.logger.Info("stopping certificate sync worker")
+			m.syncWorker.Stop(10 * time.Second)
+		}
+	})
 }
 
 func createS3Cache(ctx context.Context, cfg LetsEncryptConfig, logger *slog.Logger) (*S3Cache, error) {

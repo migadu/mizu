@@ -15,16 +15,28 @@ import (
 
 	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/acme/autocert"
+	"golang.org/x/net/idna"
 )
 
 // certKeyTypes are the key types autocert keeps a separate certificate for.
 var certKeyTypes = []string{"ecdsa", "rsa"}
 
+// asciiDomain returns the form autocert files a name under. autocert runs
+// idna.Lookup.ToASCII before it builds a cache key, so a Unicode domain is
+// stored as punycode; reading it back under the Unicode spelling finds nothing.
+func asciiDomain(domain string) string {
+	name := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(domain)), ".")
+	if ascii, err := idna.Lookup.ToASCII(name); err == nil {
+		return ascii
+	}
+	return name
+}
+
 // certHello builds the ClientHello that makes autocert select the certificate of
 // the given key type: it picks by what the client can verify, and treats a hello
 // offering no ECDSA cipher suite as RSA-only.
 func certHello(domain, keyType string) *tls.ClientHelloInfo {
-	hello := &tls.ClientHelloInfo{ServerName: strings.ToLower(domain)}
+	hello := &tls.ClientHelloInfo{ServerName: asciiDomain(domain)}
 	if keyType == "ecdsa" {
 		hello.CipherSuites = []uint16{tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256}
 	}
@@ -34,9 +46,9 @@ func certHello(domain, keyType string) *tls.ClientHelloInfo {
 // certCacheKey returns the key autocert stores the certificate under.
 func certCacheKey(domain, keyType string) string {
 	if keyType == "rsa" {
-		return strings.ToLower(domain) + "+rsa"
+		return asciiDomain(domain) + "+rsa"
 	}
-	return strings.ToLower(domain)
+	return asciiDomain(domain)
 }
 
 // autocertInstance is one autocert.Manager together with the transport that can
@@ -166,7 +178,7 @@ func (m *Manager) RenewCertificate(ctx context.Context, domain string, keyTypes 
 		return nil, fmt.Errorf("certificate renewal must be performed on the cluster leader node")
 	}
 
-	domain = strings.ToLower(strings.TrimSpace(domain))
+	domain = asciiDomain(domain)
 	if domain == "" {
 		return nil, fmt.Errorf("domain is required")
 	}
@@ -207,7 +219,12 @@ func (m *Manager) RenewCertificate(ctx context.Context, domain string, keyTypes 
 		if err == nil {
 			// autocert ignores a failed cache write on this path. A certificate
 			// that did not reach the cache is lost at the reload below.
-			err = m.verifyCached(ctx, domain, keyType, cert)
+			//
+			// Checked with a context the caller cannot cancel: the order was
+			// allowed to finish precisely so the issuance would not be wasted,
+			// and validating the result against a dead context would throw away
+			// exactly what was being protected.
+			err = m.verifyCached(context.WithoutCancel(ctx), domain, keyType, cert)
 		}
 		if err != nil {
 			m.logger.Error("TLS: certificate renewal failed", "domain", domain, "key_type", keyType, "error", err)
@@ -238,12 +255,18 @@ func resolveKeyTypes(requested []string) ([]string, error) {
 		return certKeyTypes, nil
 	}
 
+	resolved := make([]string, 0, len(requested))
 	for _, keyType := range requested {
 		if !slices.Contains(certKeyTypes, keyType) {
 			return nil, fmt.Errorf("unknown key type %q, want one of %v", keyType, certKeyTypes)
 		}
+		// Asking twice would place two orders for the same certificate, which is
+		// the spend this argument exists to avoid.
+		if !slices.Contains(resolved, keyType) {
+			resolved = append(resolved, keyType)
+		}
 	}
-	return requested, nil
+	return resolved, nil
 }
 
 // verifyCached checks that the newly issued certificate reached the cache, since
@@ -288,7 +311,7 @@ func (m *Manager) cachedLeaf(ctx context.Context, domain, keyType string) (*x509
 	if isRSA := leaf.PublicKeyAlgorithm == x509.RSA; isRSA != (keyType == "rsa") {
 		return nil, fmt.Errorf("cache entry holds a %s certificate", leaf.PublicKeyAlgorithm)
 	}
-	if err := leaf.VerifyHostname(strings.ToLower(domain)); err != nil {
+	if err := leaf.VerifyHostname(asciiDomain(domain)); err != nil {
 		return nil, err
 	}
 	if now := time.Now(); now.Before(leaf.NotBefore) || now.After(leaf.NotAfter) {
@@ -312,18 +335,26 @@ func parseCacheEntry(data []byte) (*x509.Certificate, error) {
 		return nil, errors.New("cache entry does not begin with a private key")
 	}
 
-	var chain [][]byte
+	var chain []byte
 	for len(pub) > 0 {
 		var block *pem.Block
 		if block, pub = pem.Decode(pub); block == nil {
 			break
 		}
-		chain = append(chain, block.Bytes)
+		chain = append(chain, block.Bytes...)
 	}
 	if len(pub) > 0 {
 		return nil, errors.New("cache entry has trailing data after the certificate chain")
 	}
-	if len(chain) == 0 {
+
+	// The whole chain, not just the leaf: autocert's validCert parses every
+	// certificate in the entry and rejects it if any one of them is corrupt, so
+	// judging the entry by its leaf alone would pass something autocert refuses.
+	certs, err := x509.ParseCertificates(chain)
+	if err != nil {
+		return nil, err
+	}
+	if len(certs) == 0 {
 		return nil, errors.New("cache entry holds no certificate")
 	}
 
@@ -332,7 +363,7 @@ func parseCacheEntry(data []byte) (*x509.Certificate, error) {
 		return nil, err
 	}
 
-	return x509.ParseCertificate(chain[0])
+	return certs[0], nil
 }
 
 // adoptNewerFromCache reloads autocert when the cache holds a newer certificate

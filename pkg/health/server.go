@@ -756,10 +756,7 @@ func (s *Server) renewCertHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	domain := r.URL.Query().Get("domain")
-	var keyTypes []string
-	if keyType := r.URL.Query().Get("key_type"); keyType != "" {
-		keyTypes = append(keyTypes, keyType)
-	}
+	keyType := r.URL.Query().Get("key_type")
 
 	if domain == "" {
 		// Try reading from JSON body
@@ -770,10 +767,17 @@ func (s *Server) renewCertHandler(w http.ResponseWriter, r *http.Request) {
 		if r.Body != nil {
 			json.NewDecoder(io.LimitReader(r.Body, 1024)).Decode(&body)
 			domain = body.Domain
-			if body.KeyType != "" {
-				keyTypes = append(keyTypes, body.KeyType)
+			// The query wins: taking both would ask for the same key type twice,
+			// and each ask is an order against the duplicate-certificate limit.
+			if keyType == "" {
+				keyType = body.KeyType
 			}
 		}
+	}
+
+	var keyTypes []string
+	if keyType != "" {
+		keyTypes = append(keyTypes, keyType)
 	}
 	if domain == "" {
 		w.Header().Set("Content-Type", "application/json")
@@ -788,8 +792,16 @@ func (s *Server) renewCertHandler(w http.ResponseWriter, r *http.Request) {
 	// The renewal runs to completion before answering, so the caller gets the
 	// CA's verdict (a rate limit, a failed validation) instead of a promise. That
 	// outlasts the server's WriteTimeout, which exists for slow clients.
-	if err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(renewCertTimeout)); err != nil {
+	// Both deadlines: the write one so the answer can still be delivered, and the
+	// read one because the server's ReadTimeout otherwise bounds the whole
+	// request once anything reads from the connection — which would cancel
+	// r.Context() mid-order and abandon a certificate the CA has already issued.
+	controller := http.NewResponseController(w)
+	if err := controller.SetWriteDeadline(time.Now().Add(renewCertTimeout)); err != nil {
 		s.logger.Warn("Cannot extend write deadline for certificate renewal", "error", err)
+	}
+	if err := controller.SetReadDeadline(time.Now().Add(renewCertTimeout)); err != nil {
+		s.logger.Warn("Cannot extend read deadline for certificate renewal", "error", err)
 	}
 
 	s.logger.Info("Certificate renewal requested", "domain", domain, "key_types", keyTypes)

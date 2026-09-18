@@ -189,3 +189,13 @@ func TestMaintainCertificatesReportsWhetherEverythingIsInService(t *testing.T) {
 		t.Error("reported a gap although both certificates are in service")
 	}
 }
+
+// Finding 10: Stop closes a channel, so a second call panics. Every other Stop
+// in this codebase is idempotent, and a deferred Stop next to an explicit one in
+// the shutdown path is exactly how that happens.
+func TestManagerStopIsIdempotent(t *testing.T) {
+	m := newTestManager(newMemCache(), &countingTransport{resp: refuseAll}, always(false), "mx.example.com")
+
+	m.Stop()
+	m.Stop() // must not panic
+}

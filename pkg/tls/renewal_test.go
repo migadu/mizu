@@ -621,3 +621,123 @@ func TestMaintenanceDoesNotAccumulateAutocertInstances(t *testing.T) {
 		t.Error("a day of maintenance passes replaced the autocert instance; every reload leaks one")
 	}
 }
+
+// An order that finishes after the caller has gone must still be put into
+// service. Validating it with the caller's dead context turned a certificate the
+// CA had issued and charged for into a reported failure, with no reload: the
+// node kept serving the old certificate and the operator was told it had failed.
+func TestRenewCertificateKeepsACertificateIssuedAfterTheCallerLeft(t *testing.T) {
+	const domain = "mx.example.com"
+	cache := newMemCache()
+	seedCerts(t, cache, domain, time.Now().Add(80*24*time.Hour))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ca := newFakeCA(t)
+	ca.afterIssue = cancel // the caller hangs up as the CA answers
+
+	m := newTestManager(cache, ca, always(true), domain)
+	m.maintainCertificates()
+	before := mustServedLeaf(t, m, domain, "ecdsa")
+
+	renewed, _ := m.RenewCertificate(ctx, domain)
+
+	if len(renewed) == 0 {
+		t.Error("the certificate the CA issued was not reported as renewed")
+	}
+	if after := mustServedLeaf(t, m, domain, "ecdsa"); bytes.Equal(after.Raw, before.Raw) {
+		t.Error("the issued certificate was never put into service")
+	}
+}
+
+// Finding 7: on a node that is not the leader, GetCertificate cannot order, and
+// the failed attempt leaves autocert holding a poisoned state for that name for
+// a minute. Every handshake in that window fails without the cache being read at
+// all - so a certificate the leader publishes seconds later is ignored, and the
+// 5-minute pass poisons it again. It also burns an RSA keygen per domain.
+func TestMaintainCertificatesOnNonLeaderLeavesAutocertUnpoisoned(t *testing.T) {
+	const domain = "mx.example.com"
+	cache := newMemCache()
+
+	base := &countingTransport{resp: refuseAll}
+	m := newTestManager(cache, base, always(false), domain)
+
+	m.maintainCertificates() // nothing to serve yet
+
+	// The leader publishes the certificate a moment later.
+	seedCerts(t, cache, domain, time.Now().Add(80*24*time.Hour))
+
+	if _, err := m.current.Load().mgr.GetCertificate(certHello(domain, "ecdsa")); err != nil {
+		t.Errorf("handshake still failing after the leader published the certificate: %v", err)
+	}
+	if !m.maintainCertificates() {
+		t.Error("the next pass did not pick up the published certificate")
+	}
+}
+
+// Finding 9: the whole point of naming a key type is not to spend a slot on one
+// that was already issued, so asking for the same one twice must not place two
+// orders. The handler can produce that: it reads key_type from the query and
+// then also from the body.
+func TestResolveKeyTypesDeduplicates(t *testing.T) {
+	got, err := resolveKeyTypes([]string{"rsa", "rsa"})
+	if err != nil {
+		t.Fatalf("resolveKeyTypes: %v", err)
+	}
+	if len(got) != 1 || got[0] != "rsa" {
+		t.Errorf("resolveKeyTypes = %v, want [rsa]", got)
+	}
+}
+
+// Finding 11: autocert parses the whole chain and rejects the entry if any
+// certificate in it is corrupt, so accepting one on the strength of its leaf
+// alone re-creates the mismatch parseCacheEntry exists to prevent: reload swaps
+// in an instance that cannot load it, and the leader re-orders over it.
+func TestParseCacheEntryRejectsACorruptIntermediate(t *testing.T) {
+	const domain = "mx.example.com"
+	valid := cacheEntry(t, domain, false, time.Now().Add(80*24*time.Hour))
+
+	corrupt := append([]byte{}, valid...)
+	corrupt = append(corrupt, pem.EncodeToMemory(&pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: []byte("not a certificate"),
+	})...)
+
+	cache := newMemCache()
+	cache.Put(context.Background(), certCacheKey(domain, "ecdsa"), corrupt)
+	m := newTestManager(cache, &countingTransport{resp: refuseAll}, always(false), domain)
+
+	if _, err := m.current.Load().mgr.GetCertificate(certHello(domain, "ecdsa")); err == nil {
+		t.Skip("autocert accepts this entry after all; nothing to match")
+	}
+	if _, err := m.cachedLeaf(context.Background(), domain, "ecdsa"); err == nil {
+		t.Error("cachedLeaf accepted an entry autocert refuses to load")
+	}
+}
+
+// Finding 12: autocert converts a name to its IDNA form before it builds a cache
+// key, so a Unicode domain is stored as punycode. Reading it back under the
+// Unicode spelling finds nothing: reload refuses every swap, adopt never adopts,
+// the orderer's hidingCache hides nothing, and the metric is filed under a label
+// that never matches.
+func TestUnicodeDomainUsesTheSameCacheKeyAsAutocert(t *testing.T) {
+	const unicode = "wysyłka.example.com"
+	const punycode = "xn--wysyka-6db.example.com" // what idna.Lookup.ToASCII gives, as autocert uses
+
+	if got := certCacheKey(unicode, "ecdsa"); got != punycode {
+		t.Errorf("certCacheKey(%q) = %q, want the punycode %q", unicode, got, punycode)
+	}
+	if got := certHello(unicode, "ecdsa").ServerName; got != punycode {
+		t.Errorf("certHello(%q) asks for %q, want %q", unicode, got, punycode)
+	}
+
+	// Stored the way autocert stores it, it must be found.
+	cache := newMemCache()
+	cache.Put(context.Background(), punycode, cacheEntry(t, punycode, false, time.Now().Add(80*24*time.Hour)))
+
+	m := newTestManager(cache, &countingTransport{resp: refuseAll}, always(false), unicode)
+	if _, err := m.cachedLeaf(context.Background(), unicode, "ecdsa"); err != nil {
+		t.Errorf("cachedLeaf could not find the certificate autocert would use: %v", err)
+	}
+}

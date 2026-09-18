@@ -19,10 +19,11 @@ import (
 
 // fakeS3 is an in-memory S3API whose availability can be toggled.
 type fakeS3 struct {
-	mu      sync.Mutex
-	objects map[string][]byte
-	down    bool
-	delay   time.Duration // how long a read takes before answering
+	mu       sync.Mutex
+	objects  map[string][]byte
+	down     bool
+	delay    time.Duration // how long a read takes before answering
+	putDelay time.Duration // how long a write takes before completing
 }
 
 func newFakeS3() *fakeS3 { return &fakeS3{objects: make(map[string][]byte)} }
@@ -68,7 +69,18 @@ func (f *fakeS3) GetObject(ctx context.Context, in *s3.GetObjectInput, _ ...func
 	return &s3.GetObjectOutput{Body: io.NopCloser(bytes.NewReader(data))}, nil
 }
 
-func (f *fakeS3) PutObject(_ context.Context, in *s3.PutObjectInput, _ ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
+func (f *fakeS3) PutObject(ctx context.Context, in *s3.PutObjectInput, _ ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
+	f.mu.Lock()
+	delay := f.putDelay
+	f.mu.Unlock()
+	if delay > 0 {
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.down {
@@ -467,4 +479,99 @@ func TestFallbackCacheSlowS3StillWaitedForWithoutLocalCopy(t *testing.T) {
 	if string(data) != "from-s3" {
 		t.Errorf("Get = %q, want the S3 copy", data)
 	}
+}
+
+// A pending marker can outlive the certificate it refers to - an operator
+// clearing the cache dir, a partial restore, a local write that failed after the
+// marker was written. Answering from the local copy without checking that there
+// is one turns that into ErrCacheMiss, which is the one answer that makes
+// autocert order a duplicate of a certificate S3 is holding perfectly well.
+func TestFallbackCacheStalePendingMarkerFallsBackToS3(t *testing.T) {
+	cache, s3fake, _ := newTestFallbackCache(t)
+	ctx := context.Background()
+	s3fake.objects["certs/mx.example.com"] = []byte("in-s3")
+
+	cache.setPending("mx.example.com", true) // marker with no local file
+
+	got, err := cache.Get(ctx, "mx.example.com")
+	if err == autocert.ErrCacheMiss {
+		t.Fatal("a stale pending marker reported a cache miss; autocert will order a duplicate")
+	}
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if string(got) != "in-s3" {
+		t.Errorf("Get = %q, want the copy S3 holds", got)
+	}
+	if cache.isPending("mx.example.com") {
+		t.Error("the stale marker was left in place")
+	}
+}
+
+// Put attempts S3 for a challenge response even with the breaker open, because
+// refusing one fails the validation outright. A read has to match: the node the
+// CA connects to for TLS-ALPN-01 can only answer from S3, and challenge keys are
+// never written locally, so an open breaker would fail every validation.
+func TestFallbackCacheChallengeGetIgnoresOpenBreaker(t *testing.T) {
+	cache, s3fake, _ := newTestFallbackCache(t)
+	cache.checkInterval = time.Minute
+	ctx := context.Background()
+	s3fake.objects["certs/mx.example.com+token"] = []byte("token")
+
+	s3fake.setDown(true)
+	if _, err := cache.Get(ctx, "mx.example.com"); err == nil {
+		t.Fatal("setup: expected the first Get to trip the breaker")
+	}
+	s3fake.setDown(false)
+
+	got, err := cache.Get(ctx, "mx.example.com+token")
+	if err != nil {
+		t.Fatalf("challenge Get refused while the breaker was open: %v", err)
+	}
+	if string(got) != "token" {
+		t.Errorf("Get = %q, want the token from S3", got)
+	}
+}
+
+// autocert holds one global mutex across Cache.Get, so anything a read waits for
+// is something every handshake on the node waits for. The five-minute sync walks
+// every pending key doing S3 round trips; if it holds a lock the read path also
+// takes, a degraded bucket stalls handshakes for as long as the sync runs.
+func TestFallbackCacheGetDoesNotWaitForAPendingSync(t *testing.T) {
+	cache, s3fake, dir := newTestFallbackCache(t)
+	ctx := context.Background()
+
+	// One key left over from an outage, so the sync has work to do.
+	s3fake.setDown(true)
+	if err := cache.Put(ctx, "pending.example.com", []byte("pending")); err != nil {
+		t.Fatalf("Put during outage: %v", err)
+	}
+	s3fake.setDown(false)
+
+	// An unrelated certificate this node can serve locally.
+	writeLocal(t, dir, "mx.example.com", "local")
+	s3fake.objects["certs/mx.example.com"] = []byte("local")
+
+	// Reads stay quick; it is the sync's write that takes its time.
+	s3fake.mu.Lock()
+	s3fake.putDelay = 5 * time.Second
+	s3fake.mu.Unlock()
+
+	synced := make(chan struct{})
+	go func() {
+		defer close(synced)
+		cache.SyncPendingToS3(ctx)
+	}()
+	time.Sleep(200 * time.Millisecond) // let the sync get going
+
+	start := time.Now()
+	if _, err := cache.Get(ctx, "mx.example.com"); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	elapsed := time.Since(start)
+
+	if elapsed > 2*time.Second {
+		t.Errorf("Get waited %v behind the pending sync; every handshake waits with it", elapsed)
+	}
+	<-synced
 }

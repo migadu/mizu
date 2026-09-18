@@ -54,11 +54,17 @@ func (f *fakeRenewer) RenewCertificate(ctx context.Context, _ string, keyTypes .
 
 func renewCertServer(t *testing.T, renewer CertRenewer, writeTimeout time.Duration) *httptest.Server {
 	t.Helper()
+	return renewCertServerWithTimeouts(t, renewer, writeTimeout, time.Minute)
+}
+
+func renewCertServerWithTimeouts(t *testing.T, renewer CertRenewer, writeTimeout, readTimeout time.Duration) *httptest.Server {
+	t.Helper()
 	s := NewServer("127.0.0.1:0", slog.New(slog.NewTextHandler(io.Discard, nil)))
 	s.SetCertRenewer(renewer)
 
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(s.renewCertHandler))
 	srv.Config.WriteTimeout = writeTimeout
+	srv.Config.ReadTimeout = readTimeout
 	srv.Start()
 	t.Cleanup(srv.Close)
 	return srv
@@ -167,5 +173,51 @@ func TestRenewCertHandlerStopsWhenTheClientHangsUp(t *testing.T) {
 	}
 	if !renewer.gaveUp() {
 		t.Error("the renewal carried on after the client hung up")
+	}
+}
+
+// Finding 2: the health server sets ReadTimeout, which net/http applies to the
+// whole request. For a POST with no body - the documented query-string form -
+// it starts a background read that trips at the deadline and cancels the
+// request context. The renewal would then abandon itself part-way and report a
+// certificate the CA had already issued as a failure. Extending the write
+// deadline alone is not enough.
+func TestRenewCertHandlerOutlastsReadTimeout(t *testing.T) {
+	renewer := &fakeRenewer{delay: 900 * time.Millisecond, renewed: []string{"mx.example.com (ecdsa)"}}
+	srv := renewCertServerWithTimeouts(t, renewer, time.Minute, 250*time.Millisecond)
+
+	resp, err := http.Post(srv.URL+"/api/renew-cert?domain=mx.example.com", "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var body map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body["status"] != "success" {
+		t.Errorf("status = %v, want success (the read deadline cut the renewal short)", body)
+	}
+	if renewer.gaveUp() {
+		t.Error("the renewal was cancelled by the server's own read timeout")
+	}
+}
+
+// Finding 9: key_type is read from the query and then from the body. Taking both
+// asks for the same key type twice, which is two orders for one certificate.
+func TestRenewCertHandlerDoesNotDoubleUpKeyType(t *testing.T) {
+	renewer := &fakeRenewer{renewed: []string{"mx.example.com (rsa)"}}
+	srv := renewCertServer(t, renewer, time.Minute)
+
+	resp, err := http.Post(srv.URL+"?key_type=rsa", "application/json",
+		strings.NewReader(`{"domain":"mx.example.com","key_type":"rsa"}`))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	resp.Body.Close()
+
+	if asked := renewer.askedFor(); len(asked) != 1 {
+		t.Errorf("renewer asked for %v, want one key type", asked)
 	}
 }

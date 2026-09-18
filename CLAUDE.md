@@ -162,6 +162,9 @@ Key packages:
      exists and orders one, so an outage would have the leader re-order
      everything sitting in the bucket (and generate a fresh ACME account key).
      That path returns `ErrStorageUnavailable`, after trying the local copy.
+     Challenge responses are the exception in both directions: they live only in
+     S3, so a Get and a Put for one ignore the breaker entirely — refusing either
+     fails the validation outright and spends the CA's hourly allowance.
      A cert *absent* from S3 but held locally is served and re-seeded into S3:
      otherwise an entry lost from the bucket (`tls delete`, a lifecycle rule, a
      changed prefix) takes every restarted node down for that domain for up to
@@ -169,7 +172,12 @@ Key packages:
    - **A local copy written during an outage is the only copy of that key pair.**
      Markers under `<cache_dir>/.pending` record it, so a restart cannot put S3's
      older copy back over it; a marker that outlived its certificate cannot
-     overwrite a newer one in S3 (`supersededInS3`).
+     overwrite a newer one in S3 (`supersededInS3`), and one whose certificate is
+     gone falls through to S3 rather than reporting a miss.
+     **No lock is ever held across an S3 call.** autocert holds one global mutex
+     across `Cache.Get`, so anything a read waits for, every handshake waits for;
+     the pending sync round-trips outside the lock and uses `localSeq` to tell
+     whether the copy it uploaded is still current.
    - **Read timeouts are sized by what waiting can win**: 1s when a servable
      local copy is in hand, 5s when there is nothing to serve. autocert holds one
      global mutex across `Cache.Get`, so a slow read stalls every handshake.
@@ -194,6 +202,12 @@ Key packages:
      first makes the new instance load everything the old one serves, and keeps
      the old one if the cache cannot supply it. It is serialized (`reloadMu`):
      two at once orphan an instance that is never retired, timers still armed.
+   - **Only the leader goes through autocert to load a certificate**
+     (`currentLeaf`). Elsewhere `GetCertificate` cannot order, and the refusal
+     is not free: autocert keeps the failed attempt for a minute and answers
+     every handshake for that name from it *without reading the cache*, so a
+     certificate the leader publishes meanwhile is ignored — and it costs an RSA
+     keygen per domain per pass. A non-leader reads the cache instead.
    - **Never ask autocert what it is serving.** `GetCertificate` *orders* when it
      has nothing, so on the leader a question becomes an ACME order. `reload` and
      `adoptNewerFromCache` read `Manager.served` (recorded by the handshake path
@@ -201,7 +215,12 @@ Key packages:
      which accepts exactly what autocert's `cacheGet` accepts — key first,
      nothing trailing the chain. `tls.X509KeyPair` is laxer and would pass a
      hand-placed `cat fullchain.pem privkey.pem` entry that autocert then
-     refuses, making the leader re-order and overwrite it.
+     refuses, making the leader re-order and overwrite it. It parses the *whole*
+     chain, as autocert's `validCert` does — a corrupt intermediate is enough.
+   - **Cache keys are punycode** (`asciiDomain`). autocert runs
+     `idna.Lookup.ToASCII` before building a cache key, so a Unicode domain in
+     `letsencrypt.domains` is filed as `xn--…`; reading it back under the Unicode
+     spelling finds nothing and every swap, adoption and metric label misses.
    - **An expired certificate is not "in service" for reload's purposes.**
      autocert never re-checks what it already holds, so it goes on serving an
      expired certificate while refusing to load one from the cache; counting it
@@ -219,7 +238,11 @@ Key packages:
      `context.Context` (the handler passes `r.Context()`), so an operator who
      gives up does not leave the remaining key types being ordered behind them;
      an order already in flight is allowed to finish, since abandoning one after
-     issuance wastes it.
+     issuance wastes it — and its result is verified with `context.WithoutCancel`,
+     because validating it against the dead context would throw away exactly what
+     finishing the order was protecting. The handler extends the **read** deadline
+     as well as the write one: `ReadTimeout` otherwise bounds the whole request
+     once anything reads from the connection.
      `mizu-admin tls delete` is **not** a way to force renewal — the local copy
      re-seeds S3. Use `renew-cert`.
    - **Certs replaced early reach other nodes via `adoptNewerFromCache`**
@@ -242,6 +265,11 @@ Key packages:
      handshake path and by `reload`, so the gauge follows a forced renewal
      instead of lagging an hour; a pass that leaves anything missing repeats in
      5 min rather than 60.
+   - `ClusterAwareCache.Put` lets a non-leader store a **certificate** (it was
+     entitled to order it; see the transport's grace above) but never the ACME
+     account key or a challenge response — autocert writes the account key
+     *before* it registers, so this is all that stops a node coming up against an
+     empty bucket from putting its own key over the leader's.
    - **Known limitation: a replaced autocert instance leaks.** `stopRenew` is
      unexported and nothing reachable calls it, so a reload's renewal timers live
      until the process ends. They cannot order (the transport is retired) and

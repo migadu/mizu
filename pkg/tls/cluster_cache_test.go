@@ -43,3 +43,24 @@ func TestClusterAwareCacheStillGatesDelete(t *testing.T) {
 		t.Error("the certificate was deleted anyway")
 	}
 }
+
+// Letting a non-leader store certificates must not let it store the cluster's
+// ACME account key. autocert generates that key and writes it *before* it
+// registers, so the write is not gated by the transport: a node coming up
+// against an empty bucket would put its own key over the leader's, and the
+// cluster would end up with two ACME accounts the next time the leader
+// restarted. Challenge responses are the leader's too - a non-leader cannot
+// legitimately be answering a challenge it did not start.
+func TestClusterAwareCacheKeepsSharedStateWithTheLeader(t *testing.T) {
+	for _, key := range []string{"acme_account+key", "acme_account.key", "mx.example.com+token", "abc123+http-01"} {
+		underlying := newMemCache()
+		cache := NewClusterAwareCache(underlying, func() bool { return false }, discardLogger())
+
+		if err := cache.Put(context.Background(), key, []byte("mine")); err == nil {
+			t.Errorf("%s: a non-leader was allowed to overwrite shared state", key)
+		}
+		if _, err := underlying.Get(context.Background(), key); err == nil {
+			t.Errorf("%s: shared state was overwritten anyway", key)
+		}
+	}
+}
