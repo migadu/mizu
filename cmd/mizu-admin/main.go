@@ -1064,8 +1064,10 @@ func handleTLSDelete(ctx context.Context) {
 	}
 
 	fmt.Printf("Deleting certificate for domain: %s\n", domain)
-	fmt.Println("Warning: This will remove the certificate from storage.")
-	fmt.Println("The server will automatically request a new certificate on next use.")
+	fmt.Println("Warning: This removes the certificate from shared storage only.")
+	fmt.Println("Running servers keep serving it from memory, and a node that still")
+	fmt.Println("holds a local copy will put it back. To replace a certificate, use:")
+	fmt.Printf("  mizu-admin renew-cert %s\n", domain)
 	fmt.Println()
 
 	// Compute keys for both ECDSA and RSA variants at the cert storage prefix.
