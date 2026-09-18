@@ -1,6 +1,7 @@
 package tls
 
 import (
+	"bytes"
 	"context"
 	"crypto/x509"
 	"encoding/pem"
@@ -309,6 +310,15 @@ func (f *FallbackCache) localSeedingS3(ctx context.Context, key string) ([]byte,
 		return nil, autocert.ErrCacheMiss
 	}
 
+	// Only a certificate that is still usable. Restoring an expired one would
+	// undo a deliberate purge — of something expired, or of a key that had to be
+	// destroyed — and every peer holding a copy would put it back.
+	if expiry, err := entryNotAfter(data); err == nil && !time.Now().Before(expiry) {
+		f.logger.Warn("FallbackCache: local copy has expired and S3 has none - not restoring it",
+			"name", key, "expired_at", expiry)
+		return nil, autocert.ErrCacheMiss
+	}
+
 	f.logger.Warn("FallbackCache: certificate missing from S3 - serving the local copy and restoring it",
 		"name", key)
 	f.setPending(key, true)
@@ -329,6 +339,13 @@ func (f *FallbackCache) writeThrough(ctx context.Context, key string, data []byt
 	if _, pending := f.pending[key]; pending {
 		return
 	}
+
+	// Nothing to do when the bytes already match: a maintenance pass reads every
+	// certificate, and rewriting each file every hour is churn for no change.
+	if current, err := f.fallback.Get(ctx, key); err == nil && bytes.Equal(current, data) {
+		return
+	}
+
 	f.writeLocalLocked(ctx, key, data)
 }
 

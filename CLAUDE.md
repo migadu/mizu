@@ -79,6 +79,13 @@ Key packages:
 2. **Distributed Coordination** ([pkg/cluster/](pkg/cluster/))
    - Uses **hashicorp/memberlist** for P2P gossip protocol
    - Supports leader election for TLS certificate management
+   - **Leadership needs a majority once the cluster has been seen** (`canLead`).
+     Confirmation used to be a one-way latch, so a node that had seen the cluster
+     went on electing itself after losing sight of it — a partition gave both
+     sides a leader, and both order certificates. A node that has seen a peer now
+     needs `quorum()` visible members; below that it stands down and `GetLeader()`
+     is `""`. The minority keeps serving what it holds — only issuing and renewing
+     stop, and those have weeks of slack.
    - **A node elects nobody until its membership is confirmed**
      (`membershipConfirmed`, [pkg/cluster/memberlist.go](pkg/cluster/memberlist.go)).
      The leader is the smallest node name, and a node that has not reached its
@@ -165,7 +172,9 @@ Key packages:
      Challenge responses are the exception in both directions: they live only in
      S3, so a Get and a Put for one ignore the breaker entirely — refusing either
      fails the validation outright and spends the CA's hourly allowance.
-     A cert *absent* from S3 but held locally is served and re-seeded into S3:
+     A cert *absent* from S3 but held locally is served and re-seeded into S3 —
+     but only while it is still valid, so a purge of an expired or compromised
+     entry is not undone by every peer that still holds a copy:
      otherwise an entry lost from the bucket (`tls delete`, a lifecycle rule, a
      changed prefix) takes every restarted node down for that domain for up to
      60 days, since the leader serves from memory and never learns to re-issue.

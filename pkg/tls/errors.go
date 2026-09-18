@@ -28,6 +28,12 @@ var (
 	// on certificates that are sitting in the bucket.
 	ErrStorageUnavailable = errors.New("tls: certificate storage unavailable")
 
+	// ErrNotInService reports that a certificate was issued and stored but could
+	// not be put into service on this node. The certificate is safe — every other
+	// node will pick it up from the shared cache — so it must not be confused
+	// with a key type that failed to issue.
+	ErrNotInService = errors.New("tls: renewed and stored, but not in service on this node")
+
 	// errInstanceRetired is returned for any ACME request from an autocert
 	// instance that has been replaced (see autocertInstance).
 	errInstanceRetired = errors.New("tls: autocert instance retired")

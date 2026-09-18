@@ -350,3 +350,52 @@ func TestLeaderElection_RejoinsAfterMissedJoin(t *testing.T) {
 		t.Errorf("node-a is not leader")
 	}
 }
+
+// Confirmation was a one-way latch, so a node that had once seen the cluster
+// went on electing itself after losing sight of it. A partition therefore gave
+// both sides a leader, and with leadership the only thing standing between a
+// node and Let's Encrypt, both sides order - which is the rate-limit exhaustion
+// this whole change exists to prevent.
+func TestLeaderElection_IsolatedNodeStandsDown(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	c1, err := NewCluster(Config{
+		NodeName: "node-a", BindAddr: "127.0.0.1", BindPort: 17970,
+		Peers: []string{"127.0.0.1:17971"}, Logger: logger,
+		LeaderGracePeriod: time.Hour, RejoinInterval: 200 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("Failed to create cluster 1: %v", err)
+	}
+	defer c1.Shutdown()
+
+	c2, err := NewCluster(Config{
+		NodeName: "node-b", BindAddr: "127.0.0.1", BindPort: 17971,
+		Peers: []string{"127.0.0.1:17970"}, Logger: logger,
+		LeaderGracePeriod: time.Hour, RejoinInterval: 200 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("Failed to create cluster 2: %v", err)
+	}
+	defer c2.Shutdown()
+
+	if !waitFor(5*time.Second, func() bool { return c2.NumMembers() == 2 && c1.IsLeader() }) {
+		t.Fatalf("setup: cluster did not form (c1.leader=%q members=%d)", c1.GetLeader(), c1.NumMembers())
+	}
+
+	// node-a disappears. node-b is left alone with a peer it cannot reach.
+	c1.Shutdown()
+
+	if !waitFor(10*time.Second, func() bool { return c2.NumMembers() == 1 }) {
+		t.Fatalf("setup: node-b still sees %d members", c2.NumMembers())
+	}
+
+	// It must not appoint itself: from here it cannot tell a dead peer from a
+	// partition, and the other side may still be serving with a leader.
+	if c2.IsLeader() {
+		t.Error("the isolated node elected itself; a partition would give the cluster two leaders")
+	}
+	if leader := c2.GetLeader(); leader != "" {
+		t.Errorf("GetLeader = %q, want no leader while the cluster cannot be seen", leader)
+	}
+}

@@ -397,6 +397,10 @@ type certRecord struct {
 // handshake path — where it also keeps the exported expiry live between the
 // hourly maintenance passes.
 func (m *Manager) recordServed(domain, keyType string, leaf *x509.Certificate) {
+	// One spelling throughout: the handshake path sees the SNI, which is
+	// punycode, while the configured domain may be Unicode. Recording both would
+	// give one certificate two records and two metric series.
+	domain = asciiDomain(domain)
 	key := certCacheKey(domain, keyType)
 	if prev, ok := m.served.Load(key); ok && prev.(certRecord).leaf == leaf {
 		return
@@ -408,6 +412,7 @@ func (m *Manager) recordServed(domain, keyType string, leaf *x509.Certificate) {
 
 // forgetServed records that this node has nothing to serve for a domain.
 func (m *Manager) forgetServed(domain, keyType string) {
+	domain = asciiDomain(domain)
 	m.served.Delete(certCacheKey(domain, keyType))
 	m.observeCertificate(domain, keyType, nil)
 }

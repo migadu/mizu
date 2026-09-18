@@ -64,6 +64,13 @@ echo "current cert:    expires $old_end"
 
 # Newest-first list of unexpired CT entries for the domain.
 get "https://crt.sh/?q=$domain&output=json&exclude=expired" "$tmp/ct.json"
+# Under load crt.sh answers 200 with an HTML error page. Parsing that yields no
+# ids and would be reported as "this domain has no certificates", which is a
+# very different thing to tell someone mid-incident.
+case $(head -c 1 "$tmp/ct.json") in
+	'[' | '{') ;;
+	*) echo "crt.sh did not return JSON (it is probably overloaded) - try again shortly" >&2; exit 1 ;;
+esac
 ids=$(tr ',{' '\n\n' <"$tmp/ct.json" | sed -n 's/^ *"id": *\([0-9][0-9]*\).*/\1/p' | sort -rn | uniq)
 [ -n "$ids" ] || { echo "no unexpired CT entries for $domain" >&2; exit 1; }
 
@@ -109,7 +116,10 @@ else
 	while [ $intermediates -lt 4 ]; do
 		url=$(openssl x509 -in "$cur" -noout -text | sed -n 's/.*CA Issuers - URI:\(.*\)/\1/p' | head -1)
 		[ -n "$url" ] || break
-		get "$url" "$tmp/i$intermediates.der"
+		if ! get "$url" "$tmp/i$intermediates.der"; then
+			echo "warning: could not fetch the intermediate at $url" >&2
+			break
+		fi
 		openssl x509 -inform DER -in "$tmp/i$intermediates.der" -out "$tmp/i$intermediates.pem" 2>/dev/null || cp "$tmp/i$intermediates.der" "$tmp/i$intermediates.pem"
 		# Stop before a self-signed root; servers do not send those.
 		[ "$(openssl x509 -in "$tmp/i$intermediates.pem" -noout -subject_hash)" != "$(openssl x509 -in "$tmp/i$intermediates.pem" -noout -issuer_hash)" ] || break

@@ -770,3 +770,31 @@ func TestFailedReloadCreatesNoInstance(t *testing.T) {
 		t.Errorf("24 failed reloads created %d autocert instances, each kept until the process ends", leaked)
 	}
 }
+
+// autocert.HostWhitelist converts each configured host with idna.Lookup.ToASCII
+// and stores only that form, so a Unicode domain in the config is admitted under
+// the punycode a client actually sends in SNI. asciiDomain must therefore agree
+// with it on every path that consults the policy.
+func TestUnicodeDomainPassesTheHostPolicy(t *testing.T) {
+	const unicode = "wysyłka.example.com"
+	const punycode = "xn--wysyka-6db.example.com"
+
+	m := newTestManager(newMemCache(), &countingTransport{resp: refuseAll}, always(true), unicode)
+
+	for _, name := range []string{unicode, punycode} {
+		if err := m.hostPolicy(context.Background(), asciiDomain(name)); err != nil {
+			t.Errorf("host policy rejected %q as %q: %v", name, asciiDomain(name), err)
+		}
+	}
+
+	// The handshake path passes the SNI straight through, which is punycode.
+	if err := m.hostPolicy(context.Background(), punycode); err != nil {
+		t.Errorf("host policy rejected the SNI a client would send: %v", err)
+	}
+
+	// And a renewal asked for by its Unicode name reaches the same policy.
+	if _, err := m.RenewCertificate(context.Background(), unicode, "ecdsa"); err != nil &&
+		strings.Contains(err.Error(), "not in allowed list") {
+		t.Errorf("RenewCertificate rejected a configured Unicode domain: %v", err)
+	}
+}

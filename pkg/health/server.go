@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"migadu/mizu/pkg/concurrency"
 	"migadu/mizu/pkg/logging"
+	tlsmgr "migadu/mizu/pkg/tls"
 	"net"
 	"net/http"
 	"time"
@@ -809,11 +810,19 @@ func (s *Server) renewCertHandler(w http.ResponseWriter, r *http.Request) {
 	// operator's Ctrl-C looks like from here.
 	renewed, err := s.certRenewer.RenewCertificate(r.Context(), domain, keyTypes...)
 	if err != nil && len(renewed) > 0 {
-		s.logger.Error("Certificate renewal partially failed", "domain", domain, "renewed", renewed, "error", err)
+		// Everything asked for was issued and stored, but this node could not
+		// load it. That is not the same as a key type failing to issue, and an
+		// operator told the wrong one would retry and spend the CA's budget.
+		status := "partial"
+		if errors.Is(err, tlsmgr.ErrNotInService) {
+			status = "stored"
+		}
+
+		s.logger.Error("Certificate renewal incomplete", "domain", domain, "status", status, "renewed", renewed, "error", err)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]any{
-			"status":  "partial",
+			"status":  status,
 			"error":   err.Error(),
 			"renewed": renewed,
 		})

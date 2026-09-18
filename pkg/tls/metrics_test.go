@@ -199,3 +199,53 @@ func TestManagerStopIsIdempotent(t *testing.T) {
 	m.Stop()
 	m.Stop() // must not panic
 }
+
+// Finding 9: the handshake path records the SNI, which is punycode, while the
+// maintenance walk records the configured spelling. A Unicode domain therefore
+// produced two series for one certificate, and an alert on either saw half the
+// truth.
+func TestExportedExpiryUsesOneLabelPerCertificate(t *testing.T) {
+	const unicode = "wysyłka.example.com"
+	punycode := asciiDomain(unicode)
+
+	cache := newMemCache()
+	cache.Put(context.Background(), certCacheKey(unicode, "ecdsa"),
+		cacheEntry(t, punycode, false, time.Now().Add(80*24*time.Hour)))
+
+	mx := metrics.New("tlsexpiry_idna")
+	m := newTestManager(cache, &countingTransport{resp: refuseAll}, always(false), unicode)
+	m.SetMetrics(mx)
+	m.maintainCertificates()
+
+	if got := expiryGauge(t, mx, punycode, "ecdsa"); got == 0 {
+		t.Errorf("no expiry exported under %q, the label the handshake path uses", punycode)
+	}
+	if got := expiryGauge(t, mx, unicode, "ecdsa"); got != 0 {
+		t.Errorf("a second series exists under the Unicode spelling %q", unicode)
+	}
+}
+
+// Finding 6: a certificate renewed for a domain this node was not yet serving -
+// a newly configured one, or any renewal in the first two minutes after boot -
+// was never recorded, so it stayed invisible to the metric and to the check that
+// carries early replacements to the other nodes.
+func TestRenewCertificateRecordsADomainNotYetServed(t *testing.T) {
+	const domain = "new.example.com"
+	cache := newMemCache()
+
+	mx := metrics.New("tlsexpiry_newdomain")
+	m := newTestManager(cache, newFakeCA(t), always(true), domain)
+	m.SetMetrics(mx)
+
+	// Nothing served yet: no maintenance pass has run.
+	if _, err := m.RenewCertificate(context.Background(), domain); err != nil {
+		t.Fatalf("RenewCertificate: %v", err)
+	}
+
+	if got := expiryGauge(t, mx, domain, "ecdsa"); got == 0 {
+		t.Error("the newly issued certificate is not exported")
+	}
+	if len(m.servedRecords()) == 0 {
+		t.Error("the newly issued certificate was not recorded as served")
+	}
+}

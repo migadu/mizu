@@ -575,3 +575,57 @@ func TestFallbackCacheGetDoesNotWaitForAPendingSync(t *testing.T) {
 	}
 	<-synced
 }
+
+// Re-seeding S3 from a local copy must not resurrect a certificate that is no
+// longer usable. An operator who purged an expired - or compromised - entry from
+// the bucket would otherwise have every peer put it straight back.
+func TestFallbackCacheDoesNotReseedAnExpiredCertificate(t *testing.T) {
+	cache, s3fake, dir := newTestFallbackCache(t)
+
+	expired := cacheEntry(t, "mx.example.com", false, time.Now().Add(-time.Hour))
+	if err := os.WriteFile(filepath.Join(dir, "mx.example.com"), expired, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := cache.Get(context.Background(), "mx.example.com"); err != autocert.ErrCacheMiss {
+		t.Errorf("Get error = %v, want ErrCacheMiss for an expired local copy", err)
+	}
+	if cache.NeedsSync() {
+		t.Error("an expired certificate was queued for upload to S3")
+	}
+	if err := cache.SyncPendingToS3(context.Background()); err != nil {
+		t.Fatalf("SyncPendingToS3: %v", err)
+	}
+	if _, ok := s3fake.object("certs/mx.example.com"); ok {
+		t.Error("the expired certificate was restored into S3")
+	}
+}
+
+// The local copy is rewritten on every S3 read, so a maintenance pass rewrites
+// every certificate file on the node each hour for no change at all.
+func TestFallbackCacheWriteThroughSkipsIdenticalBytes(t *testing.T) {
+	cache, s3fake, _ := newTestFallbackCache(t)
+	ctx := context.Background()
+	s3fake.objects["certs/mx.example.com"] = []byte("same-bytes")
+
+	if _, err := cache.Get(ctx, "mx.example.com"); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	cache.mu.Lock()
+	afterFirst := cache.localSeq["mx.example.com"]
+	cache.mu.Unlock()
+
+	for i := 0; i < 3; i++ {
+		if _, err := cache.Get(ctx, "mx.example.com"); err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+	}
+
+	cache.mu.Lock()
+	afterRest := cache.localSeq["mx.example.com"]
+	cache.mu.Unlock()
+
+	if afterRest != afterFirst {
+		t.Errorf("the local copy was rewritten %d more times for identical bytes", afterRest-afterFirst)
+	}
+}

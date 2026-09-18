@@ -797,6 +797,14 @@ func renewCertResult(body []byte, err error) ([]string, int) {
 		}
 		return append(lines, "  "+result.Error), 1
 
+	case "stored":
+		lines = append(lines, "⚠ Certificate issued and stored, but not in service on that node")
+		for _, renewed := range result.Renewed {
+			lines = append(lines, "  "+renewed)
+		}
+		lines = append(lines, "  "+result.Error)
+		return append(lines, "  The certificate is safe - do not re-run this, it would spend another issuance."), 1
+
 	default:
 		return []string{
 			"✗ Certificate renewal failed - the current certificate is unchanged",

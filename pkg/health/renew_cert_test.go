@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -11,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	tlsmgr "migadu/mizu/pkg/tls"
 	"time"
 )
 
@@ -219,5 +222,26 @@ func TestRenewCertHandlerDoesNotDoubleUpKeyType(t *testing.T) {
 
 	if asked := renewer.askedFor(); len(asked) != 1 {
 		t.Errorf("renewer asked for %v, want one key type", asked)
+	}
+}
+
+// A renewal where everything asked for was issued and stored, but this node
+// could not load it, is not "some key types only". An operator told that would
+// retry and spend another issuance for nothing.
+func TestRenewCertHandlerSeparatesStoredFromPartial(t *testing.T) {
+	stored := &fakeRenewer{
+		renewed: []string{"mx.example.com (ecdsa)", "mx.example.com (rsa)"},
+		err:     fmt.Errorf("%w: cache entry for other.example.com is not loadable", tlsmgr.ErrNotInService),
+	}
+	if _, body := postRenew(t, renewCertServer(t, stored, time.Minute).URL); body["status"] != "stored" {
+		t.Errorf("status = %v, want stored", body["status"])
+	}
+
+	partial := &fakeRenewer{
+		renewed: []string{"mx.example.com (ecdsa)"},
+		err:     errors.New("rsa: rate limited"),
+	}
+	if _, body := postRenew(t, renewCertServer(t, partial, time.Minute).URL); body["status"] != "partial" {
+		t.Errorf("status = %v, want partial", body["status"])
 	}
 }

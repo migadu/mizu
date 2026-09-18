@@ -243,6 +243,13 @@ func (m *Manager) RenewCertificate(ctx context.Context, domain string, keyTypes 
 			continue
 		}
 
+		// Recorded here rather than left to the reload below, which only carries
+		// over what was already in service: a domain renewed before this node
+		// ever served it - a newly configured one, or any renewal in the first
+		// couple of minutes after boot - would otherwise stay unrecorded, absent
+		// from the metric and invisible to adoptNewerFromCache.
+		m.recordServed(domain, keyType, cert.Leaf)
+
 		renewed = append(renewed, fmt.Sprintf("%s (%s, expires %s)",
 			domain, keyType, cert.Leaf.NotAfter.UTC().Format(time.RFC3339)))
 	}
@@ -255,7 +262,7 @@ func (m *Manager) RenewCertificate(ctx context.Context, domain string, keyTypes 
 	// errors still say what was left undone.
 
 	if err := m.reload("certificate renewed on request: " + domain); err != nil {
-		errs = append(errs, fmt.Errorf("renewed and stored, but not in service yet: %w", err))
+		errs = append(errs, fmt.Errorf("%w: %v", ErrNotInService, err))
 	}
 	return renewed, errors.Join(errs...)
 }
