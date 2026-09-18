@@ -56,10 +56,17 @@ func certCacheKey(domain, keyType string) string {
 //
 // autocert keeps every certificate it has loaded in memory and offers no way to
 // drop one, so making it read the cache again means replacing the whole manager
-// (Manager.reload). Its renewal timers cannot be stopped either: a replaced
-// manager keeps them for the life of the process. retire is what makes that
-// harmless — such a manager can still adopt what it finds in the cache, but it
-// can never order.
+// (Manager.reload). Its renewal timers cannot be stopped either — stopRenew is
+// unexported and nothing reachable calls it — so a replaced manager keeps them
+// for the life of the process.
+//
+// retire bounds what they can do, it does not make them free. A retired manager
+// can never order: its transport refuses everything. Its timers still wake and
+// still read the shared cache, which is a real S3 GET, before rescheduling to
+// the renewed certificate's own renewal time. So the cost of a reload is one
+// leaked manager, its certificates in memory, and a cache read per certificate
+// per renewal period — bounded by how often reload runs, which is why a steady
+// state must never reload.
 type autocertInstance struct {
 	mgr         *autocert.Manager
 	httpHandler http.Handler
