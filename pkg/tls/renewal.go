@@ -151,7 +151,13 @@ func (c *hidingCache) Get(ctx context.Context, key string) ([]byte, error) {
 // instance that cannot see the current certificate orders the replacement into
 // the shared cache while the live instance keeps serving. If the order fails — a
 // rate limit, a failed validation — the domain is left exactly as it was.
-func (m *Manager) RenewCertificate(domain string, keyTypes ...string) ([]string, error) {
+//
+// ctx gives the caller a way out. The call blocks until the CA answers, so an
+// operator may well give up part-way; without this the remaining key types were
+// still ordered, and a re-run afterwards ordered everything again. An order
+// already in flight is allowed to finish — abandoning one after the CA has
+// issued the certificate would waste it.
+func (m *Manager) RenewCertificate(ctx context.Context, domain string, keyTypes ...string) ([]string, error) {
 	if m == nil || m.current.Load() == nil {
 		return nil, fmt.Errorf("TLS manager not initialized")
 	}
@@ -165,7 +171,7 @@ func (m *Manager) RenewCertificate(domain string, keyTypes ...string) ([]string,
 		return nil, fmt.Errorf("domain is required")
 	}
 
-	if err := m.hostPolicy(context.Background(), domain); err != nil {
+	if err := m.hostPolicy(ctx, domain); err != nil {
 		return nil, fmt.Errorf("domain %q not in allowed list: %w", domain, err)
 	}
 
@@ -190,13 +196,18 @@ func (m *Manager) RenewCertificate(domain string, keyTypes ...string) ([]string,
 	var errs []error
 
 	for _, keyType := range keyTypes {
+		if err := ctx.Err(); err != nil {
+			errs = append(errs, fmt.Errorf("%s: not ordered, the caller gave up: %w", keyType, err))
+			break
+		}
+
 		m.logger.Info("TLS: ordering replacement certificate", "domain", domain, "key_type", keyType)
 
 		cert, err := orderer.mgr.GetCertificate(certHello(domain, keyType))
 		if err == nil {
 			// autocert ignores a failed cache write on this path. A certificate
 			// that did not reach the cache is lost at the reload below.
-			err = m.verifyCached(domain, keyType, cert)
+			err = m.verifyCached(ctx, domain, keyType, cert)
 		}
 		if err != nil {
 			m.logger.Error("TLS: certificate renewal failed", "domain", domain, "key_type", keyType, "error", err)
@@ -211,6 +222,9 @@ func (m *Manager) RenewCertificate(domain string, keyTypes ...string) ([]string,
 	if len(renewed) == 0 {
 		return nil, errors.Join(errs...)
 	}
+
+	// Whatever was issued is put into service even when the caller has gone; the
+	// errors still say what was left undone.
 
 	if err := m.reload("certificate renewed on request: " + domain); err != nil {
 		errs = append(errs, fmt.Errorf("renewed and stored, but not in service yet: %w", err))
@@ -239,8 +253,8 @@ func resolveKeyTypes(requested []string) ([]string, error) {
 // Anything at least as fresh counts: the live instance's own renewal timer can
 // store a newer certificate for the same name while this order is in flight, and
 // that satisfies the intent as well as our own bytes would.
-func (m *Manager) verifyCached(domain, keyType string, cert *tls.Certificate) error {
-	cached, err := m.cachedLeaf(context.Background(), domain, keyType)
+func (m *Manager) verifyCached(ctx context.Context, domain, keyType string, cert *tls.Certificate) error {
+	cached, err := m.cachedLeaf(ctx, domain, keyType)
 	if err != nil {
 		return fmt.Errorf("certificate was issued but is not in the cache: %w", err)
 	}

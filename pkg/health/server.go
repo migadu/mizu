@@ -50,8 +50,9 @@ type CacheFlusher interface {
 
 // CertRenewer defines an interface for components that can renew TLS certificates
 type CertRenewer interface {
-	// keyTypes selects which key types to order; none means all of them.
-	RenewCertificate(domain string, keyTypes ...string) ([]string, error)
+	// keyTypes selects which key types to order; none means all of them. The
+	// context lets a caller that has gone away stop the work it asked for.
+	RenewCertificate(ctx context.Context, domain string, keyTypes ...string) ([]string, error)
 }
 
 // IPUnblocker defines an interface for components that can remove IPs from reputation tracking
@@ -792,7 +793,9 @@ func (s *Server) renewCertHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.logger.Info("Certificate renewal requested", "domain", domain, "key_types", keyTypes)
-	renewed, err := s.certRenewer.RenewCertificate(domain, keyTypes...)
+	// r.Context() is cancelled when the client disconnects, which is what an
+	// operator's Ctrl-C looks like from here.
+	renewed, err := s.certRenewer.RenewCertificate(r.Context(), domain, keyTypes...)
 	if err != nil && len(renewed) > 0 {
 		s.logger.Error("Certificate renewal partially failed", "domain", domain, "renewed", renewed, "error", err)
 		w.Header().Set("Content-Type", "application/json")

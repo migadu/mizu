@@ -153,7 +153,7 @@ func TestRenewCertificateRefreshesExportedExpiry(t *testing.T) {
 
 	before := expiryGauge(t, mx, domain, "ecdsa")
 
-	if _, err := m.RenewCertificate(domain); err != nil {
+	if _, err := m.RenewCertificate(context.Background(), domain); err != nil {
 		t.Fatalf("RenewCertificate: %v", err)
 	}
 

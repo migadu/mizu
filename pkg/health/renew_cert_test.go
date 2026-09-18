@@ -1,6 +1,7 @@
 package health
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -8,20 +9,46 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
 type fakeRenewer struct {
-	delay    time.Duration
-	renewed  []string
-	err      error
-	keyTypes []string // what the handler asked for
+	delay   time.Duration
+	renewed []string
+	err     error
+
+	mu        sync.Mutex
+	keyTypes  []string // what the handler asked for
+	cancelled bool     // the handler passed a context that was cancelled
 }
 
-func (f *fakeRenewer) RenewCertificate(_ string, keyTypes ...string) ([]string, error) {
+func (f *fakeRenewer) askedFor() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.keyTypes
+}
+
+func (f *fakeRenewer) gaveUp() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.cancelled
+}
+
+func (f *fakeRenewer) RenewCertificate(ctx context.Context, _ string, keyTypes ...string) ([]string, error) {
+	f.mu.Lock()
 	f.keyTypes = keyTypes
-	time.Sleep(f.delay)
+	f.mu.Unlock()
+
+	select {
+	case <-time.After(f.delay):
+	case <-ctx.Done():
+		f.mu.Lock()
+		f.cancelled = true
+		f.mu.Unlock()
+		return nil, ctx.Err()
+	}
 	return f.renewed, f.err
 }
 
@@ -90,8 +117,8 @@ func TestRenewCertHandlerPassesKeyTypeThrough(t *testing.T) {
 	}
 	resp.Body.Close()
 
-	if len(renewer.keyTypes) != 1 || renewer.keyTypes[0] != "rsa" {
-		t.Errorf("renewer asked for %v, want [rsa]", renewer.keyTypes)
+	if asked := renewer.askedFor(); len(asked) != 1 || asked[0] != "rsa" {
+		t.Errorf("renewer asked for %v, want [rsa]", asked)
 	}
 }
 
@@ -103,7 +130,42 @@ func TestRenewCertHandlerDefaultsToEveryKeyType(t *testing.T) {
 	if _, body := postRenew(t, srv.URL); body["status"] != "success" {
 		t.Fatalf("renewal failed: %v", body)
 	}
-	if len(renewer.keyTypes) != 0 {
-		t.Errorf("renewer asked for %v, want every key type", renewer.keyTypes)
+	if asked := renewer.askedFor(); len(asked) != 0 {
+		t.Errorf("renewer asked for %v, want every key type", asked)
+	}
+}
+
+// A client that hangs up must stop the work it asked for: renew-cert blocks for
+// as long as the CA takes, and an operator who gives up and re-runs it would
+// otherwise have two orders running for the same certificates.
+func TestRenewCertHandlerStopsWhenTheClientHangsUp(t *testing.T) {
+	renewer := &fakeRenewer{delay: 30 * time.Second, renewed: []string{"mx.example.com (ecdsa)"}}
+	srv := renewCertServer(t, renewer, time.Minute)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL,
+		strings.NewReader(`{"domain":"mx.example.com"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if resp, err := http.DefaultClient.Do(req); err == nil {
+			resp.Body.Close()
+		}
+	}()
+
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+	<-done
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && !renewer.gaveUp() {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !renewer.gaveUp() {
+		t.Error("the renewal carried on after the client hung up")
 	}
 }

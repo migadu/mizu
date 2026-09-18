@@ -26,10 +26,11 @@ import (
 // fakeCA is an ACME server behind a RoundTripper. It authorizes every order on
 // the spot (status "ready", no challenges) and signs whatever CSR it is sent.
 type fakeCA struct {
-	t      *testing.T
-	key    *ecdsa.PrivateKey
-	cert   *x509.Certificate
-	issued atomic.Int32
+	t          *testing.T
+	key        *ecdsa.PrivateKey
+	cert       *x509.Certificate
+	issued     atomic.Int32
+	afterIssue func() // test hook, called once a certificate has been signed
 
 	mu    sync.Mutex
 	certs map[string][]byte // cert URL path -> PEM chain
@@ -130,7 +131,11 @@ func (ca *fakeCA) issue(req *http.Request) string {
 	certPath := fmt.Sprintf("/cert/%d", n)
 	ca.mu.Lock()
 	ca.certs[certPath] = chain.Bytes()
+	hook := ca.afterIssue
 	ca.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
 	return certPath
 }
 
@@ -175,7 +180,7 @@ func TestRenewCertificateOrdersAndServesNewCertificate(t *testing.T) {
 	}
 	oldInstance := m.current.Load()
 
-	renewed, err := m.RenewCertificate(domain)
+	renewed, err := m.RenewCertificate(context.Background(), domain)
 	if err != nil {
 		t.Fatalf("RenewCertificate: %v", err)
 	}
@@ -215,7 +220,7 @@ func TestRenewCertificateFailedOrderChangesNothing(t *testing.T) {
 	before := mustServedLeaf(t, m, domain, "ecdsa")
 	instance := m.current.Load()
 
-	if _, err := m.RenewCertificate(domain); err == nil {
+	if _, err := m.RenewCertificate(context.Background(), domain); err == nil {
 		t.Fatal("RenewCertificate succeeded without a reachable CA")
 	}
 
@@ -237,10 +242,10 @@ func TestRenewCertificateRefusedOnNonLeader(t *testing.T) {
 	ca := newFakeCA(t)
 	m := newTestManager(newMemCache(), ca, always(false), domain)
 
-	if _, err := m.RenewCertificate(domain); err == nil {
+	if _, err := m.RenewCertificate(context.Background(), domain); err == nil {
 		t.Error("RenewCertificate succeeded on a non-leader")
 	}
-	if _, err := m.RenewCertificate("other.example.com"); err == nil {
+	if _, err := m.RenewCertificate(context.Background(), "other.example.com"); err == nil {
 		t.Error("RenewCertificate accepted a domain that is not configured")
 	}
 	if ca.issued.Load() != 0 {
@@ -534,7 +539,7 @@ func TestRenewCertificateOrdersOnlyTheRequestedKeyType(t *testing.T) {
 	m.maintainCertificates()
 	beforeECDSA := mustServedLeaf(t, m, domain, "ecdsa")
 
-	renewed, err := m.RenewCertificate(domain, "rsa")
+	renewed, err := m.RenewCertificate(context.Background(), domain, "rsa")
 	if err != nil {
 		t.Fatalf("RenewCertificate: %v", err)
 	}
@@ -556,10 +561,63 @@ func TestRenewCertificateRejectsUnknownKeyType(t *testing.T) {
 	ca := newFakeCA(t)
 	m := newTestManager(newMemCache(), ca, always(true), domain)
 
-	if _, err := m.RenewCertificate(domain, "ed25519"); err == nil {
+	if _, err := m.RenewCertificate(context.Background(), domain, "ed25519"); err == nil {
 		t.Error("RenewCertificate accepted a key type it cannot order")
 	}
 	if n := ca.issued.Load(); n != 0 {
 		t.Errorf("CA issued %d certificates for an unknown key type", n)
+	}
+}
+
+// Residual: renew-cert blocks until the CA answers, so the operator may well
+// give up - Ctrl-C, or a dropped connection. The order then carried on server
+// side, and a re-run after it finished ordered everything a second time: four
+// issuances for two certificates, against a five-per-week budget.
+func TestRenewCertificateStopsWhenTheCallerGivesUp(t *testing.T) {
+	const domain = "mx.example.com"
+	cache := newMemCache()
+	seedCerts(t, cache, domain, time.Now().Add(80*24*time.Hour))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ca := newFakeCA(t)
+	// The caller disconnects as the first certificate comes back.
+	ca.afterIssue = cancel
+
+	m := newTestManager(cache, ca, always(true), domain)
+	m.maintainCertificates()
+
+	if _, err := m.RenewCertificate(ctx, domain); err == nil {
+		t.Error("RenewCertificate reported success after the caller gave up")
+	}
+
+	if n := ca.issued.Load(); n != 1 {
+		t.Errorf("CA issued %d certificates after the caller gave up, want 1", n)
+	}
+}
+
+// Residual: autocert offers no way to stop a replaced manager's renewal timers
+// (stopRenew is unexported and unreachable), so every reload leaves one behind
+// for the life of the process. It cannot order - its transport is retired - and
+// its timers settle into a cache read per certificate per renewal period, so the
+// cost is bounded by how often reload runs.
+//
+// This is what keeps that bounded: a steady state must not reload at all.
+func TestMaintenanceDoesNotAccumulateAutocertInstances(t *testing.T) {
+	const domain = "mx.example.com"
+	cache := newMemCache()
+	seedCerts(t, cache, domain, time.Now().Add(80*24*time.Hour))
+
+	m := newTestManager(cache, &countingTransport{resp: refuseAll}, always(false), domain)
+	m.maintainCertificates()
+	instance := m.current.Load()
+
+	for i := 0; i < 24; i++ {
+		m.maintainCertificates()
+	}
+
+	if m.current.Load() != instance {
+		t.Error("a day of maintenance passes replaced the autocert instance; every reload leaks one")
 	}
 }

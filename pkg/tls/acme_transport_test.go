@@ -12,6 +12,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"math/big"
@@ -347,5 +348,92 @@ func TestACMETransportIgnoresNonJSONSuccess(t *testing.T) {
 	}
 	if strings.Contains(logs.String(), "level=WARN") {
 		t.Errorf("a certificate download was logged as a failure:\n%s", logs.String())
+	}
+}
+
+// jwsRequest builds a request shaped like the ACME client's: a JWS whose
+// payload is empty for a read (POST-as-GET, RFC 8555 §6.3) and set for a write.
+func jwsRequest(t *testing.T, url, payload string) *http.Request {
+	t.Helper()
+	body := fmt.Sprintf(`{"protected":"eyJhbGciOiJFUzI1NiJ9","payload":%q,"signature":"c2ln"}`, payload)
+	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.ContentLength = int64(len(body))
+	return req
+}
+
+// Residual: leadership can move while an order is in flight - a rolling restart
+// demotes a node a second after the smaller name rejoins. Refusing every request
+// then strands a certificate the CA has issued and charged against the weekly
+// limit, because the download comes after issuance and autocert ignores the
+// error rather than retrying.
+//
+// Reads are therefore allowed and writes are not: a demoted node can collect
+// what it already caused to be issued, but can never cause an issuance.
+func TestACMETransportNonLeaderMayReadButNotWrite(t *testing.T) {
+	seen := make(chan string, 4)
+	base := &countingTransport{resp: func(req *http.Request) (*http.Response, error) {
+		body, _ := io.ReadAll(req.Body)
+		seen <- string(body)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/pem-certificate-chain"}},
+			Body:       io.NopCloser(strings.NewReader("chain")),
+		}, nil
+	}}
+	leader := true
+	transport := &acmeTransport{base: base, isLeaderF: func() bool { return leader }, logger: discardLogger()}
+
+	// The order is placed while this node is the leader.
+	if _, err := transport.RoundTrip(jwsRequest(t, "https://acme.invalid/new-order", "eyJ4Ijp0cnVlfQ")); err != nil {
+		t.Fatalf("setup: leader could not place an order: %v", err)
+	}
+	<-seen
+	leader = false
+
+	// The certificate download, once the CA has issued it.
+	read := jwsRequest(t, "https://acme.invalid/cert/1", "")
+	if _, err := transport.RoundTrip(read); err != nil {
+		t.Errorf("non-leader could not collect an issued certificate: %v", err)
+	}
+	select {
+	case body := <-seen:
+		if !strings.Contains(body, `"payload":""`) {
+			t.Errorf("the request body reached the CA altered: %s", body)
+		}
+	default:
+		t.Error("the read never reached the CA")
+	}
+
+	// Anything that could cause an issuance stays refused.
+	for _, write := range []struct{ name, url, payload string }{
+		{"new order", "https://acme.invalid/new-order", "eyJpZGVudGlmaWVycyI6W119"},
+		{"finalize", "https://acme.invalid/finalize", "eyJjc3IiOiJ4In0"},
+		{"new account", "https://acme.invalid/new-account", "eyJ0ZXJtcyI6dHJ1ZX0"},
+	} {
+		req := jwsRequest(t, write.url, write.payload)
+		if _, err := transport.RoundTrip(req); !errors.Is(err, ErrNotLeader) {
+			t.Errorf("%s: error = %v, want ErrNotLeader", write.name, err)
+		}
+	}
+
+	if n := base.calls.Load(); n != 2 {
+		t.Errorf("the CA saw %d requests, want the leader's order and the read", n)
+	}
+}
+
+// A node that has not been leader recently does not reach the CA at all, not
+// even to read: there is no order of its own left to finish.
+func TestACMETransportNonLeaderWithNoOrderInFlightReadsNothing(t *testing.T) {
+	base := &countingTransport{resp: refuseAll}
+	transport := &acmeTransport{base: base, isLeaderF: always(false), logger: discardLogger()}
+
+	if _, err := transport.RoundTrip(jwsRequest(t, "https://acme.invalid/cert/1", "")); !errors.Is(err, ErrNotLeader) {
+		t.Errorf("error = %v, want ErrNotLeader", err)
+	}
+	if n := base.calls.Load(); n != 0 {
+		t.Errorf("the CA saw %d requests from a node with no order in flight", n)
 	}
 }
