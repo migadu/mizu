@@ -524,6 +524,14 @@ Key packages:
   be equal (VERP, aliases); each must be authorized. An unparseable header or a
   second `From` is rejected for authenticated sessions. Before this the header was
   unchecked, so a mailbox could present as any other and get it DKIM-signed.
+  - **Malformed is 5.6.0, unauthorized is 5.7.1.** A header that is not valid
+    RFC 5322 is a client bug — most often a display name with an unquoted comma
+    (`Wearzoor, Alfred <a@b>`), which net/mail reads as a list whose first entry
+    has no address. It gets `550 5.6.0 malformed From header …` telling the user
+    to quote the name; "not allowed" sent them hunting a missing permission.
+    Rejected rather than accepted as-is: receivers need one parseable From for
+    DMARC and may bounce it after our 250. The reject log carries the raw header
+    as `value`; its `from` field is the envelope.
 - `allowed_from` entries may be exact addresses, `*@domain` wildcards, or
   `/regex/` patterns (rcptd's regex_sender_login pass-through, matched
   case-insensitively against MAIL FROM with substring semantics like Postfix pcre)
