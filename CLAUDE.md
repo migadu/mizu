@@ -169,6 +169,11 @@ Key packages:
   - `enable_junk_header`: `X-Mizu-Junk` — governs only this header;
     `junk.apply_action` adds its own marker (e.g. `X-Spam`) independently, and
     rspamd's forwarded `add_headers` (X-Migadu-*) bypass these toggles entirely
+  - Any `X-Mizu-*` header the sender supplied is stripped first
+    (`stripHeaderPrefix` in `InjectMizuHeaders`), whatever the toggles:
+    otherwise, with `enable_auth_results_header` off, mailqueuer would record a
+    forged verdict as Mizu's. Contract modeled in mailqueuer's
+    `spec/Mailqueuer/Auth.lean`
 - Replaced the former all-or-nothing `disable_mizu_headers` (forward-only, no
   fallback). Unknown/stale config keys produce a startup stderr warning
   (`warnUndecodedKeys` in [pkg/config/loader.go](pkg/config/loader.go))

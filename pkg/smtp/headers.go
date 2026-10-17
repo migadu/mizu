@@ -30,6 +30,14 @@ func normalizeToCRLF(s string) string {
 // spamHeaders are NOT subject to toggles — rspamd's add_headers are injected verbatim.
 // stripClientIdentity omits the "from <HELO> (<client IP>)" clause from Received; see buildReceivedHeader.
 func InjectMizuHeaders(rawEmail, domain, remoteAddr, heloHostname, traceID string, tlsVersion string, spfResult *validation.SPFResult, dmarcResult *validation.DMARCResult, arcResult *validation.ARCResult, isJunk bool, toggles config.HeaderToggles, stripClientIdentity bool, spamHeaders map[string][]string) string {
+	// Drop any X-Mizu-* header the sender supplied. Ours are prepended above
+	// the sender's headers and mailqueuer reads only the first
+	// X-Mizu-Authentication-Results line, so a forged copy loses while ours
+	// is there; but with a header toggled off, a forged copy would be taken
+	// as ours (mailqueuer records its verdicts on the ledger). Modeled in
+	// mailqueuer's spec/Mailqueuer/Auth.lean.
+	rawEmail = stripHeaderPrefix(rawEmail, "X-Mizu-")
+
 	// Build the Received header (always added)
 	receivedHeader := buildReceivedHeader(domain, remoteAddr, heloHostname, traceID, tlsVersion, stripClientIdentity)
 
@@ -271,7 +279,13 @@ func addEnvelopeToHeader(rawEmail, recipient string) string {
 // the message. Everything from the first empty line onward (the body) is left
 // untouched, so occurrences of the name in the body are not affected.
 func stripHeader(rawEmail, headerName string) string {
-	prefix := headerName + ":"
+	return stripHeaderPrefix(rawEmail, headerName+":")
+}
+
+// stripHeaderPrefix is stripHeader for every header line starting with prefix
+// (case-insensitive), e.g. "X-Mizu-" for all of Mizu's own headers. Lines are
+// split on CRLF: callers pass messages already through normalizeToCRLF.
+func stripHeaderPrefix(rawEmail, prefix string) string {
 	lines := strings.Split(rawEmail, "\r\n")
 	result := make([]string, 0, len(lines))
 	skipping := false

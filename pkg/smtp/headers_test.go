@@ -886,3 +886,51 @@ func TestRewriteFromHeader_EmptyArgs(t *testing.T) {
 		t.Error("empty new address must be a no-op")
 	}
 }
+
+// A sender-supplied X-Mizu-* header (any case, folded or not) is dropped
+// before Mizu adds its own, whatever the toggles: with the auth-results
+// header off, mailqueuer would otherwise record a forged verdict. Body
+// lines are left alone.
+func TestInjectMizuHeaders_StripsForgedMizuHeaders(t *testing.T) {
+	forged := "From: sender@example.com\r\n" +
+		"X-Mizu-Authentication-Results: spf=pass dkim=pass dmarc=pass arc=pass\r\n" +
+		"x-mizu-junk: YES\r\n" +
+		"X-MIZU-TRACE-ID: forged\r\n" +
+		"X-Mizu-Custom: a\r\n\tfolded\r\n" +
+		"Subject: Test\r\n" +
+		"\r\n" +
+		"X-Mizu-Authentication-Results: in the body\r\n"
+	for _, toggles := range []config.HeaderToggles{
+		{},
+		{TraceID: true, AuthResults: true, Junk: true},
+	} {
+		out := InjectMizuHeaders(forged, "mail.example.com", "1.2.3.4:5678", "client.example.com",
+			"trace123", "TLS 1.3", nil, nil, nil, false, toggles, false, nil)
+		head, body, ok := strings.Cut(out, "\r\n\r\n")
+		if !ok {
+			t.Fatalf("no header/body separator:\n%s", out)
+		}
+		lower := strings.ToLower(head)
+		for _, gone := range []string{"spf=pass dkim=pass", "x-mizu-junk: yes", "forged", "x-mizu-custom", "\tfolded"} {
+			if strings.Contains(lower, gone) {
+				t.Errorf("toggles %+v: forged %q survived:\n%s", toggles, gone, head)
+			}
+		}
+		if n := strings.Count(lower, "x-mizu-authentication-results:"); n != b2i(toggles.AuthResults) {
+			t.Errorf("toggles %+v: %d auth-results lines, want %d:\n%s", toggles, n, b2i(toggles.AuthResults), head)
+		}
+		if !strings.Contains(head, "Subject: Test") || !strings.Contains(head, "From: sender@example.com") {
+			t.Errorf("toggles %+v: other headers lost:\n%s", toggles, head)
+		}
+		if body != "X-Mizu-Authentication-Results: in the body\r\n" {
+			t.Errorf("toggles %+v: body changed: %q", toggles, body)
+		}
+	}
+}
+
+func b2i(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
