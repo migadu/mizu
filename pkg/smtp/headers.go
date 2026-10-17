@@ -286,12 +286,28 @@ func stripHeader(rawEmail, headerName string) string {
 // (case-insensitive), e.g. "X-Mizu-" for all of Mizu's own headers. Lines are
 // split on CRLF: callers pass messages already through normalizeToCRLF.
 func stripHeaderPrefix(rawEmail, prefix string) string {
-	lines := strings.Split(rawEmail, "\r\n")
+	// Only the header section is split: the body (from the first empty line)
+	// is appended untouched, so a large message isn't copied line by line.
+	if strings.HasPrefix(rawEmail, "\r\n") {
+		return rawEmail // empty header section
+	}
+	header, body := rawEmail, ""
+	if i := strings.Index(rawEmail, "\r\n\r\n"); i >= 0 {
+		// The header keeps the CRLF ending its last line; body starts at the
+		// empty line, exactly where the whole-message split would put it.
+		header, body = rawEmail[:i+2], rawEmail[i+2:]
+	}
+	if !strings.Contains(strings.ToLower(header), strings.ToLower(prefix)) {
+		return rawEmail
+	}
+
+	lines := strings.Split(header, "\r\n")
 	result := make([]string, 0, len(lines))
 	skipping := false
 
 	for i, line := range lines {
-		// Empty line marks the end of the header section: copy the body verbatim.
+		// Only the last line can be empty here (after the header's final
+		// CRLF); keep it, so the join restores that CRLF.
 		if line == "" {
 			result = append(result, lines[i:]...)
 			break
@@ -313,7 +329,7 @@ func stripHeaderPrefix(rawEmail, prefix string) string {
 		result = append(result, line)
 	}
 
-	return strings.Join(result, "\r\n")
+	return strings.Join(result, "\r\n") + body
 }
 
 // rewriteFromHeader replaces the address in the From header with newAddress,

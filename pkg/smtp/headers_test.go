@@ -934,3 +934,71 @@ func b2i(b bool) int {
 	}
 	return 0
 }
+
+func TestStripHeaderPrefix_Edges(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"", ""},
+		{"\r\nX-Mizu-A: body only\r\n", "\r\nX-Mizu-A: body only\r\n"},
+		{"X-Mizu-A: 1\r\n\tcont\r\n", ""},
+		{"X-Mizu-A: 1\r\n", ""},
+		{"Subject: s\r\nX-Mizu-A: 1", "Subject: s"},
+		{"Subject: s\r\nx-mizu-a: 1\r\n\r\nX-Mizu-B: body\r\n", "Subject: s\r\n\r\nX-Mizu-B: body\r\n"},
+		{"Subject: s\r\n\r\n", "Subject: s\r\n\r\n"},
+		{"X-Mizu-A: 1\r\n\r\nbody", "\r\nbody"},
+	}
+	for _, c := range cases {
+		if got := stripHeaderPrefix(c.in, "X-Mizu-"); got != c.want {
+			t.Errorf("stripHeaderPrefix(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// stripHeaderPrefixWhole is the previous implementation, which split the
+// whole message; stripHeaderPrefix must behave the same while splitting only
+// the header section.
+func stripHeaderPrefixWhole(rawEmail, prefix string) string {
+	lines := strings.Split(rawEmail, "\r\n")
+	result := make([]string, 0, len(lines))
+	skipping := false
+	for i, line := range lines {
+		if line == "" {
+			result = append(result, lines[i:]...)
+			break
+		}
+		if skipping {
+			if line[0] == ' ' || line[0] == '\t' {
+				continue
+			}
+			skipping = false
+		}
+		if len(line) >= len(prefix) && strings.EqualFold(line[:len(prefix)], prefix) {
+			skipping = true
+			continue
+		}
+		result = append(result, line)
+	}
+	return strings.Join(result, "\r\n")
+}
+
+func TestStripHeaderPrefix_MatchesWholeSplit(t *testing.T) {
+	parts := []string{"X-Mizu-A: 1", "x-mizu-b: 2", "\tcont", " cont", "Subject: s",
+		"X-Mizu", "From: a", "", "body", "X-Mizu-C: in body"}
+	seed := uint64(1)
+	next := func(n int) int {
+		seed = seed*6364136223846793005 + 1442695040888963407
+		return int((seed >> 33) % uint64(n))
+	}
+	for i := 0; i < 20000; i++ {
+		var lines []string
+		for j := next(8); j > 0; j-- {
+			lines = append(lines, parts[next(len(parts))])
+		}
+		msg := strings.Join(lines, "\r\n")
+		if next(2) == 0 {
+			msg += "\r\n"
+		}
+		if got, want := stripHeaderPrefix(msg, "X-Mizu-"), stripHeaderPrefixWhole(msg, "X-Mizu-"); got != want {
+			t.Fatalf("stripHeaderPrefix(%q) = %q, whole-message split gives %q", msg, got, want)
+		}
+	}
+}
