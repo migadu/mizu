@@ -1428,7 +1428,7 @@ func (s *Session) Rcpt(ctx context.Context, to string, opts *smtp.RcptOptions) e
 	// delivery POST. Local mode delivers nowhere, so `me@localhost` is fine.
 	if !s.globalConfig.Local {
 		if err := validRecipient(to); err != nil {
-			s.Logger.Warn("Rejecting RCPT TO - invalid recipient address", "to", to)
+			s.Logger.Warn("Rejecting RCPT TO - invalid recipient address", "to", to, "error", err)
 			return err
 		}
 	}
@@ -2132,7 +2132,7 @@ func (s *Session) deliverToRecipient(ctx context.Context, signedEmail string, re
 		// Any other delivery failure is treated as temporary so the sender's MTA
 		// retries rather than bouncing the message (zero message loss). Deliberate
 		// backend rejections handled above remain permanent: 413 and 422 always,
-		// 404 and 403 only when a distributed tracker is configured.
+		// 404 and 403 only with a distributed tracker and a recipient cache TTL.
 		return &smtp.SMTPError{Code: 451, EnhancedCode: smtp.EnhancedCode{4, 4, 0}, Message: "Temporary failure, please try again later"}
 	}
 

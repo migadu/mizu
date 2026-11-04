@@ -56,10 +56,12 @@ var (
 
 	// ErrRecipientAddressLiteral: a recipient whose domain is an address
 	// literal (`user@[192.0.2.1]`, `user@[IPv6:2001:db8::1]`). A literal never
-	// names a hosted domain, so both families are refused alike.
+	// names a hosted domain, so both families are refused alike. The syntax
+	// is valid, so this is RFC 3463's 5.1.2 "bad destination system address",
+	// not the 5.1.3 syntax code.
 	ErrRecipientAddressLiteral = &smtp.SMTPError{
 		Code:         553,
-		EnhancedCode: smtp.EnhancedCode{5, 1, 3},
+		EnhancedCode: smtp.EnhancedCode{5, 1, 2},
 		Message:      "address literals not accepted",
 	}
 

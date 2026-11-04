@@ -17,16 +17,17 @@ import (
 // 553 5.1.3. Before this, `RCPT TO:<user@gmail>` (2026-10-24) was accepted and
 // failed only at delivery, where mailqueuer's 422 became a 451 the client
 // retried. The rule is emailutil.IsValidEmail plus no comma (ingest splits
-// X-Mail-To on commas) and no address literal.
+// X-Mail-To on commas) and no address literal (553 5.1.2).
 
-func assertInvalidRecipient(t *testing.T, err error, msg string) {
+func assertRefused(t *testing.T, err error, want *smtp.SMTPError) {
 	t.Helper()
 	var smtpErr *smtp.SMTPError
 	if !errors.As(err, &smtpErr) {
 		t.Fatalf("want *smtp.SMTPError, got %T: %v", err, err)
 	}
-	if smtpErr.Code != 553 || smtpErr.EnhancedCode != (smtp.EnhancedCode{5, 1, 3}) || smtpErr.Message != msg {
-		t.Fatalf("want 553 5.1.3 %q, got %d %v %q", msg, smtpErr.Code, smtpErr.EnhancedCode, smtpErr.Message)
+	if smtpErr.Code != want.Code || smtpErr.EnhancedCode != want.EnhancedCode || smtpErr.Message != want.Message {
+		t.Fatalf("want %d %v %q, got %d %v %q", want.Code, want.EnhancedCode, want.Message,
+			smtpErr.Code, smtpErr.EnhancedCode, smtpErr.Message)
 	}
 }
 
@@ -54,26 +55,29 @@ func rcptSession(validator RecipientValidator) *Session {
 }
 
 func TestRcpt_InvalidRecipientRefused(t *testing.T) {
-	for _, tc := range []struct{ to, msg string }{
-		{"user@gmail", ErrInvalidRecipient.Message},
-		{"user@example", ErrInvalidRecipient.Message},
-		{"user@.com", ErrInvalidRecipient.Message},
-		{"user@example.com.", ErrInvalidRecipient.Message},
-		{"user@example..com", ErrInvalidRecipient.Message},
-		{"a@b@example.com", ErrInvalidRecipient.Message},      // "a@b"@example.com
-		{"john doe@example.com", ErrInvalidRecipient.Message}, // "john doe"@example.com
-		{"user@a.com,b.com", ErrInvalidRecipient.Message},
-		{"a,b@example.com", ErrInvalidRecipient.Message},
-		{",bob@example.com", ErrInvalidRecipient.Message},
-		{"x@[y@example.com", ErrInvalidRecipient.Message}, // "x@[y"@example.com: not a literal
-		{"user@[192.0.2.1]", ErrRecipientAddressLiteral.Message},
-		{"user@[IPv6:2001:db8::1]", ErrRecipientAddressLiteral.Message},
+	for _, tc := range []struct {
+		to   string
+		want *smtp.SMTPError
+	}{
+		{"user@gmail", ErrInvalidRecipient},
+		{"user@example", ErrInvalidRecipient},
+		{"user@.com", ErrInvalidRecipient},
+		{"user@example.com.", ErrInvalidRecipient},
+		{"user@example..com", ErrInvalidRecipient},
+		{"a@b@example.com", ErrInvalidRecipient},      // "a@b"@example.com
+		{"john doe@example.com", ErrInvalidRecipient}, // "john doe"@example.com
+		{"user@a.com,b.com", ErrInvalidRecipient},
+		{"a,b@example.com", ErrInvalidRecipient},
+		{",bob@example.com", ErrInvalidRecipient},
+		{"x@[y@example.com", ErrInvalidRecipient}, // "x@[y"@example.com: not a literal
+		{"user@[192.0.2.1]", ErrRecipientAddressLiteral},
+		{"user@[IPv6:2001:db8::1]", ErrRecipientAddressLiteral},
 	} {
 		t.Run(tc.to, func(t *testing.T) {
 			v := &countingRecipientValidator{}
 			s := rcptSession(v)
 			err := s.Rcpt(context.Background(), tc.to, nil)
-			assertInvalidRecipient(t, err, tc.msg)
+			assertRefused(t, err, tc.want)
 			if len(s.to) != 0 {
 				t.Fatalf("refused recipient must not be recorded, got %v", s.to)
 			}
@@ -120,20 +124,26 @@ func TestRcpt_LocalModeSkipsAddressCheck(t *testing.T) {
 }
 
 // Through the go-smtp parser, which strips the quotes from a quoted local
-// part: the only place `"a@b"@example.com` turns into a second `@`.
+// part (the only place `"a@b"@example.com` turns into a second `@`) and
+// passes an address literal through verbatim.
 func TestRcpt_InvalidRecipientRefused_Wire(t *testing.T) {
 	// Never reached: the test stops at RCPT TO.
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	defer server.Close()
 
-	for _, to := range []string{
-		`"a@b"@example.com`,
-		`"john doe"@example.com`,
-		`"a,b"@example.com`,
-		`"x@[y"@example.com`,
-		`user@gmail`,
+	for _, tc := range []struct {
+		to   string
+		want *smtp.SMTPError
+	}{
+		{`"a@b"@example.com`, ErrInvalidRecipient},
+		{`"john doe"@example.com`, ErrInvalidRecipient},
+		{`"a,b"@example.com`, ErrInvalidRecipient},
+		{`"x@[y"@example.com`, ErrInvalidRecipient},
+		{`user@gmail`, ErrInvalidRecipient},
+		{`user@[192.0.2.1]`, ErrRecipientAddressLiteral},
+		{`user@[IPv6:2001:db8::1]`, ErrRecipientAddressLiteral},
 	} {
-		t.Run(to, func(t *testing.T) {
+		t.Run(tc.to, func(t *testing.T) {
 			backend, client := createTestSMTPServer(t, server.URL)
 			defer backend.Close()
 			defer client.Close()
@@ -144,7 +154,7 @@ func TestRcpt_InvalidRecipientRefused_Wire(t *testing.T) {
 			if err := client.Mail("sender@example.com", nil); err != nil {
 				t.Fatalf("MAIL FROM failed: %v", err)
 			}
-			assertInvalidRecipient(t, client.Rcpt(to, nil), ErrInvalidRecipient.Message)
+			assertRefused(t, client.Rcpt(tc.to, nil), tc.want)
 		})
 	}
 }
@@ -184,5 +194,5 @@ func TestHTTP422InvalidRecipient(t *testing.T) {
 	if _, err := io.WriteString(wc, message); err != nil {
 		t.Fatalf("Writing message failed: %v", err)
 	}
-	assertInvalidRecipient(t, wc.Close(), ErrInvalidRecipient.Message)
+	assertRefused(t, wc.Close(), ErrInvalidRecipient)
 }

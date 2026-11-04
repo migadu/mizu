@@ -614,7 +614,8 @@ Key packages:
     `IsValidEmail` and still fails at ingest, and `",bob"@example.com` would be
     delivered to `bob@example.com`.
   - **Address literals are refused, both families**
-    (`ErrRecipientAddressLiteral`): a literal never names a hosted domain.
+    (`ErrRecipientAddressLiteral`, `553 5.1.2`: the syntax is valid, the
+    system is not deliverable): a literal never names a hosted domain.
   - Skipped in `--local` mode, which delivers nowhere (`me@localhost`).
     MAIL FROM is not checked.
   - **Backstop: a 422 at delivery is `553 5.1.3`** (`IsInvalidRecipient`,
@@ -887,8 +888,9 @@ deliveryCfg := serverCfg.Delivery
     mailqueuer's ingest applies, imported so the RCPT TO check cannot drift
     from it. **mailqueuer tracks `../emailutil` by `replace`; Mizu pins a
     commit.** A stricter `IsValidEmail` deployed in mailqueuer before the pin
-    is bumped reopens the 422 → 451 retry loop for whatever it newly rejects,
-    so bump the pin here in the same change.
+    is bumped means whatever it newly rejects gets 250 at RCPT and a 553
+    bounce at DATA — after any earlier recipients of the same message were
+    delivered — so bump the pin here in the same change.
   - Both are private repos required by pseudo-version with no `replace`
     (they replaced the former single `shared` module). Fetching them needs
     `GOPRIVATE=github.com/migadu` and git credentials for github.com/migadu.
