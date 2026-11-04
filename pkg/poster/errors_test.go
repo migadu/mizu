@@ -79,6 +79,27 @@ func TestHTTPStatusError_IsRetryable(t *testing.T) {
 	}
 }
 
+// A 422 is mailqueuer's verdict on the address: permanent, and not retried.
+func TestHTTPStatusError_IsInvalidRecipient(t *testing.T) {
+	for _, tt := range []struct {
+		statusCode int
+		expected   bool
+	}{
+		{422, true},
+		{400, false},
+		{404, false},
+		{500, false},
+	} {
+		err := NewHTTPStatusError(tt.statusCode, "test body")
+		if got := err.IsInvalidRecipient(); got != tt.expected {
+			t.Errorf("IsInvalidRecipient() = %v; want %v for status %d", got, tt.expected, tt.statusCode)
+		}
+	}
+	if NewHTTPStatusError(422, "test body").IsRetryable() {
+		t.Error("IsRetryable() = true for 422; want false")
+	}
+}
+
 func TestNewHTTPStatusError(t *testing.T) {
 	statusCode := 404
 	body := "Not Found"

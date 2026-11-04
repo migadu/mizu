@@ -15,6 +15,7 @@ require (
 	github.com/emersion/go-smtp v0.21.3
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/hashicorp/memberlist v0.5.3
+	github.com/migadu/emailutil v0.0.0-20260910140846-955a3017f9e3
 	github.com/migadu/passwd v0.0.0-20260815055905-ea3ab9a0a7d0
 	github.com/migadu/spf v1.0.0
 	github.com/pires/go-proxyproto v0.12.0

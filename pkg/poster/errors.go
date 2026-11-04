@@ -52,6 +52,12 @@ func (e *HTTPStatusError) IsRecipientBlocked() bool {
 	return e.StatusCode == 403
 }
 
+// IsInvalidRecipient returns true if the status code indicates the recipient
+// address was refused as invalid (422, mailqueuer's ingest)
+func (e *HTTPStatusError) IsInvalidRecipient() bool {
+	return e.StatusCode == 422
+}
+
 // IsPayloadTooLarge returns true if the status code indicates message is too large (413)
 func (e *HTTPStatusError) IsPayloadTooLarge() bool {
 	return e.StatusCode == 413

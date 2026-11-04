@@ -40,6 +40,31 @@ var (
 		Message:      "non-ASCII addresses not permitted: SMTPUTF8 not supported",
 	}
 
+	// ErrInvalidRecipient: a recipient mailqueuer's ingest would refuse
+	// (`user@gmail`, 2026-10-24). The go-smtp parser is grammar-only and
+	// strips the quotes from a quoted local part, so `"a@b"@example.com` and
+	// `"john doe"@example.com` reach the session as unquoted strings. Before
+	// this they were accepted and failed at delivery, where mailqueuer's 422
+	// became a 451 the client retried for days. Returned at RCPT TO
+	// (validRecipient) and, as a backstop, for a 422 at delivery. 553 5.1.3 is
+	// RFC 3463's "bad destination mailbox address syntax".
+	ErrInvalidRecipient = &smtp.SMTPError{
+		Code:         553,
+		EnhancedCode: smtp.EnhancedCode{5, 1, 3},
+		Message:      "invalid recipient address",
+	}
+
+	// ErrRecipientAddressLiteral: a recipient whose domain is an address
+	// literal (`user@[192.0.2.1]`, `user@[IPv6:2001:db8::1]`). A literal never
+	// names a hosted domain, so both families are refused alike. The syntax
+	// is valid, so this is RFC 3463's 5.1.2 "bad destination system address",
+	// not the 5.1.3 syntax code.
+	ErrRecipientAddressLiteral = &smtp.SMTPError{
+		Code:         553,
+		EnhancedCode: smtp.EnhancedCode{5, 1, 2},
+		Message:      "address literals not accepted",
+	}
+
 	// Authentication errors. Structured SMTPErrors so the auth-failure code is
 	// correct per RFC 4954 §6, which Outlook's setup wizard relies on: a
 	// permanent 535 is a password prompt, a temporary 454 is read as "server
