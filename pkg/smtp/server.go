@@ -1504,8 +1504,9 @@ func (s *Session) Rcpt(ctx context.Context, to string, opts *smtp.RcptOptions) e
 	// An address the delivery backend will refuse is refused here, where the
 	// reply is for this recipient alone. Accepted, it fails the delivery
 	// request with a 422, and the one reply to DATA then bounces the message
-	// for every recipient.
-	if !isDeliverableAddress(to) {
+	// for every recipient. Not in local mode: nothing is delivered there, and
+	// a development setup uses addresses like user@localhost.
+	if !s.globalConfig.Local && !isDeliverableAddress(to) {
 		s.Logger.Warn("Rejecting RCPT TO - address the delivery backend does not accept", "to", to)
 		return &smtp.SMTPError{
 			Code:         553,
