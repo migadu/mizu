@@ -722,7 +722,10 @@ func TestResolveSender_MasterLoginResolvesToIdentity(t *testing.T) {
 		{"identity itself passes through", identity, identity, true},
 		{"inherited alias passes through", "alias@example.com", "alias@example.com", true},
 		{"inherited wildcard passes through", "someone@team.example.com", "someone@team.example.com", true},
-		{"display name form of the login", "Support <" + login + ">", identity, true},
+		// MAIL FROM is an envelope path, never "Name <addr>". Parsing it as one
+		// was the sender-authorization bypass of audit item A4, so a
+		// display-name form is refused outright rather than unwrapped.
+		{"display name form of the login is not an envelope path", "Support <" + login + ">", "", false},
 		{"unrelated address stays rejected", "stranger@example.com", "", false},
 	}
 	for _, tt := range tests {

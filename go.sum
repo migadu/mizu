@@ -142,8 +142,8 @@ github.com/migadu/emailutil v0.0.0-20260910140846-955a3017f9e3 h1:SJ8LmyXSw+kyig
 github.com/migadu/emailutil v0.0.0-20260910140846-955a3017f9e3/go.mod h1:fOn5miC0SvNtPSEoaflvb90SM7KJ6zz79ifw+zZ4pC0=
 github.com/migadu/go-message v0.0.0-20250216181611-b9039e0d248f h1:ddb396ZA1QZ2IJaTBKcUyvA7rVysX8CujSFE6gREweg=
 github.com/migadu/go-message v0.0.0-20250216181611-b9039e0d248f/go.mod h1:XpJyL70LwRvq2a8rVbHXikPgKj8+aI0kGdHlg16ibYA=
-github.com/migadu/go-smtp v0.0.0-20260815141737-8c80850aaeaf h1:aXHGnHP/rkNlMXPfP0XCyFK0Yc8bFNKFxbLpoSBiaAk=
-github.com/migadu/go-smtp v0.0.0-20260815141737-8c80850aaeaf/go.mod h1:3DhKoQGRMhBVSVkW1MQXML3tHhQbL6aBkscvJuak/90=
+github.com/migadu/go-smtp v0.24.0-migadu.3 h1:LfEnsXDIkV5YcYtOm0hGSpINfc2XB0G04/yO/aHPnH4=
+github.com/migadu/go-smtp v0.24.0-migadu.3/go.mod h1:3DhKoQGRMhBVSVkW1MQXML3tHhQbL6aBkscvJuak/90=
 github.com/migadu/passwd v0.0.0-20260815055905-ea3ab9a0a7d0 h1:QUNNH5eue3Iftf/AAf/WvwxDLU6dFKxilCM0/ZUAqwY=
 github.com/migadu/passwd v0.0.0-20260815055905-ea3ab9a0a7d0/go.mod h1:yao4veE+JciUAmilDkoEGn31nVOCLRPULsqE3OsNG2c=
 github.com/migadu/spf v1.0.0 h1:kn/R6zgjERBT/unZz3Bw2wILwWZbKWonheHznenC/4w=

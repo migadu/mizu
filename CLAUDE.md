@@ -131,12 +131,26 @@ Key packages:
    - `AuthRateLimiter` ([pkg/smtp/auth_rate_limiter.go](pkg/smtp/auth_rate_limiter.go)) blocks brute force in three tiers, configured under `[server.auth.rate_limit]`:
      - Tier 1 (IP+username), Tier 2 (IP-only), Tier 3 (subnet, [pkg/smtp/auth_subnet.go](pkg/smtp/auth_subnet.go))
      - Tier 3 catches attackers rotating through sibling IPs, which never accumulate under tiers 1-2. It triggers on **breadth** (distinct failing addresses in a subnet: `subnet_max_distinct_ips`, default 8), not volume, so a shared NAT does not qualify. IPv4 groups by /24, IPv6 counts distinct /64s inside a /48
+     - A successful login forgives only that username's own failures from
+       that IP (`forgiveIPFailures`), never the whole per-IP count: otherwise
+       one valid account launders unlimited guesses at other accounts
      - Every tier keys IPv6 by /64 (`bucketIP`), otherwise one allocation supplies 2^64 free identities
      - Refusals are 454 (temporary), an address that logged in successfully within `success_exempt_duration` (default 24h) bypasses subnet blocks, and private/loopback/`subnet_exempt` ranges are never blocked
      - Lift a subnet block with `./mizu-admin unblock-ip 203.0.113.0/24` (CIDR form); blocks and unblocks propagate over cluster gossip
 
 4. **Connection Tracking & DoS Protection** ([pkg/smtp/](pkg/smtp/))
-   - `ConnectionTracker`: Local per-IP and global connection limits
+   - `AcceptLimiter` ([pkg/smtp/accept_limiter.go](pkg/smtp/accept_limiter.go)):
+     listener wrapper that applies `max_connections` / `max_connections_per_ip`
+     to open sockets at accept, before EHLO. Everything below only starts at
+     EHLO (go-smtp calls `NewSession` from the greeting), so without it a peer
+     that never greets is uncounted. Sits under PROXY protocol and TLS; trusted
+     proxies are exempt from the per-IP count
+   - Every per-IP limit here keys IPv6 on the /64 (`bucketIP`), like the auth
+     limiter: accept limiter, both trackers, and the rate limiter's IP key
+   - `ConnectionTracker`: Local per-IP and global connection limits. Slots are
+     `ConnLease`s held by the session: the reaper may take a slot, after which
+     the session's own release is a no-op (never release by address when a
+     lease is at hand)
    - `DistributedTracker`: Cluster-wide connection tracking via gossip + S3 sync
    - `RateLimiter`: Multi-dimensional rate limiting (IP, FROM, FROM_DOMAIN, TO, TO_DOMAIN, AUTHENTICATED_USER) with optional gossip
 
@@ -379,7 +393,9 @@ Key packages:
   - **"reject"** (default for submission): Reject emails missing Date or Message-ID headers
   - **"fix"** (default for relay): Add missing headers before forwarding
   - **"none"**: Allow through without modification
-- `allow_null_sender`: Allow bounce messages with null sender `<>` (typically false for submission, true for relay)
+- The null sender `<>` is accepted on relay servers (bounces need it) unless
+  `junk.reject_null_sender` is set. On submission it goes through `allowed_from`
+  like any sender, which refuses it. There is no separate setting
 
 **Injected Headers Configuration:**
 - Per-server `[[server]]` toggles for the X-Mizu-* headers added before
@@ -392,6 +408,19 @@ Key packages:
   - `enable_junk_header`: `X-Mizu-Junk` — governs only this header;
     `junk.apply_action` adds its own marker (e.g. `X-Spam`) independently, and
     rspamd's forwarded `add_headers` (X-Migadu-*) bypass these toggles entirely
+  - `enable_envelope_to_header` decides who stamps `X-Envelope-To`, and with
+    it the shape of delivery (`deliverSynchronous`). On (default): Mizu stamps
+    it, which needs a copy per recipient, so one POST per recipient - works
+    with any backend. Off: ONE POST for the whole message with every recipient
+    in `X-Mail-To` (comma-separated), all-or-nothing as far as the sender can
+    tell; only for a backend that splits `X-Mail-To` and stamps the header
+    itself (mailqueuer does, at delivery). A sender-supplied `X-Envelope-To`
+    is stripped either way
+  - Any `X-Mizu-*` header the sender supplied is stripped first
+    (`stripHeaderPrefix` in `InjectMizuHeaders`), whatever the toggles:
+    otherwise, with `enable_auth_results_header` off, mailqueuer would record a
+    forged verdict as Mizu's. Contract modeled in mailqueuer's
+    `spec/Mailqueuer/Auth.lean`
 - Replaced the former all-or-nothing `disable_mizu_headers` (forward-only, no
   fallback). Unknown/stale config keys produce a startup stderr warning
   (`warnUndecodedKeys` in [pkg/config/loader.go](pkg/config/loader.go))
@@ -514,6 +543,12 @@ Key packages:
   - `auth_session.go` checks the error **first**, so an implementation that
     signals a rejection with an error can only ever be too lenient, never too
     harsh.
+  - A wrong password is returned as an error wrapping `ErrCredentialRejected`
+    ([pkg/smtp/auth.go](pkg/smtp/auth.go)). The reply is still 454, but that
+    sentinel is what makes `auth_session.go` record the attempt with the
+    `AuthRateLimiter`; a plain error (backend failure, 403) is never counted.
+    Drop the sentinel and password guessing against existing accounts becomes
+    unlimited again.
   - Known trade-off: 535 vs 454 is a mailbox-enumeration oracle on the
     submission port, accepted so clients can distinguish "no such address" from
     "server down". The `AuthRateLimiter` tiers bound the probing.
@@ -576,6 +611,12 @@ Key packages:
     signature.
   - With an empty `allowed_from`, the fallback compares MAIL FROM against the
     **identity**, never the raw login — a suffixed login is not an address.
+- MAIL FROM is authorized as the exact envelope address
+  (`normalizeEnvelopeSender`, `isPlainEnvelopeAddress`): never run
+  `extractEmail` on an envelope path, and addresses with `<`, `>` or more than
+  one `@` are refused. go-smtp unquotes `"<a@x>"@victim` into `<a@x>@victim`.
+- The credentials cache and the limiter key on the lowercased login; a cache
+  miss in `ResolveSender` refetches instead of rejecting.
 - Password verification happens **locally** (never send passwords over network)
 - Supports multiple password hashes per user (tries all until one matches)
 - URL supports `$email` and `$ip` placeholders for interpolation
@@ -734,7 +775,11 @@ telnet localhost 25
 - Multi-dimensional: Can combine keys (IP, FROM, FROM_DOMAIN, TO, TO_DOMAIN, AUTHENTICATED_USER)
 - Sliding window algorithm
 - Gossip-based cluster-wide enforcement (optional)
-- Whitelist support: IPs, domains, and senders can be exempted from ALL rate limit dimensions
+- Whitelist support: IPs are exempted from ALL rate limit dimensions. Sender
+  domains/addresses are exempted from all dimensions only on an authenticated
+  session (MAIL FROM verified via `allowed_from`); unauthenticated, MAIL FROM is
+  whatever the client typed, so a match lifts only the FROM / FROM_DOMAIN
+  dimensions. To let a relay peer past IP limits, whitelist its IPs
   - `whitelisted_ips`: IPs/CIDRs bypass rate limits (e.g., ["1.2.3.4", "10.0.0.0/8"])
   - `whitelisted_domains`: Entire sender domains bypass rate limits (e.g., ["trusted.com"])
   - `whitelisted_senders`: Specific sender addresses bypass rate limits (e.g., ["admin@example.com"])
@@ -745,6 +790,13 @@ telnet localhost 25
     automatically when the file changes on disk (`whitelist_reload_interval_seconds`, default 10).
     A missing/unreadable file logs a warning and is treated as empty until it appears.
     Implementation: [pkg/smtp/rate_limit_whitelist.go](pkg/smtp/rate_limit_whitelist.go) (atomic snapshot swap, lock-free read path)
+- Each dimension is checked and charged at exactly one SMTP stage
+  (`RateLimitStage`, `stageForKeys` in [pkg/smtp/rate_limiter.go](pkg/smtp/rate_limiter.go)),
+  so the unit of a limit follows from its keys: IP alone = connections
+  (charged at EHLO); any of FROM / FROM_DOMAIN / AUTHENTICATED_USER = messages
+  (charged at MAIL); any of TO / TO_DOMAIN = recipients (charged per RCPT).
+  A check that is refused charges nothing (all dimensions are checked before
+  any is incremented)
 - Configured via `smtp.rate_limit.dimensions` array
 
 ## Workflow Orchestration

@@ -886,3 +886,119 @@ func TestRewriteFromHeader_EmptyArgs(t *testing.T) {
 		t.Error("empty new address must be a no-op")
 	}
 }
+
+// A sender-supplied X-Mizu-* header (any case, folded or not) is dropped
+// before Mizu adds its own, whatever the toggles: with the auth-results
+// header off, mailqueuer would otherwise record a forged verdict. Body
+// lines are left alone.
+func TestInjectMizuHeaders_StripsForgedMizuHeaders(t *testing.T) {
+	forged := "From: sender@example.com\r\n" +
+		"X-Mizu-Authentication-Results: spf=pass dkim=pass dmarc=pass arc=pass\r\n" +
+		"x-mizu-junk: YES\r\n" +
+		"X-MIZU-TRACE-ID: forged\r\n" +
+		"X-Mizu-Custom: a\r\n\tfolded\r\n" +
+		"Subject: Test\r\n" +
+		"\r\n" +
+		"X-Mizu-Authentication-Results: in the body\r\n"
+	for _, toggles := range []config.HeaderToggles{
+		{},
+		{TraceID: true, AuthResults: true, Junk: true},
+	} {
+		out := InjectMizuHeaders(forged, "mail.example.com", "1.2.3.4:5678", "client.example.com",
+			"trace123", "TLS 1.3", nil, nil, nil, false, toggles, false, nil)
+		head, body, ok := strings.Cut(out, "\r\n\r\n")
+		if !ok {
+			t.Fatalf("no header/body separator:\n%s", out)
+		}
+		lower := strings.ToLower(head)
+		for _, gone := range []string{"spf=pass dkim=pass", "x-mizu-junk: yes", "forged", "x-mizu-custom", "\tfolded"} {
+			if strings.Contains(lower, gone) {
+				t.Errorf("toggles %+v: forged %q survived:\n%s", toggles, gone, head)
+			}
+		}
+		if n := strings.Count(lower, "x-mizu-authentication-results:"); n != b2i(toggles.AuthResults) {
+			t.Errorf("toggles %+v: %d auth-results lines, want %d:\n%s", toggles, n, b2i(toggles.AuthResults), head)
+		}
+		if !strings.Contains(head, "Subject: Test") || !strings.Contains(head, "From: sender@example.com") {
+			t.Errorf("toggles %+v: other headers lost:\n%s", toggles, head)
+		}
+		if body != "X-Mizu-Authentication-Results: in the body\r\n" {
+			t.Errorf("toggles %+v: body changed: %q", toggles, body)
+		}
+	}
+}
+
+func b2i(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func TestStripHeaderPrefix_Edges(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"", ""},
+		{"\r\nX-Mizu-A: body only\r\n", "\r\nX-Mizu-A: body only\r\n"},
+		{"X-Mizu-A: 1\r\n\tcont\r\n", ""},
+		{"X-Mizu-A: 1\r\n", ""},
+		{"Subject: s\r\nX-Mizu-A: 1", "Subject: s"},
+		{"Subject: s\r\nx-mizu-a: 1\r\n\r\nX-Mizu-B: body\r\n", "Subject: s\r\n\r\nX-Mizu-B: body\r\n"},
+		{"Subject: s\r\n\r\n", "Subject: s\r\n\r\n"},
+		{"X-Mizu-A: 1\r\n\r\nbody", "\r\nbody"},
+	}
+	for _, c := range cases {
+		if got := stripHeaderPrefix(c.in, "X-Mizu-"); got != c.want {
+			t.Errorf("stripHeaderPrefix(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// stripHeaderPrefixWhole is the previous implementation, which split the
+// whole message; stripHeaderPrefix must behave the same while splitting only
+// the header section.
+func stripHeaderPrefixWhole(rawEmail, prefix string) string {
+	lines := strings.Split(rawEmail, "\r\n")
+	result := make([]string, 0, len(lines))
+	skipping := false
+	for i, line := range lines {
+		if line == "" {
+			result = append(result, lines[i:]...)
+			break
+		}
+		if skipping {
+			if line[0] == ' ' || line[0] == '\t' {
+				continue
+			}
+			skipping = false
+		}
+		if len(line) >= len(prefix) && strings.EqualFold(line[:len(prefix)], prefix) {
+			skipping = true
+			continue
+		}
+		result = append(result, line)
+	}
+	return strings.Join(result, "\r\n")
+}
+
+func TestStripHeaderPrefix_MatchesWholeSplit(t *testing.T) {
+	parts := []string{"X-Mizu-A: 1", "x-mizu-b: 2", "\tcont", " cont", "Subject: s",
+		"X-Mizu", "From: a", "", "body", "X-Mizu-C: in body"}
+	seed := uint64(1)
+	next := func(n int) int {
+		seed = seed*6364136223846793005 + 1442695040888963407
+		return int((seed >> 33) % uint64(n))
+	}
+	for i := 0; i < 20000; i++ {
+		var lines []string
+		for j := next(8); j > 0; j-- {
+			lines = append(lines, parts[next(len(parts))])
+		}
+		msg := strings.Join(lines, "\r\n")
+		if next(2) == 0 {
+			msg += "\r\n"
+		}
+		if got, want := stripHeaderPrefix(msg, "X-Mizu-"), stripHeaderPrefixWhole(msg, "X-Mizu-"); got != want {
+			t.Fatalf("stripHeaderPrefix(%q) = %q, whole-message split gives %q", msg, got, want)
+		}
+	}
+}

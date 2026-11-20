@@ -1,10 +1,8 @@
 package smtp
 
 import (
-	"bytes"
-	"encoding/gob"
+	"encoding/json"
 	"log/slog"
-	"migadu/mizu/pkg/cluster"
 	"migadu/mizu/pkg/concurrency"
 	"net"
 	"net/netip"
@@ -51,15 +49,23 @@ type AuthRateLimitEvent struct {
 	// For USERNAME_* events
 	Username string
 
-	// For *_SUBNET events (gob tolerates the field being absent on old nodes,
-	// and old nodes drop the unknown event types with a warn)
+	// For *_SUBNET events
 	Subnet string
+}
+
+// AuthRateLimitCluster is what the auth rate limiter needs from the cluster.
+// Pass a per-server view (cluster.Cluster.Scoped) so that a node running
+// several submission servers keeps their blocks apart.
+type AuthRateLimitCluster interface {
+	BroadcastAuthRateLimit(data []byte) error
+	RegisterAuthRateLimitHandler(handler func(data []byte))
+	LocalNodeName() string
 }
 
 // ClusterAuthRateLimiter handles cluster synchronization for auth rate limiting
 type ClusterAuthRateLimiter struct {
 	limiter        *AuthRateLimiter
-	cluster        *cluster.Cluster
+	cluster        AuthRateLimitCluster
 	logger         *slog.Logger
 	broadcastQueue []AuthRateLimitEvent
 	queueMu        sync.Mutex
@@ -68,8 +74,8 @@ type ClusterAuthRateLimiter struct {
 }
 
 // NewClusterAuthRateLimiter creates a new cluster auth rate limiter
-func NewClusterAuthRateLimiter(limiter *AuthRateLimiter, clusterMgr *cluster.Cluster, logger *slog.Logger) *ClusterAuthRateLimiter {
-	nodeID := clusterMgr.LocalNode().Name
+func NewClusterAuthRateLimiter(limiter *AuthRateLimiter, clusterMgr AuthRateLimitCluster, logger *slog.Logger) *ClusterAuthRateLimiter {
+	nodeID := clusterMgr.LocalNodeName()
 
 	cl := &ClusterAuthRateLimiter{
 		limiter:        limiter,
@@ -352,19 +358,15 @@ func (c *ClusterAuthRateLimiter) broadcastRoutine() {
 	}
 }
 
-// encodeEvent encodes an event using gob
+// encodeEvent encodes an event as JSON. The gossip envelope
+// (cluster.GossipMessage) carries its payload as json.RawMessage, so the
+// payload must itself be JSON: the previous gob encoding made every envelope
+// fail to marshal and no auth rate-limit event was ever broadcast.
 func encodeEvent(event AuthRateLimitEvent) ([]byte, error) {
-	var buf bytes.Buffer
-	enc := gob.NewEncoder(&buf)
-	if err := enc.Encode(event); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
+	return json.Marshal(event)
 }
 
-// decodeEvent decodes an event using gob
+// decodeEvent decodes an event produced by encodeEvent.
 func decodeEvent(data []byte, event *AuthRateLimitEvent) error {
-	buf := bytes.NewBuffer(data)
-	dec := gob.NewDecoder(buf)
-	return dec.Decode(event)
+	return json.Unmarshal(data, event)
 }

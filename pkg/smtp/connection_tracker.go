@@ -17,7 +17,61 @@ const shardCount = 32
 type connectionShard struct {
 	mu            sync.RWMutex
 	ipConnections map[string]int
-	connTimes     map[string][]time.Time
+	leases        map[string][]*ConnLease // per IP, oldest first; len == ipConnections[ip]
+}
+
+// ConnLease is one connection slot handed out by ConnectionTracker.Acquire.
+//
+// A slot has an identity so that it can be given back exactly once. The reaper
+// force-releases slots older than MaxConnectionDuration; when the connection
+// that owned such a slot finally closes, its Release must be a no-op. With
+// address-keyed counters alone that second release took the slot of some
+// other, still-open connection, and the counters drifted below reality.
+type ConnLease struct {
+	ct         *ConnectionTracker
+	host       string
+	acquiredAt time.Time
+	released   bool // guarded by the shard mutex of host
+}
+
+// Release gives the slot back. It is idempotent, and a no-op for a lease the
+// reaper has already taken. Safe to call on a nil lease.
+func (l *ConnLease) Release() {
+	if l == nil {
+		return
+	}
+	shard := l.ct.getShard(l.host)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	l.ct.releaseLocked(shard, l)
+}
+
+// releaseLocked removes one lease and its counts. The shard mutex must be held.
+func (ct *ConnectionTracker) releaseLocked(shard *connectionShard, l *ConnLease) {
+	if l.released {
+		return
+	}
+	l.released = true
+
+	leases := shard.leases[l.host]
+	for i, candidate := range leases {
+		if candidate == l {
+			leases = append(leases[:i:i], leases[i+1:]...)
+			break
+		}
+	}
+
+	ct.totalConnections.Add(-1)
+	ct.generation.Add(1)
+
+	if len(leases) == 0 {
+		// Clean up map entries to prevent memory leak
+		delete(shard.leases, l.host)
+		delete(shard.ipConnections, l.host)
+		return
+	}
+	shard.leases[l.host] = leases
+	shard.ipConnections[l.host] = len(leases)
 }
 
 // ConnectionTracker tracks active connections globally and per-IP to enforce limits.
@@ -72,7 +126,7 @@ func NewConnectionTracker(maxConnections, maxConnectionsPerIP int, maxConnection
 	for i := 0; i < shardCount; i++ {
 		ct.shards[i] = &connectionShard{
 			ipConnections: make(map[string]int),
-			connTimes:     make(map[string][]time.Time),
+			leases:        make(map[string][]*ConnLease),
 		}
 	}
 
@@ -159,49 +213,33 @@ func (ct *ConnectionTracker) reapExpired() int {
 		shard := ct.shards[i]
 		shard.mu.Lock()
 
-		for ip, times := range shard.connTimes {
-			// Times are sorted oldest-first, so count expired from the front
-			expired := 0
-			for _, t := range times {
-				if t.Before(cutoff) {
-					expired++
-				} else {
+		for ip, leases := range shard.leases {
+			// Leases are ordered oldest-first, so the expired ones are a prefix.
+			var expired []*ConnLease
+			for _, l := range leases {
+				if !l.acquiredAt.Before(cutoff) {
 					break // All subsequent are newer
 				}
+				expired = append(expired, l)
+			}
+			if len(expired) == 0 {
+				continue
 			}
 
-			if expired > 0 {
-				if ct.logger != nil {
-					ct.logger.Warn("Force-releasing stale connections for IP",
-						"ip", ip,
-						"expired", expired,
-						"remaining", len(times)-expired,
-						"oldest", times[0].Format(time.RFC3339))
-				}
-
-				// Remove expired timestamps
-				shard.connTimes[ip] = times[expired:]
-
-				// Decrement counters
-				shard.ipConnections[ip] -= expired
-				ct.totalConnections.Add(-int32(expired))
-				ct.generation.Add(1)
-				reaped += expired
-
-				// Prevent negative counts (defensive)
-				if shard.ipConnections[ip] < 0 {
-					shard.ipConnections[ip] = 0
-				}
-				if ct.totalConnections.Load() < 0 {
-					ct.totalConnections.Store(0)
-				}
-
-				// Clean up empty entries
-				if shard.ipConnections[ip] <= 0 {
-					delete(shard.ipConnections, ip)
-					delete(shard.connTimes, ip)
-				}
+			if ct.logger != nil {
+				ct.logger.Warn("Force-releasing stale connections for IP",
+					"ip", ip,
+					"expired", len(expired),
+					"remaining", len(leases)-len(expired),
+					"oldest", expired[0].acquiredAt.Format(time.RFC3339))
 			}
+
+			// Marking each lease released is what makes the owner's eventual
+			// Release a no-op instead of a second decrement.
+			for _, l := range expired {
+				ct.releaseLocked(shard, l)
+			}
+			reaped += len(expired)
 		}
 		shard.mu.Unlock()
 	}
@@ -215,81 +253,49 @@ func (ct *ConnectionTracker) getTotalConnections() int {
 	return int(ct.totalConnections.Load())
 }
 
-// TryAcquire attempts to acquire a connection slot for the given remote address.
-// Returns nil on success, or an error if limits are exceeded.
-func (ct *ConnectionTracker) TryAcquire(remoteAddr string) error {
+// Acquire attempts to acquire a connection slot for the given remote address
+// and returns the lease that owns it. Release the lease when the connection
+// ends.
+func (ct *ConnectionTracker) Acquire(remoteAddr string) (*ConnLease, error) {
 	// Extract IP from address (format: "IP:port" or "[IPv6]:port")
 	host, _, err := net.SplitHostPort(remoteAddr)
 	if err != nil {
 		// If no port, assume it's just an IP
 		host = remoteAddr
 	}
+	// Per-IP limits key IPv6 on the /64: one allocation is 2^64 addresses,
+	// each of which would otherwise get its own budget.
+	host = bucketIP(host)
 
 	// Check global connection limit (lock-free check first)
 	if ct.maxConnections > 0 && int(ct.totalConnections.Load()) >= ct.maxConnections {
-		return fmt.Errorf("maximum total connections reached (%d)", ct.maxConnections)
+		return nil, fmt.Errorf("maximum total connections reached (%d)", ct.maxConnections)
 	}
 
 	shard := ct.getShard(host)
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
-	// Double-check global limit under lock?
-	// No, totalConnections is atomic, but there's a race where we might go slightly over.
-	// That's usually acceptable for performance.
-	// If strict enforcement is needed, we'd need a global lock or CAS loop, but that defeats sharding.
-	// We'll stick to the atomic check above.
+	// The global limit is not re-checked under the shard lock: totalConnections
+	// is atomic, so concurrent acquires on different shards can overshoot it
+	// slightly. Strict enforcement would need a global lock, defeating sharding.
 
 	// Check per-IP connection limit
 	if ct.maxConnectionsPerIP > 0 {
 		currentIPConns := shard.ipConnections[host]
 		if currentIPConns >= ct.maxConnectionsPerIP {
-			return fmt.Errorf("maximum connections per IP reached (%d)", ct.maxConnectionsPerIP)
+			return nil, fmt.Errorf("maximum connections per IP reached (%d)", ct.maxConnectionsPerIP)
 		}
 	}
 
 	// Acquire connection slot
+	lease := &ConnLease{ct: ct, host: host, acquiredAt: time.Now()}
 	ct.totalConnections.Add(1)
 	ct.generation.Add(1)
-	shard.ipConnections[host]++
-	shard.connTimes[host] = append(shard.connTimes[host], time.Now())
+	shard.leases[host] = append(shard.leases[host], lease)
+	shard.ipConnections[host] = len(shard.leases[host])
 
-	return nil
-}
-
-// Release releases a connection slot for the given remote address.
-// This should be called when a connection is closed, typically in a defer statement.
-func (ct *ConnectionTracker) Release(remoteAddr string) {
-	// Extract IP from address
-	host, _, err := net.SplitHostPort(remoteAddr)
-	if err != nil {
-		host = remoteAddr
-	}
-
-	shard := ct.getShard(host)
-	shard.mu.Lock()
-	defer shard.mu.Unlock()
-
-	// Release connection slot
-	if ct.totalConnections.Load() > 0 {
-		ct.totalConnections.Add(-1)
-	}
-	ct.generation.Add(1)
-
-	if count, exists := shard.ipConnections[host]; exists && count > 0 {
-		shard.ipConnections[host]--
-
-		// Remove the oldest timestamp for this IP (FIFO)
-		if times := shard.connTimes[host]; len(times) > 0 {
-			shard.connTimes[host] = times[1:]
-		}
-
-		// Clean up map entries if count reaches zero to prevent memory leak
-		if shard.ipConnections[host] == 0 {
-			delete(shard.ipConnections, host)
-			delete(shard.connTimes, host)
-		}
-	}
+	return lease, nil
 }
 
 // GetStats returns current connection statistics.
@@ -327,6 +333,7 @@ func (ct *ConnectionTracker) GetTotalCount() int {
 // GetCountForIP returns the current connection count for a specific IP.
 // This is more efficient than GetStats() when you only need one IP's count.
 func (ct *ConnectionTracker) GetCountForIP(ip string) int {
+	ip = bucketIP(ip)
 	shard := ct.getShard(ip)
 	shard.mu.RLock()
 	defer shard.mu.RUnlock()

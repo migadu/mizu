@@ -14,7 +14,6 @@ import (
 	"net"
 	net_http "net/http"
 	"net/mail"
-	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -210,6 +209,11 @@ type Backend struct {
 // The asymmetry is deliberate: err is checked first, so an implementation that
 // signals a rejection with an error can only ever be too lenient (a 4xx), never
 // too harsh. Only return (false, nil) when the account itself is absent.
+//
+// A wrong password is still an error, but one that wraps ErrCredentialRejected:
+// the reply stays a temporary 454, and the session records the attempt as a
+// failure with the auth rate limiter. Errors that do not wrap it (backend
+// failures, denied accounts) are not counted.
 type Authenticator interface {
 	Authenticate(username, password string) (bool, error)
 	CanSendAs(authenticatedUser, fromAddress string) bool
@@ -294,7 +298,7 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 	sessionCreated := false
 
 	// Check rate limit (prevent rapid connection attempts)
-	// At this point, we only have IP information, so only IP-based dimensions will be checked
+	// Connect stage: charges the dimensions keyed on the peer address alone.
 	if be.RateLimiter != nil {
 		sessionCtx := SessionContext{
 			RemoteAddr: remoteAddr,
@@ -319,12 +323,23 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 	}
 
 	// Check connection limits (DoS protection)
-	// Use distributed tracker if available, otherwise fall back to local tracker
-	tracker := be.ConnTracker
-	if be.DistTracker != nil {
-		// Distributed tracker wraps local tracker
-		if err := be.DistTracker.TryAcquire(remoteAddr); err != nil {
-			be.Logger.Info("Rejecting connection - distributed connection limit exceeded",
+	// Use distributed tracker if available, otherwise fall back to local tracker.
+	// The slot is a lease owned by the session: Logout gives it back, and if the
+	// reaper has already taken it by then, that release is a no-op rather than a
+	// second decrement.
+	var connLease *ConnLease
+	if be.DistTracker != nil || be.ConnTracker != nil {
+		var err error
+		limitKind := "connection limit exceeded"
+		if be.DistTracker != nil {
+			// Distributed tracker wraps local tracker
+			limitKind = "distributed connection limit exceeded"
+			connLease, err = be.DistTracker.Acquire(remoteAddr)
+		} else {
+			connLease, err = be.ConnTracker.Acquire(remoteAddr)
+		}
+		if err != nil {
+			be.Logger.Info("Rejecting connection - "+limitKind,
 				"server", be.ServerConfig.Name,
 				"remote_addr", remoteAddr,
 				"error", err)
@@ -337,25 +352,7 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 		// Ensure connection is released if we fail to create session
 		defer func() {
 			if !sessionCreated {
-				be.DistTracker.Release(remoteAddr)
-			}
-		}()
-	} else if tracker != nil {
-		if err := tracker.TryAcquire(remoteAddr); err != nil {
-			be.Logger.Info("Rejecting connection - connection limit exceeded",
-				"server", be.ServerConfig.Name,
-				"remote_addr", remoteAddr,
-				"error", err)
-			return nil, &smtp.SMTPError{
-				Code:         421,
-				EnhancedCode: smtp.EnhancedCode{4, 3, 2},
-				Message:      "too many connections, please try again later",
-			}
-		}
-		// Ensure connection is released if we fail to create session
-		defer func() {
-			if !sessionCreated {
-				tracker.Release(remoteAddr)
+				connLease.Release()
 			}
 		}()
 	}
@@ -420,9 +417,9 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 	if be.DistTracker != nil {
 		activeConnections = be.DistTracker.GetTotalCount()
 		connectionsFromIP = be.DistTracker.GetCountForIP(remoteAddr)
-	} else if tracker != nil {
-		activeConnections = tracker.GetTotalCount()
-		connectionsFromIP = tracker.GetCountForIP(remoteAddr)
+	} else if be.ConnTracker != nil {
+		activeConnections = be.ConnTracker.GetTotalCount()
+		connectionsFromIP = be.ConnTracker.GetCountForIP(remoteAddr)
 	}
 
 	be.Logger.Info("Client connected",
@@ -598,17 +595,23 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 				}
 
 				// Check hostname whitelist (PTR suffix match)
-				if !isWhitelisted && ptrRecord != "" {
-					for _, whitelistHost := range be.ServerConfig.Reputation.WhitelistHosts {
-						if be.matchHostWhitelist(ptrRecord, whitelistHost) {
-							be.Logger.Info("Hostname is whitelisted - skipping reputation check",
-								"server", be.ServerConfig.Name,
-								"remote_addr", remoteAddr,
-								"remote_host", ptrRecord,
-								"whitelist_host", whitelistHost)
-							isWhitelisted = true
-							break
-						}
+				if !isWhitelisted && ptrRecord != "" && len(be.ServerConfig.Reputation.WhitelistHosts) > 0 {
+					fwdCtx, fwdCancel := context.WithTimeout(context.Background(), time.Duration(be.GlobalConfig.DNS.TimeoutSeconds)*time.Second)
+					// Cached when possible: this runs on every EHLO from the
+					// highest-volume (whitelisted) senders.
+					lookupHost := be.DNSResolver.LookupHost
+					if be.DNSCache != nil {
+						lookupHost = be.DNSCache.LookupHost
+					}
+					whitelistHost, ok := be.ptrWhitelisted(fwdCtx, ptrRecord, ip, be.ServerConfig.Reputation.WhitelistHosts, lookupHost)
+					fwdCancel()
+					if ok {
+						be.Logger.Info("Hostname is whitelisted - skipping reputation check",
+							"server", be.ServerConfig.Name,
+							"remote_addr", remoteAddr,
+							"remote_host", ptrRecord,
+							"whitelist_host", whitelistHost)
+						isWhitelisted = true
 					}
 				}
 
@@ -685,6 +688,7 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 		dnsResolver:        be.DNSResolver,
 		dnsCache:           be.DNSCache,
 		connTracker:        be.ConnTracker,
+		connLease:          connLease,
 		distTracker:        be.DistTracker,
 		rateLimiter:        be.RateLimiter,
 		metrics:            be.Metrics,
@@ -773,6 +777,38 @@ func (be *Backend) matchHostWhitelist(ptrHost string, whitelistHost string) bool
 	return strings.HasSuffix(ptrHost, "."+whitelistHost)
 }
 
+// ptrWhitelisted reports whether a client's PTR name earns the reputation
+// whitelist, returning the entry it matched.
+//
+// The PTR name alone is not evidence: the owner of an IP controls its reverse
+// zone and can make it claim any name. It only counts once the name resolves
+// forward to the same address (forward-confirmed reverse DNS). The forward
+// lookup is done only for names that match the whitelist, so it costs nothing
+// for ordinary connections; a failed lookup means "not confirmed".
+func (be *Backend) ptrWhitelisted(ctx context.Context, ptrHost string, clientIP net.IP, whitelistHosts []string, lookupHost func(context.Context, string) ([]string, error)) (string, bool) {
+	matched := ""
+	for _, whitelistHost := range whitelistHosts {
+		if be.matchHostWhitelist(ptrHost, whitelistHost) {
+			matched = whitelistHost
+			break
+		}
+	}
+	if matched == "" || clientIP == nil {
+		return "", false
+	}
+
+	addrs, err := lookupHost(ctx, strings.TrimSuffix(ptrHost, "."))
+	if err != nil {
+		return "", false
+	}
+	for _, addr := range addrs {
+		if parsed := net.ParseIP(addr); parsed != nil && parsed.Equal(clientIP) {
+			return matched, true
+		}
+	}
+	return "", false
+}
+
 // Session represents an active SMTP session for an incoming email.
 // It tracks the SMTP conversation state and enforces protocol requirements.
 type Session struct {
@@ -783,7 +819,6 @@ type Session struct {
 	from           string                 // Sender's email address (MAIL FROM)
 	to             []string               // Recipient email addresses (RCPT TO)
 	remoteAddr     string                 // Remote IP:port of the client
-	mailData       bytes.Buffer           // Buffer to store the raw email body
 	serverConfig   *config.ServerConfig   // Server-specific configuration (this server instance)
 	globalConfig   *config.Config         // Global configuration (shared across servers)
 	tlsState       *tls.ConnectionState   // TLS connection state (nil if not using TLS)
@@ -793,6 +828,7 @@ type Session struct {
 	dnsResolver    *net.Resolver          // DNS resolver (custom or system default)
 	dnsCache       *dns.CachingWrapper    // Caching wrapper around dnsResolver (preferred for TXT/MX lookups)
 	connTracker    *ConnectionTracker     // Connection tracker for DoS protection
+	connLease      *ConnLease             // This session's connection slot (nil when no tracker is configured)
 	distTracker    *DistributedTracker    // Distributed connection tracker (optional, for cluster-wide limits)
 	rateLimiter    *RateLimiter           // Multi-dimensional rate limiter
 	metrics        *metrics.Metrics       // Prometheus metrics for observability
@@ -891,6 +927,13 @@ func (s *Session) Helo(hostname string) error {
 		}
 	}
 
+	// Control bytes are refused on every server type and in every mode: this
+	// is not a hostname-shape rule, so the helo_validation toggle does not
+	// govern it.
+	if err := s.rejectHeloControlBytes(hostname); err != nil {
+		return err
+	}
+
 	// Validate HELO hostname for security (skip in local development mode
 	// or when HELO validation is explicitly disabled via helo_validation = false)
 	if !s.globalConfig.Local && s.heloValidationEnabled() {
@@ -924,6 +967,50 @@ func (s *Session) heloValidationEnabled() bool {
 		return *s.serverConfig.HELOValidation
 	}
 	return !s.serverConfig.IsSubmission()
+}
+
+// rejectHeloControlBytes refuses a HELO/EHLO argument containing an ASCII
+// control character (0x00-0x1F, 0x7F). go-smtp passes the argument through
+// unfiltered, and no legitimate client sends one. It runs unconditionally -
+// unlike validateHeloHostname, which judges the hostname's shape and is off by
+// default on submission - because the name is reused downstream (rspamd
+// request header, logs, validation URLs) where such a byte does damage: it
+// used to abort the rspamd request, and the spam check fails open.
+// Bytes >= 0x80 are deliberately allowed: Windows clients send non-ASCII
+// machine names.
+func (s *Session) rejectHeloControlBytes(hostname string) error {
+	for i := 0; i < len(hostname); i++ {
+		if c := hostname[i]; c < 0x20 || c == 0x7f {
+			s.Logger.Warn("Rejecting HELO/EHLO - control character", "hostname", hostname)
+			return &smtp.SMTPError{
+				Code:         501,
+				EnhancedCode: smtp.EnhancedCode{5, 5, 2},
+				Message:      "invalid characters in HELO hostname",
+			}
+		}
+	}
+	return nil
+}
+
+// rejectEnvelopeControlBytes refuses a MAIL FROM / RCPT TO address containing
+// an ASCII control character (0x00-0x1F, 0x7F). go-smtp's address parser
+// accepts any byte, and the envelope is reused downstream - above all as HTTP
+// header values on delivery, where net/http refuses to send such a byte: the
+// message could then never be delivered, and each attempt counted against the
+// delivery circuit breaker. No valid address contains one. Bytes >= 0x80 are
+// allowed (SMTPUTF8).
+func (s *Session) rejectEnvelopeControlBytes(command, address string) error {
+	for i := 0; i < len(address); i++ {
+		if c := address[i]; c < 0x20 || c == 0x7f {
+			s.Logger.Warn("Rejecting "+command+" - control character in address", "address", address)
+			return &smtp.SMTPError{
+				Code:         553,
+				EnhancedCode: smtp.EnhancedCode{5, 1, 3},
+				Message:      "invalid characters in address",
+			}
+		}
+	}
+	return nil
 }
 
 // validateHeloHostname checks a HELO/EHLO hostname for security issues.
@@ -1098,6 +1185,10 @@ func (s *Session) commandContext(ctx context.Context) (context.Context, context.
 // Mail is called for the MAIL FROM command.
 // This sets the envelope sender for the SMTP transaction.
 func (s *Session) Mail(ctx context.Context, from string, opts *smtp.MailOptions) error {
+	if err := s.rejectEnvelopeControlBytes("MAIL FROM", from); err != nil {
+		return err
+	}
+
 	// Reject null sender <> (bounce messages) to prevent backscatter
 	// Check this FIRST before any other processing for security
 	if s.serverConfig.Junk.RejectNullSender && (from == "" || from == "<>") {
@@ -1115,6 +1206,9 @@ func (s *Session) Mail(ctx context.Context, from string, opts *smtp.MailOptions)
 		if heloHostname != "" && s.helo == "" {
 			// EHLO was handled by go-smtp internally — run the same
 			// validation that the explicit Helo() path uses.
+			if err := s.rejectHeloControlBytes(heloHostname); err != nil {
+				return err
+			}
 			if !s.globalConfig.Local && s.heloValidationEnabled() {
 				if err := s.validateHeloHostname(heloHostname); err != nil {
 					return err
@@ -1184,7 +1278,7 @@ func (s *Session) Mail(ctx context.Context, from string, opts *smtp.MailOptions)
 				Message:      "sender address rejected: not allowed",
 			}
 		}
-		if resolved != "" && resolved != extractEmail(from) {
+		if resolved != "" && resolved != normalizeEnvelopeSender(from) {
 			s.Logger.Info("Rewrote sender to authenticated identity",
 				"user", s.authenticatedUser,
 				"from", from,
@@ -1365,14 +1459,14 @@ func (s *Session) Mail(ctx context.Context, from string, opts *smtp.MailOptions)
 	s.from = from
 	s.commandState = stateMail
 
-	// Check rate limits now that we have FROM information
-	// This allows FROM, FROM_DOMAIN, AUTHENTICATED_USER, and IP+FROM combination checks
+	// Mail stage: charges the dimensions keyed on the sender or the login
+	// (with or without IP), once per message.
 	if s.rateLimiter != nil {
 		sessionCtx := SessionContext{
 			RemoteAddr:        s.remoteAddr,
 			From:              from,
-			To:                s.to, // May be empty at this point
 			AuthenticatedUser: s.authenticatedUser,
+			Stage:             StageMail,
 		}
 		if err := s.rateLimiter.CheckRateLimit(sessionCtx); err != nil {
 			s.Logger.Warn("Rate limit exceeded for sender", "from", from, "error", err)
@@ -1401,6 +1495,9 @@ func (s *Session) Mail(ctx context.Context, from string, opts *smtp.MailOptions)
 // Rcpt is called for the RCPT TO command.
 // This validates and adds recipients to the envelope.
 func (s *Session) Rcpt(ctx context.Context, to string, opts *smtp.RcptOptions) error {
+	if err := s.rejectEnvelopeControlBytes("RCPT TO", to); err != nil {
+		return err
+	}
 	// Set timeout for this command
 	if err := s.setCommandTimeout(ProcessingTimeout); err != nil {
 		return err
@@ -1464,13 +1561,16 @@ func (s *Session) Rcpt(ctx context.Context, to string, opts *smtp.RcptOptions) e
 	// Check rate limits now that we have TO information
 	// This allows TO, TO_DOMAIN, FROM+TO, AUTHENTICATED_USER, and other recipient-based combination checks
 	if s.rateLimiter != nil {
-		// Include the candidate recipient for rate limit evaluation.
-		// Use slices.Concat to avoid mutating s.to's underlying array.
+		// Evaluate the recipient being added, and only that one. The TO and
+		// TO_DOMAIN keys are built from SessionContext.To[0]; passing the whole
+		// recipient list keyed every RCPT on the transaction's FIRST recipient,
+		// so a throwaway address up front exempted everyone after it.
 		sessionCtx := SessionContext{
 			RemoteAddr:        s.remoteAddr,
 			From:              s.from,
-			To:                slices.Concat(s.to, []string{to}),
+			To:                []string{to},
 			AuthenticatedUser: s.authenticatedUser,
+			Stage:             StageRcpt,
 		}
 		if err := s.rateLimiter.CheckRateLimit(sessionCtx); err != nil {
 			s.Logger.Warn("Rate limit exceeded for recipient", "to", to, "error", err)
@@ -1556,7 +1656,6 @@ func (s *Session) Data(ctx context.Context, r io.Reader) (err error) {
 	if err != nil {
 		return err
 	}
-	defer s.mailData.Reset() // Ensure buffer is cleared after processing.
 
 	// 1b. If MAIL FROM was resolved to a different address (a master/token
 	// login that presented its own login string as the sender), bring the From
@@ -1639,12 +1738,35 @@ func (s *Session) readMessageData(r io.Reader) (string, error) {
 	if maxSize > 0 {
 		reader = io.LimitReader(reader, maxSize+1)
 	}
-	n, err := io.Copy(&s.mailData, reader)
+	// The buffer is local to this message. It used to live on the session,
+	// where Reset kept its capacity: one large message stayed pinned for the
+	// life of the connection.
+	var mailData bytes.Buffer
+	n, err := io.Copy(&mailData, reader)
 	if err != nil {
-		// A 552 (message exceeds MaxMessageBytes) from the underlying reader is
-		// returned as-is so the client receives the correct SMTP status.
-		s.Logger.Error("Failed to read message data", "error", err)
-		return "", err
+		// A deliberate reply from the underlying reader (552, message exceeds
+		// MaxMessageBytes) is returned as-is, and so is a BDAT transfer the
+		// client aborted with RSET: the connection is still in sync.
+		var smtpErr *smtp.SMTPError
+		if errors.As(err, &smtpErr) || errors.Is(err, smtp.ErrDataReset) {
+			s.Logger.Warn("Message data not accepted", "error", err)
+			return "", err
+		}
+		// Anything else is the transport failing mid-body: the client stalled
+		// past the block timeout, the session deadline passed, or the peer
+		// went away. That is temporary (go-smtp would turn a raw error into a
+		// permanent 554 carrying the socket error text), and the stream
+		// position is now unknown - whatever the client sends next is body,
+		// not commands - so the connection must not be reused.
+		s.Logger.Warn("Failed to read message data - closing connection", "error", err)
+		if s.netConn != nil {
+			_ = s.netConn.Close()
+		}
+		return "", &smtp.SMTPError{
+			Code:         421,
+			EnhancedCode: smtp.EnhancedCode{4, 4, 2},
+			Message:      "error reading message data, closing connection",
+		}
 	}
 	if maxSize > 0 && n > maxSize {
 		s.Logger.Warn("Rejecting message - exceeds maximum size",
@@ -1662,7 +1784,7 @@ func (s *Session) readMessageData(r io.Reader) (string, error) {
 	// message using lone-LF line endings smuggle a forged header (e.g.
 	// X-Envelope-To) past stripHeader and bypass mail-loop counting. A
 	// compliant client already sends CRLF, so this is a no-op for them.
-	rawEmail := normalizeToCRLF(s.mailData.String())
+	rawEmail := normalizeToCRLF(mailData.String())
 
 	// Record message received and size in metrics
 	if s.metrics != nil {
@@ -2047,47 +2169,60 @@ func (s *Session) deliverMessage(ctx context.Context, rawEmail string) error {
 	return s.deliverSynchronous(ctx, emailWithHeaders)
 }
 
-// deliverSynchronous handles synchronous delivery
+// deliverSynchronous hands the message to the delivery backend. How depends
+// on who stamps X-Envelope-To (enable_envelope_to_header):
+//
+// Mizu stamps it (default): each recipient needs its own copy, so there is one
+// request per recipient, stopping at the first failure. SMTP gives a single
+// reply to DATA, so a failure on a later recipient makes the sender retry them
+// all - a duplicate for those already delivered, unless the backend
+// deduplicates - or bounces a message some have received.
+//
+// The backend stamps it: ONE request carries every recipient (X-Mail-To,
+// comma-separated). That is all-or-nothing as far as the sender can tell; the
+// backend publishes per recipient, and a retry of a partly published request
+// publishes only what is missing. The shared body carries no X-Envelope-To.
+//
+// A sender-supplied X-Envelope-To never gets through in either mode, or it
+// would stand as the envelope recipient.
 func (s *Session) deliverSynchronous(ctx context.Context, signedEmail string) error {
-	// Per-recipient POST to Mailqueuer. Each request is atomic: one recipient,
-	// one queue message, one S3 object. On first failure, stop and return the
-	// error — the sending MTA will retry all recipients.
-	for _, recipient := range s.to {
-		if err := s.deliverToRecipient(ctx, signedEmail, recipient); err != nil {
-			return err
+	if s.serverConfig.HeaderToggles().EnvelopeTo {
+		for _, recipient := range s.to {
+			if err := s.deliverRequest(ctx, addEnvelopeToHeader(signedEmail, recipient), []string{recipient}); err != nil {
+				return err
+			}
 		}
+	} else if err := s.deliverRequest(ctx, stripHeader(signedEmail, "X-Envelope-To"), s.to); err != nil {
+		return err
 	}
 
 	s.Logger.Info("Successfully delivered message to destination", "recipients", len(s.to))
 	return nil
 }
 
-func (s *Session) deliverToRecipient(ctx context.Context, signedEmail string, recipient string) error {
-	// Check recipient cache first (if distributed tracking is enabled)
+// deliverRequest sends one delivery request for the given recipients and maps
+// its failure to an SMTP reply.
+func (s *Session) deliverRequest(ctx context.Context, email string, recipients []string) error {
+	// A recipient the backend recently reported as unknown fails the request
+	// before anything is sent (only with distributed tracking enabled).
 	if s.distTracker != nil {
-		if found, isBlocked, reason := s.distTracker.IsRecipientCached(recipient); found {
-			s.Logger.Info(fmt.Sprintf("Recipient %s found in cache: %s", recipient, reason))
-			if isBlocked {
-				return &smtp.SMTPError{Code: 550, EnhancedCode: smtp.EnhancedCode{5, 7, 1}, Message: "Recipient blocked by destination"}
+		for _, recipient := range recipients {
+			if s.distTracker.IsRecipientCached(recipient) {
+				s.Logger.Info(fmt.Sprintf("Recipient %s found in cache: recipient not found (cached)", recipient))
+				return &smtp.SMTPError{Code: 550, EnhancedCode: smtp.EnhancedCode{5, 1, 1}, Message: "Recipient not found"}
 			}
-			return &smtp.SMTPError{Code: 550, EnhancedCode: smtp.EnhancedCode{5, 1, 1}, Message: "Recipient not found"}
 		}
 	}
 
-	// Add the X-Envelope-To header for this specific recipient. Delivery is
-	// per-recipient, so each delivered copy carries exactly the envelope
-	// recipient it was sent for.
-	emailForRecipient := addEnvelopeToHeader(signedEmail, recipient)
-
 	err := poster.PostEmailToDestinationWithContext(
 		ctx,
-		emailForRecipient,
+		email,
 		s.serverConfig.Delivery.URL,
 		s.serverConfig.Delivery.AuthToken,
 		s.serverConfig.Delivery.MaxRetryAttempts,
 		s.isJunk,
 		s.from,
-		recipient,
+		strings.Join(recipients, ","), // a comma inside an address is refused at RCPT
 		s.traceID,
 		s.authenticatedUser,
 		s.circuitBreaker,
@@ -2097,7 +2232,7 @@ func (s *Session) deliverToRecipient(ctx context.Context, signedEmail string, re
 	)
 
 	if err != nil {
-		s.Logger.Error(fmt.Sprintf("Failed to deliver message for recipient %s: %v", recipient, err))
+		s.Logger.Error(fmt.Sprintf("Failed to deliver message for %v: %v", recipients, err))
 
 		var httpErr *poster.HTTPStatusError
 		if errors.As(err, &httpErr) {
@@ -2110,12 +2245,19 @@ func (s *Session) deliverToRecipient(ctx context.Context, signedEmail string, re
 			}
 
 			if httpErr.IsRecipientNotFound() && s.distTracker != nil && s.distTracker.recipientCacheTTL > 0 {
-				s.distTracker.CacheRecipientNotFound(recipient)
+				// The verdict is for the request. It can be pinned on a
+				// recipient - and cached - only when there was just one.
+				if len(recipients) == 1 {
+					s.distTracker.CacheRecipientNotFound(recipients[0])
+				}
 				return &smtp.SMTPError{Code: 550, EnhancedCode: smtp.EnhancedCode{5, 1, 1}, Message: "Recipient not found"}
 			}
 
-			if httpErr.IsRecipientBlocked() && s.distTracker != nil && s.distTracker.recipientCacheTTL > 0 {
-				s.distTracker.CacheRecipientBlocked(recipient)
+			// A 403 refuses THIS delivery (a recipient blocking a sender). It
+			// is answered permanently but never cached: the next sender to
+			// the same recipient must get its own verdict. It does not depend
+			// on the recipient cache being enabled.
+			if httpErr.IsRecipientBlocked() {
 				return &smtp.SMTPError{Code: 550, EnhancedCode: smtp.EnhancedCode{5, 7, 1}, Message: "Recipient blocked by destination"}
 			}
 
@@ -2434,7 +2576,6 @@ func (s *Session) Reset() {
 	s.from = ""
 	s.senderIdentity = ""
 	s.to = make([]string, 0)
-	s.mailData.Reset()
 	s.commandState = stateHelo // After reset, we're back to post-HELO state
 	s.isJunk = false
 	s.junkReasons = nil
@@ -2472,11 +2613,9 @@ func (s *Session) Logout() error {
 
 			// Release connection slot for DoS protection.
 			// Prefer distributed tracker for cluster-wide coordination.
-			if s.distTracker != nil {
-				s.distTracker.Release(s.remoteAddr)
-			} else if s.connTracker != nil {
-				s.connTracker.Release(s.remoteAddr)
-			}
+			// The lease, not the address, identifies the slot: if the
+			// reaper already took it, this is a no-op.
+			s.connLease.Release()
 
 			// Signal that this session has completed (for graceful shutdown).
 			if s.sessionsWg != nil {

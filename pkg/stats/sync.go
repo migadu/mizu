@@ -93,26 +93,13 @@ func (m *Manager) syncFromServer(ctx context.Context, s3Client *s3.Client, bucke
 	}
 	defer result.Body.Close()
 
-	// Read and decompress
-	gzReader, err := gzip.NewReader(result.Body)
+	remoteStats, err := decodeStatsExport(result.Body)
 	if err != nil {
-		return 0, fmt.Errorf("failed to create gzip reader: %w", err)
-	}
-	defer gzReader.Close()
-
-	var buf bytes.Buffer
-	if _, err := io.Copy(&buf, gzReader); err != nil {
-		return 0, fmt.Errorf("failed to decompress: %w", err)
-	}
-
-	// Parse JSON
-	var remoteStats StatsExport
-	if err := json.Unmarshal(buf.Bytes(), &remoteStats); err != nil {
-		return 0, fmt.Errorf("failed to unmarshal stats: %w", err)
+		return 0, err
 	}
 
 	// Merge the stats
-	merged := m.mergeStats(&remoteStats)
+	merged := m.mergeStats(remoteStats)
 
 	// Capture peer's per-server summary if available
 	if remoteStats.Summary != nil {
@@ -173,4 +160,33 @@ func (m *Manager) StartSyncLoop(ctx context.Context, s3Client *s3.Client, bucket
 			return
 		}
 	}
+}
+
+// maxStatsExportBytes bounds the decompressed size of a peer's stats export.
+// The file is written by another process; a few kilobytes of gzip can expand
+// to gigabytes.
+const maxStatsExportBytes = 256 << 20
+
+// decodeStatsExport reads a gzip-compressed stats export.
+func decodeStatsExport(r io.Reader) (*StatsExport, error) {
+	gzReader, err := gzip.NewReader(r)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create gzip reader: %w", err)
+	}
+	defer gzReader.Close()
+
+	var buf bytes.Buffer
+	n, err := io.Copy(&buf, io.LimitReader(gzReader, maxStatsExportBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("failed to decompress: %w", err)
+	}
+	if n > maxStatsExportBytes {
+		return nil, fmt.Errorf("stats export exceeds %d bytes decompressed", maxStatsExportBytes)
+	}
+
+	var export StatsExport
+	if err := json.Unmarshal(buf.Bytes(), &export); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal stats: %w", err)
+	}
+	return &export, nil
 }

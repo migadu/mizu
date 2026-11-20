@@ -48,6 +48,7 @@ func exampleServer() ServerConfig {
 		EnableTraceIDHeader:     &t,
 		EnableAuthResultsHeader: &t,
 		EnableJunkHeader:        &t,
+		EnableEnvelopeToHeader:  &t, // false: one POST per message, the backend stamps X-Envelope-To
 
 		// Per-type default: true on submission, false on relay.
 		StripClientIdentity: &f,
@@ -62,7 +63,6 @@ func exampleServer() ServerConfig {
 		DMARCQuarantineAction: "junk",
 
 		Validation: ServerValidationConfig{
-			AllowNullSender:      true,
 			MissingHeadersAction: "fix", // submission default: "reject"
 			LoopDetection:        &t,
 			MaxHops:              30,

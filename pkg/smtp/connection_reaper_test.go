@@ -16,13 +16,13 @@ func TestReaper_ExpiredConnectionsAreRemoved(t *testing.T) {
 	defer tracker.Stop()
 
 	// Add connections
-	if err := tracker.TryAcquire("192.168.1.1"); err != nil {
+	if _, err := tracker.Acquire("192.168.1.1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := tracker.TryAcquire("192.168.1.2"); err != nil {
+	if _, err := tracker.Acquire("192.168.1.2"); err != nil {
 		t.Fatal(err)
 	}
-	if err := tracker.TryAcquire("192.168.1.2"); err != nil {
+	if _, err := tracker.Acquire("192.168.1.2"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -57,21 +57,27 @@ func TestReaper_NormalReleaseStillWorks(t *testing.T) {
 	tracker.Start()
 	defer tracker.Stop()
 
-	tracker.TryAcquire("10.0.0.1")
-	tracker.TryAcquire("10.0.0.1")
+	first, err := tracker.Acquire("10.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := tracker.Acquire("10.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	total, _, _ := tracker.GetStats()
 	if total != 2 {
 		t.Fatalf("expected 2, got %d", total)
 	}
 
-	tracker.Release("10.0.0.1")
+	first.Release()
 	total, _, _ = tracker.GetStats()
 	if total != 1 {
 		t.Fatalf("expected 1, got %d", total)
 	}
 
-	tracker.Release("10.0.0.1")
+	second.Release()
 	total, _, _ = tracker.GetStats()
 	if total != 0 {
 		t.Fatalf("expected 0, got %d", total)
@@ -82,7 +88,7 @@ func TestReaper_DisabledWhenZeroDuration(t *testing.T) {
 	// maxDuration=0 means no reaper
 	tracker := NewConnectionTracker(100, 10, 0, nil)
 
-	tracker.TryAcquire("1.2.3.4")
+	tracker.Acquire("1.2.3.4")
 	time.Sleep(50 * time.Millisecond)
 
 	total, _, _ := tracker.GetStats()
@@ -110,14 +116,14 @@ func TestReaper_MixedExpiredAndFresh(t *testing.T) {
 	defer tracker.Stop()
 
 	// Add old connections
-	tracker.TryAcquire("192.168.1.1")
-	tracker.TryAcquire("192.168.1.1")
+	tracker.Acquire("192.168.1.1")
+	tracker.Acquire("192.168.1.1")
 
 	// Wait for them to expire
 	time.Sleep(250 * time.Millisecond)
 
 	// Add fresh connection
-	tracker.TryAcquire("192.168.1.2")
+	tracker.Acquire("192.168.1.2")
 
 	// Give reaper time to run
 	time.Sleep(200 * time.Millisecond)

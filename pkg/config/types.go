@@ -103,6 +103,21 @@ type ServerConfig struct {
 	EnableAuthResultsHeader *bool `toml:"enable_auth_results_header"` // X-Mizu-Authentication-Results (default: true)
 	EnableJunkHeader        *bool `toml:"enable_junk_header"`         // X-Mizu-Junk (default: true). Governs only this header: junk.apply_action adds its own junk marker (e.g. X-Spam) independently
 
+	// EnableEnvelopeToHeader decides who stamps X-Envelope-To, and with it the
+	// shape of the delivery (default: true).
+	//
+	//   true:  Mizu stamps it. That needs a copy of the message per
+	//          recipient, so delivery is one POST per recipient. Works with
+	//          any backend.
+	//   false: the backend stamps it. The message is handed over in ONE POST
+	//          with every recipient in X-Mail-To (comma-separated), which is
+	//          all-or-nothing as far as the sending MTA can tell. Only for a
+	//          backend that splits X-Mail-To and adds the header itself
+	//          (mailqueuer does).
+	//
+	// A sender-supplied X-Envelope-To is stripped either way.
+	EnableEnvelopeToHeader *bool `toml:"enable_envelope_to_header"`
+
 	// === Privacy ===
 	// StripClientIdentity omits the "from <HELO> (<client IP>)" clause from the
 	// Received header this server stamps, so the submitting client's machine name
@@ -152,6 +167,7 @@ type HeaderToggles struct {
 	TraceID     bool // X-Mizu-Trace-ID
 	AuthResults bool // X-Mizu-Authentication-Results
 	Junk        bool // X-Mizu-Junk
+	EnvelopeTo  bool // X-Envelope-To, and one POST per recipient (see ServerConfig.EnableEnvelopeToHeader)
 }
 
 // HeaderToggles resolves the per-header enable flags (nil = true).
@@ -160,6 +176,7 @@ func (s *ServerConfig) HeaderToggles() HeaderToggles {
 		TraceID:     s.EnableTraceIDHeader == nil || *s.EnableTraceIDHeader,
 		AuthResults: s.EnableAuthResultsHeader == nil || *s.EnableAuthResultsHeader,
 		Junk:        s.EnableJunkHeader == nil || *s.EnableJunkHeader,
+		EnvelopeTo:  s.EnableEnvelopeToHeader == nil || *s.EnableEnvelopeToHeader,
 	}
 }
 
@@ -173,7 +190,6 @@ type ServerLimitsConfig struct {
 
 // ServerValidationConfig holds message validation settings (applies to both relay and submission)
 type ServerValidationConfig struct {
-	AllowNullSender      bool   `toml:"allow_null_sender"`      // Allow bounce messages with null sender (<>) - typically true for relay, false for submission
 	MissingHeadersAction string `toml:"missing_headers_action"` // Action for missing Message-ID/Date headers: "reject", "fix", "none" (default: "reject" for submission, "fix" for relay)
 	LoopDetection        *bool  `toml:"loop_detection"`         // Enable mail loop detection by checking Received headers (default: true, set to false to disable)
 	MaxHops              int    `toml:"max_hops"`               // Maximum number of hops (Received headers) before rejecting (default: 30, RFC 5321 recommends 100)
@@ -495,8 +511,8 @@ func (s *ServerConfig) ApplyDefaults(defaults DefaultsConfig) {
 		s.LegacyAuthCap = &trueVal
 	}
 
-	// X-Mizu-* header toggles default to true (pointers detect unset)
-	for _, p := range []**bool{&s.EnableTraceIDHeader, &s.EnableAuthResultsHeader, &s.EnableJunkHeader} {
+	// Header toggles default to true (pointers detect unset)
+	for _, p := range []**bool{&s.EnableTraceIDHeader, &s.EnableAuthResultsHeader, &s.EnableJunkHeader, &s.EnableEnvelopeToHeader} {
 		if *p == nil {
 			trueVal := true
 			*p = &trueVal
@@ -536,7 +552,10 @@ type RateLimitConfig struct {
 	Enabled               bool `toml:"enabled"`                 // Enable rate limiting (default: true)
 	GossipEnabled         bool `toml:"gossip_enabled"`          // Share rate limit state across cluster via gossip (default: false)
 	GossipIntervalSeconds int  `toml:"gossip_interval_seconds"` // How often to gossip rate limit data in seconds (default: 5)
-	// Whitelist entries below are exempt from ALL rate limit dimensions. Each
+	// Whitelisted IPs are exempt from ALL rate limit dimensions. Whitelisted
+	// sender domains/addresses are exempt from all dimensions on an
+	// authenticated session, and only from the FROM / FROM_DOMAIN dimensions
+	// otherwise (an unauthenticated MAIL FROM is unverified). Each
 	// kind accepts an inline array and/or an external file (one entry per line,
 	// blank lines and '#' comments ignored); the effective set is the union of
 	// both. Files are re-read automatically when they change on disk.

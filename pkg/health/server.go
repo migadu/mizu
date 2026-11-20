@@ -14,6 +14,7 @@ import (
 	tlsmgr "migadu/mizu/pkg/tls"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"log/slog"
@@ -64,19 +65,25 @@ type IPUnblocker interface {
 
 // Server represents the health check HTTP server.
 type Server struct {
-	listenAddr      string
-	logger          *slog.Logger
-	checkers        []Checker
-	statsProvider   StatsProvider
-	cacheFlusher    CacheFlusher
-	certRenewer     CertRenewer
-	ipUnblocker     IPUnblocker
+	listenAddr    string
+	logger        *slog.Logger
+	statsProvider StatsProvider
+
+	// mu guards the registrations below. The server is started before the
+	// SMTP servers exist, and their trackers and limiters register afterwards
+	// - while requests may already be arriving.
+	mu            sync.RWMutex
+	checkers      []Checker
+	cacheFlushers []CacheFlusher
+	certRenewer   CertRenewer
+	ipUnblockers  []IPUnblocker
+	acmeHandler   http.Handler
+
 	httpServer      *http.Server
 	mux             *http.ServeMux
 	healthEnabled   bool   // Enable health endpoints (/health, /api/stats, /api/flush-cache)
 	username        string // HTTP Basic Auth username (empty = no auth)
 	password        string // HTTP Basic Auth password
-	acmeHandler     http.Handler
 	metricsEnabled  bool   // Enable Prometheus metrics endpoint
 	metricsPath     string // Metrics endpoint path
 	metricsUsername string // Metrics HTTP Basic Auth username (empty = no auth)
@@ -101,53 +108,85 @@ func (s *Server) SetStatsProvider(provider StatsProvider) {
 	s.statsProvider = provider
 }
 
-// SetCacheFlusher registers a cache flusher for the /api/flush-cache endpoint
-func (s *Server) SetCacheFlusher(flusher CacheFlusher) {
-	s.cacheFlusher = flusher
+// AddCacheFlusher registers a cache flusher for the /api/flush-cache endpoint.
+// A flush is dispatched to every registered flusher.
+func (s *Server) AddCacheFlusher(flusher CacheFlusher) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cacheFlushers = append(s.cacheFlushers, flusher)
+}
+
+// flushCaches runs every registered flusher and sums their counts by key.
+// ok is false when none is registered.
+func (s *Server) flushCaches() (flushed map[string]int, ok bool) {
+	s.mu.RLock()
+	flushers := append([]CacheFlusher(nil), s.cacheFlushers...)
+	s.mu.RUnlock()
+	if len(flushers) == 0 {
+		return nil, false
+	}
+	flushed = make(map[string]int)
+	for _, f := range flushers {
+		for k, n := range f.FlushCache() {
+			flushed[k] += n
+		}
+	}
+	return flushed, true
 }
 
 // SetCertRenewer registers a certificate renewer for the /api/renew-cert endpoint
 func (s *Server) SetCertRenewer(renewer CertRenewer) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.certRenewer = renewer
 }
 
-// SetIPUnblocker registers an IP unblocker for the /api/unblock-ip endpoint
-func (s *Server) SetIPUnblocker(unblocker IPUnblocker) {
-	s.ipUnblocker = unblocker
+func (s *Server) getCertRenewer() CertRenewer {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.certRenewer
 }
 
-// AddIPUnblocker adds an additional IP unblocker. Calls to RemoveIP will be
-// dispatched to all registered unblockers. Returns true if any removed the IP.
+// AddIPUnblocker registers an IP unblocker for the /api/unblock-ip endpoint.
+// An unblock is dispatched to every registered unblocker.
 func (s *Server) AddIPUnblocker(unblocker IPUnblocker) {
-	if s.ipUnblocker == nil {
-		s.ipUnblocker = unblocker
-		return
-	}
-	if c, ok := s.ipUnblocker.(*compositeUnblocker); ok {
-		c.unblockers = append(c.unblockers, unblocker)
-		return
-	}
-	s.ipUnblocker = &compositeUnblocker{unblockers: []IPUnblocker{s.ipUnblocker, unblocker}}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ipUnblockers = append(s.ipUnblockers, unblocker)
 }
 
-// compositeUnblocker dispatches RemoveIP to multiple unblockers.
-type compositeUnblocker struct {
-	unblockers []IPUnblocker
-}
-
-func (c *compositeUnblocker) RemoveIP(ip string) bool {
-	removed := false
-	for _, u := range c.unblockers {
+// removeIP asks every registered unblocker to remove ip. configured is false
+// when none is registered; removed is true if any of them held the entry.
+func (s *Server) removeIP(ip string) (removed, configured bool) {
+	s.mu.RLock()
+	unblockers := append([]IPUnblocker(nil), s.ipUnblockers...)
+	s.mu.RUnlock()
+	for _, u := range unblockers {
 		if u.RemoveIP(ip) {
 			removed = true
 		}
 	}
-	return removed
+	return removed, len(unblockers) > 0
 }
 
-// SetACMEHandler registers an HTTP handler for the ACME challenge
+// SetACMEHandler registers an HTTP handler for the ACME challenge. It may be
+// called after Start: the route is always present and answers 404 until a
+// handler is set.
 func (s *Server) SetACMEHandler(handler http.Handler) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.acmeHandler = handler
+}
+
+func (s *Server) serveACME(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	handler := s.acmeHandler
+	s.mu.RUnlock()
+	if handler == nil {
+		http.NotFound(w, r)
+		return
+	}
+	handler.ServeHTTP(w, r)
 }
 
 // SetHealthEnabled configures whether health endpoints should be registered
@@ -273,6 +312,8 @@ func (s *Server) basicAuthMiddlewareWithCredsHandler(next http.Handler, username
 // This is useful when components (like per-server connection trackers) are created
 // after the health server has been initialized.
 func (s *Server) AddChecker(checker Checker) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.checkers = append(s.checkers, checker)
 }
 
@@ -287,11 +328,7 @@ func (s *Server) RegisterHandler(pattern string, handler http.HandlerFunc) {
 func (s *Server) Start() {
 	s.mux = http.NewServeMux()
 
-	// Register ACME handler if provided
-	if s.acmeHandler != nil {
-		s.mux.Handle("/.well-known/acme-challenge/", s.acmeHandler)
-		s.logger.Info("ACME HTTP-01 challenge handler registered")
-	}
+	s.mux.HandleFunc("/.well-known/acme-challenge/", s.serveACME)
 
 	// Register health endpoints only if enabled
 	if s.healthEnabled {
@@ -351,14 +388,18 @@ func (s *Server) healthHandler(w http.ResponseWriter, r *http.Request) {
 
 	componentStatus := make(map[string]ComponentStatus)
 
+	s.mu.RLock()
+	checkers := append([]Checker(nil), s.checkers...)
+	s.mu.RUnlock()
+
 	// Create a channel to collect results from concurrent checks.
 	// The buffer size is equal to the number of checkers to prevent goroutines from blocking.
 	resultsChan := make(chan struct {
 		Name   string
 		Status ComponentStatus
-	}, len(s.checkers))
+	}, len(checkers))
 
-	for _, checker := range s.checkers {
+	for _, checker := range checkers {
 		c := checker // Capture loop variable
 		concurrency.SafeGo(s.logger, "health-checker-"+c.Name(), func() {
 			status := c.CheckHealth()
@@ -373,10 +414,10 @@ func (s *Server) healthHandler(w http.ResponseWriter, r *http.Request) {
 	// panics, in which case SafeGo recovers and never sends a result) must not
 	// wedge the whole endpoint. Any checker that misses the deadline is
 	// surfaced as unhealthy so the problem is visible.
-	received := make(map[string]bool, len(s.checkers))
+	received := make(map[string]bool, len(checkers))
 	deadline := time.After(8 * time.Second)
 collect:
-	for i := 0; i < len(s.checkers); i++ {
+	for i := 0; i < len(checkers); i++ {
 		select {
 		case res := <-resultsChan:
 			received[res.Name] = true
@@ -388,7 +429,7 @@ collect:
 			break collect
 		}
 	}
-	for _, checker := range s.checkers {
+	for _, checker := range checkers {
 		name := checker.Name()
 		if received[name] {
 			continue
@@ -714,7 +755,8 @@ func (s *Server) flushCacheHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.cacheFlusher == nil {
+	flushed, ok := s.flushCaches()
+	if !ok {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusNotImplemented)
 		json.NewEncoder(w).Encode(map[string]any{
@@ -724,8 +766,6 @@ func (s *Server) flushCacheHandler(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-
-	flushed := s.cacheFlusher.FlushCache()
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -747,7 +787,8 @@ func (s *Server) renewCertHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.certRenewer == nil {
+	certRenewer := s.getCertRenewer()
+	if certRenewer == nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusNotImplemented)
 		json.NewEncoder(w).Encode(map[string]any{
@@ -805,7 +846,7 @@ func (s *Server) renewCertHandler(w http.ResponseWriter, r *http.Request) {
 	s.logger.Info("Certificate renewal requested", "domain", domain, "key_types", keyTypes)
 	// r.Context() is cancelled when the client disconnects, which is what an
 	// operator's Ctrl-C looks like from here.
-	renewed, err := s.certRenewer.RenewCertificate(r.Context(), domain, keyTypes...)
+	renewed, err := certRenewer.RenewCertificate(r.Context(), domain, keyTypes...)
 	if err != nil && len(renewed) > 0 {
 		// Everything asked for was issued and stored, but this node could not
 		// load it. That is not the same as a key type failing to issue, and an
@@ -851,7 +892,10 @@ func (s *Server) unblockIPHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if s.ipUnblocker == nil {
+	s.mu.RLock()
+	configured := len(s.ipUnblockers) > 0
+	s.mu.RUnlock()
+	if !configured {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusNotImplemented)
 		json.NewEncoder(w).Encode(map[string]any{
@@ -897,7 +941,7 @@ func (s *Server) unblockIPHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	removed := s.ipUnblocker.RemoveIP(ip)
+	removed, _ := s.removeIP(ip)
 
 	// Log the admin action
 	s.logger.Info("IP unblock requested",

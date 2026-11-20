@@ -251,7 +251,10 @@ func (v *Validator) queryEndpoint(ctx context.Context, clientIP, ptr, helo, from
 // buildCacheKey creates a cache key from request parameters
 func (v *Validator) buildCacheKey(clientIP, ptr, helo, from, to string) string {
 	// Normalize email addresses to lowercase for consistent cache hits.
-	return fmt.Sprintf("%s:%s:%s:%s:%s", clientIP, ptr, helo, strings.ToLower(from), strings.ToLower(to))
+	// Each field is quoted so the key is unambiguous: joined with a bare ":"
+	// (which HELO names and quoted local parts may contain) two different
+	// requests could collide and share a cached verdict.
+	return fmt.Sprintf("%q %q %q %q %q", clientIP, ptr, helo, strings.ToLower(from), strings.ToLower(to))
 }
 
 // GetStats returns cache statistics

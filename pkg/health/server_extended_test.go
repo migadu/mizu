@@ -91,16 +91,16 @@ func TestServer_SetStatsProvider(t *testing.T) {
 	t.Log("✓ SetStatsProvider works")
 }
 
-func TestServer_SetCacheFlusher(t *testing.T) {
+func TestServer_AddCacheFlusher(t *testing.T) {
 	server := NewServer(":8080", slog.New(slog.NewTextHandler(io.Discard, nil)))
 	flusher := &mockCacheFlusher{}
 
-	server.SetCacheFlusher(flusher)
-	if server.cacheFlusher != flusher {
+	server.AddCacheFlusher(flusher)
+	if len(server.cacheFlushers) != 1 || server.cacheFlushers[0] != CacheFlusher(flusher) {
 		t.Error("Cache flusher not set")
 	}
 
-	t.Log("✓ SetCacheFlusher works")
+	t.Log("✓ AddCacheFlusher works")
 }
 
 func TestServer_SetBasicAuth(t *testing.T) {
@@ -288,7 +288,7 @@ func TestServer_FlushCacheHandler_NoFlusher(t *testing.T) {
 func TestServer_FlushCacheHandler_WithFlusher(t *testing.T) {
 	server := NewServer(":8080", slog.New(slog.NewTextHandler(io.Discard, nil)))
 	flusher := &mockCacheFlusher{}
-	server.SetCacheFlusher(flusher)
+	server.AddCacheFlusher(flusher)
 
 	req := httptest.NewRequest("POST", "/api/flush-cache", nil)
 	w := httptest.NewRecorder()
