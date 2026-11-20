@@ -67,6 +67,19 @@ type rspamdResponse struct {
 	Messages json.RawMessage `json:"messages,omitempty"`
 }
 
+// maxResponseBytes bounds how much of an rspamd reply is read.
+const maxResponseBytes = 64 << 20
+
+// bodyExcerpt is the start of a reply, for logs and error text: the whole
+// reply can be tens of megabytes.
+func bodyExcerpt(body []byte) string {
+	const max = 2048
+	if len(body) > max {
+		return string(body[:max]) + "...(truncated)"
+	}
+	return string(body)
+}
+
 // rspamdSymbol represents a triggered spam rule
 type rspamdSymbol struct {
 	Score       float64  `json:"score"`
@@ -194,17 +207,17 @@ func (c *Client) Check(ctx context.Context, traceID, message, clientIP, from str
 	c.Logger.Debug("Rspamd raw response",
 		"trace_id", traceID,
 		"status", status,
-		"body", string(bodyBytes))
+		"body", bodyExcerpt(bodyBytes))
 
 	// Rspamd may return 504 when autolearn/statistics fails even though the
 	// scan itself succeeded. The body contains a JSON error (not a scan result),
 	// so we log and return a nil result rather than an error — fail open.
 	if status != http.StatusOK {
 		if status == http.StatusGatewayTimeout && isStatisticsError(bodyBytes) {
-			c.Logger.Debug("Ignoring rspamd statistics error (autolearn failure)", "body", string(bodyBytes))
+			c.Logger.Debug("Ignoring rspamd statistics error (autolearn failure)", "body", bodyExcerpt(bodyBytes))
 			return &CheckResult{AddHeaders: map[string][]string{}, Symbols: map[string]float64{}}, nil
 		}
-		return nil, fmt.Errorf("rspamd returned status %d: %s", status, string(bodyBytes))
+		return nil, fmt.Errorf("rspamd returned status %d: %s", status, bodyExcerpt(bodyBytes))
 	}
 
 	// Parse JSON response
@@ -272,6 +285,29 @@ func (c *Client) Check(ctx context.Context, traceID, message, clientIP, from str
 	return result, nil
 }
 
+// headerValue drops the bytes net/http rejects in a header field value (ASCII
+// control characters and DEL), so a client-supplied envelope value can never
+// make the transport refuse the whole request.
+func headerValue(v string) string {
+	clean := true
+	for i := 0; i < len(v); i++ {
+		if c := v[i]; c < 0x20 || c == 0x7f {
+			clean = false
+			break
+		}
+	}
+	if clean {
+		return v
+	}
+	b := make([]byte, 0, len(v))
+	for i := 0; i < len(v); i++ {
+		if c := v[i]; c >= 0x20 && c != 0x7f {
+			b = append(b, c)
+		}
+	}
+	return string(b)
+}
+
 // doCheckOnce performs a single rspamd /checkv2 round trip, returning the
 // response body and status code. Transport-level failures are returned
 // wrapped with the existing "rspamd request failed" / "failed to read
@@ -289,24 +325,27 @@ func (c *Client) doCheckOnce(ctx context.Context, traceID string, msgBytes []byt
 	// Pass our trace ID as the rspamd Queue-ID so rspamd records it in its
 	// own logs, letting us correlate a Mizu trace with the matching scan.
 	if traceID != "" {
-		req.Header.Set("Queue-ID", traceID)
+		req.Header.Set("Queue-ID", headerValue(traceID))
 	}
 
-	// Add message metadata headers
+	// Add message metadata headers. Every value below originates from the
+	// SMTP client, so each goes through headerValue: net/http refuses to send
+	// a request whose header value holds a control byte, and a refused scan
+	// fails open in the session - one such byte must never skip the scan.
 	if clientIP != "" {
-		req.Header.Set("IP", clientIP)
+		req.Header.Set("IP", headerValue(clientIP))
 	}
 	if from != "" {
-		req.Header.Set("From", from)
+		req.Header.Set("From", headerValue(from))
 	}
 	if len(rcpt) > 0 {
 		// Rspamd expects multiple Rcpt headers for multiple recipients
 		for _, r := range rcpt {
-			req.Header.Add("Rcpt", r)
+			req.Header.Add("Rcpt", headerValue(r))
 		}
 	}
 	if helo != "" {
-		req.Header.Set("Helo", helo)
+		req.Header.Set("Helo", headerValue(helo))
 	}
 
 	// Pass the SMTP AUTH username as rspamd's "User" header. Rspamd uses this
@@ -315,7 +354,7 @@ func (c *Client) doCheckOnce(ctx context.Context, traceID string, msgBytes []byt
 	// Empty for unauthenticated relay/inbound mail, in which case the header
 	// is omitted so rspamd scans the message as ordinary inbound traffic.
 	if authenticatedUser != "" {
-		req.Header.Set("User", authenticatedUser)
+		req.Header.Set("User", headerValue(authenticatedUser))
 	}
 
 	// Add HTTPCrypt authentication if password is configured.
@@ -336,9 +375,17 @@ func (c *Client) doCheckOnce(ctx context.Context, traceID string, msgBytes []byt
 	defer resp.Body.Close()
 
 	// Read full response body once for both status-check and decode paths.
-	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1 MiB cap
+	// The cap only guards against a runaway peer. It has to sit well above
+	// anything a real scan produces: rspamd echoes every URL and address it
+	// found, so the reply grows with the message, and a reply cut short does
+	// not parse - the scan would fail open for exactly the messages built to
+	// be large.
+	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
 		return nil, resp.StatusCode, fmt.Errorf("failed to read rspamd response: %w", err)
+	}
+	if len(bodyBytes) > maxResponseBytes {
+		return nil, resp.StatusCode, fmt.Errorf("rspamd response exceeds %d bytes", maxResponseBytes)
 	}
 	return bodyBytes, resp.StatusCode, nil
 }
