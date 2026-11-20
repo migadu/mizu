@@ -57,10 +57,11 @@ type RateLimiter struct {
 
 // dimensionTracker tracks a single rate limit dimension
 type dimensionTracker struct {
-	name   string        // Human-readable name (e.g., "per_ip", "per_sender")
-	keys   []string      // Dimension keys to combine (e.g., ["IP"], ["FROM"], ["IP", "FROM"])
-	limit  int           // Max connections per window
-	window time.Duration // Time window for rate limiting
+	name   string         // Human-readable name (e.g., "per_ip", "per_sender")
+	keys   []string       // Dimension keys to combine (e.g., ["IP"], ["FROM"], ["IP", "FROM"])
+	limit  int            // Max connections per window
+	window time.Duration  // Time window for rate limiting
+	stage  RateLimitStage // The one stage this dimension is checked and charged at
 }
 
 // connectionWindow tracks connection attempts for a single composite key using a sliding window
@@ -70,6 +71,7 @@ type connectionWindow struct {
 	peerCount   int                         // Cached sum of peerCounts (cluster-wide estimate)
 	peerCounts  map[string]peerContribution // nodeID -> that peer's last reported count
 	windowStart time.Time                   // Start of current window
+	duration    time.Duration               // Length of the window (its dimension's), zero for a window created from gossip only
 	lastUpdate  time.Time                   // Last time this window was updated
 	lastCleanup time.Time                   // Last time old windows were cleaned up
 }
@@ -92,10 +94,41 @@ type RateLimitData struct {
 
 // SessionContext holds all the information needed for rate limiting checks
 type SessionContext struct {
-	RemoteAddr        string   // Remote address (IP:port)
-	From              string   // MAIL FROM address
-	To                []string // RCPT TO addresses
-	AuthenticatedUser string   // Authenticated username (empty if not authenticated)
+	RemoteAddr        string         // Remote address (IP:port)
+	From              string         // MAIL FROM address
+	To                []string       // The recipient under evaluation, as a single element (TO/TO_DOMAIN key on To[0]); empty before RCPT
+	AuthenticatedUser string         // Authenticated username (empty if not authenticated)
+	Stage             RateLimitStage // Which SMTP stage is asking; selects the dimensions charged
+}
+
+// RateLimitStage is the point in the SMTP dialogue a rate-limit check is made
+// at. Each dimension belongs to exactly one stage - the one where the last of
+// its keys becomes known - and is checked and charged only there, so the unit
+// of a limit follows from its keys:
+//
+//	IP alone                               -> connections  (StageConnect)
+//	FROM / FROM_DOMAIN / AUTHENTICATED_USER -> messages     (StageMail)
+//	TO / TO_DOMAIN                         -> recipients   (StageRcpt)
+type RateLimitStage int
+
+const (
+	StageConnect RateLimitStage = iota // EHLO/HELO: only the peer address is known
+	StageMail                          // MAIL FROM accepted: sender and login are known
+	StageRcpt                          // RCPT TO: one recipient under evaluation
+)
+
+// stageForKeys returns the stage a dimension with these keys is charged at.
+func stageForKeys(keys []string) RateLimitStage {
+	stage := StageConnect
+	for _, key := range keys {
+		switch strings.ToUpper(key) {
+		case "TO", "TO_DOMAIN":
+			return StageRcpt
+		case "FROM", "FROM_DOMAIN", "AUTHENTICATED_USER":
+			stage = StageMail
+		}
+	}
+	return stage
 }
 
 // NewRateLimiter creates a new multi-dimensional rate limiter with memberlist gossip
@@ -115,6 +148,7 @@ func NewRateLimiter(rlConfig config.RateLimitConfig, cluster RateLimiterCluster,
 				keys:   d.Keys,
 				limit:  d.Limit,
 				window: time.Duration(d.WindowSeconds) * time.Second,
+				stage:  stageForKeys(d.Keys),
 			})
 		}
 	}
@@ -211,17 +245,38 @@ func (rl *RateLimiter) CheckRateLimit(sessionCtx SessionContext) error {
 	if snapshot.matchesIP(extractIP(sessionCtx.RemoteAddr)) {
 		return nil // Whitelisted IP
 	}
-	if snapshot.matchesSender(sessionCtx.From) {
-		return nil // Whitelisted sender
+	// A whitelisted sender is only as trustworthy as the MAIL FROM it was
+	// matched against. On an authenticated session that address has passed
+	// allowed_from, so the exemption covers every dimension. Unauthenticated,
+	// MAIL FROM is whatever the client typed: it lifts only the dimensions
+	// keyed on the sender (below), never IP or recipient limits - otherwise
+	// claiming a whitelisted address is a free pass through all rate limiting.
+	senderWhitelisted := snapshot.matchesSender(sessionCtx.From)
+	if senderWhitelisted && sessionCtx.AuthenticatedUser != "" {
+		return nil // Whitelisted, verified sender
 	}
 
 	now := time.Now()
 
-	// Check each dimension independently - any violation rejects the connection
+	// Two passes under one lock: first check every dimension that belongs to
+	// this stage, then charge them - and only if none refused. Charging as we
+	// went meant a client refused by a later dimension had still spent the
+	// earlier ones, so an already-blocked client could burn a victim's
+	// recipient budget.
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	var charged []*connectionWindow
 	for _, dim := range rl.dimensions {
+		if dim.stage != sessionCtx.Stage {
+			continue
+		}
+		if senderWhitelisted && dimensionKeyedOnSender(dim.keys) {
+			continue
+		}
 		compositeKey := rl.buildCompositeKey(dim.keys, sessionCtx)
 		if compositeKey == "" {
-			// Skip this dimension if we can't build a key (e.g., FROM dimension but no MAIL FROM yet)
+			// A key this dimension needs is absent (null sender, no login).
 			continue
 		}
 		// Namespace the window by dimension name so two dimensions that share the
@@ -229,23 +284,9 @@ func (rl *RateLimiter) CheckRateLimit(sessionCtx SessionContext) error {
 		// windows instead of colliding and corrupting each other's counts.
 		windowKey := dim.name + "|" + compositeKey
 
-		rl.mu.Lock()
-
-		// Get or create window for this composite key
 		window, exists := rl.windows[windowKey]
-		if !exists {
-			window = &connectionWindow{
-				localCount:  0,
-				peerCount:   0,
-				windowStart: now,
-				lastUpdate:  now,
-				lastCleanup: now,
-			}
-			rl.windows[windowKey] = window
-		}
-
-		// Reset window if it has expired
-		if now.Sub(window.windowStart) > dim.window {
+		if exists && now.Sub(window.windowStart) > dim.window {
+			// Expired: start a fresh window.
 			window.localCount = 0
 			window.peerCount = 0
 			window.peerCounts = nil
@@ -253,28 +294,47 @@ func (rl *RateLimiter) CheckRateLimit(sessionCtx SessionContext) error {
 			window.lastUpdate = now
 		}
 
-		// Check if adding this connection would exceed the limit (local + peer counts)
-		totalCount := window.localCount + window.peerCount
-		if totalCount >= dim.limit {
-			rl.mu.Unlock()
-			rl.logger.Warn("Rate limit exceeded",
-				"dimension", dim.name,
-				"composite_key", compositeKey,
-				"local_count", window.localCount,
-				"peer_count", window.peerCount,
-				"total", totalCount,
-				"limit", dim.limit,
-				"window", dim.window)
-			return fmt.Errorf("rate limit exceeded for %s: %d/%d connections in %v", dim.name, totalCount, dim.limit, dim.window)
+		if exists {
+			if totalCount := window.localCount + window.peerCount; totalCount >= dim.limit {
+				rl.logger.Warn("Rate limit exceeded",
+					"dimension", dim.name,
+					"composite_key", compositeKey,
+					"local_count", window.localCount,
+					"peer_count", window.peerCount,
+					"total", totalCount,
+					"limit", dim.limit,
+					"window", dim.window)
+				return fmt.Errorf("rate limit exceeded for %s: %d/%d in %v", dim.name, totalCount, dim.limit, dim.window)
+			}
+		} else {
+			// Created only once the request is known to pass every dimension
+			// would be tidier, but an empty window is harmless and cleanup
+			// removes it; creating it here keeps a single map lookup.
+			window = &connectionWindow{windowStart: now, lastUpdate: now, lastCleanup: now}
+			rl.windows[windowKey] = window
 		}
+		window.duration = dim.window
+		charged = append(charged, window)
+	}
 
-		// Increment local count for this connection
+	for _, window := range charged {
 		window.localCount++
 		window.lastUpdate = now
-		rl.mu.Unlock()
 	}
 
 	return nil
+}
+
+// dimensionKeyedOnSender reports whether a dimension's key includes the
+// envelope sender (FROM or FROM_DOMAIN).
+func dimensionKeyedOnSender(keys []string) bool {
+	for _, key := range keys {
+		switch strings.ToUpper(key) {
+		case "FROM", "FROM_DOMAIN":
+			return true
+		}
+	}
+	return false
 }
 
 // buildCompositeKey builds a composite key from the specified dimension keys and session context
@@ -289,7 +349,9 @@ func (rl *RateLimiter) buildCompositeKey(keys []string, sessionCtx SessionContex
 			if ip == "" {
 				return "" // Can't build key without IP
 			}
-			parts = append(parts, fmt.Sprintf("IP:%s", ip))
+			// IPv6 is keyed on the /64 (see bucketIP): per-address keys give
+			// one host 2^64 budgets.
+			parts = append(parts, fmt.Sprintf("IP:%s", bucketIP(ip)))
 
 		case "FROM":
 			if sessionCtx.From == "" {
@@ -308,7 +370,7 @@ func (rl *RateLimiter) buildCompositeKey(keys []string, sessionCtx SessionContex
 			if len(sessionCtx.To) == 0 {
 				return "" // Can't build key without TO
 			}
-			// For multiple recipients, use the first one (or could iterate per-recipient)
+			// Callers pass exactly the recipient being evaluated (see Session.Rcpt).
 			parts = append(parts, fmt.Sprintf("TO:%s", strings.ToLower(sessionCtx.To[0])))
 
 		case "TO_DOMAIN":
@@ -352,12 +414,17 @@ func extractIP(remoteAddr string) string {
 }
 
 // extractDomain extracts the domain part from an email address
+//
+// The domain is whatever follows the LAST "@" - the part mail is routed on -
+// minus a trailing dot. Requiring exactly one "@" returned "" for
+// `"a@b"@spam.test`, and a dimension with an empty key is skipped: the
+// address had no domain limit at all.
 func extractDomain(email string) string {
-	parts := strings.Split(email, "@")
-	if len(parts) != 2 {
+	at := strings.LastIndex(email, "@")
+	if at == -1 {
 		return ""
 	}
-	return parts[1]
+	return strings.TrimSuffix(email[at+1:], ".")
 }
 
 // gossipLoop periodically sends rate limit data to cluster peers
@@ -384,6 +451,13 @@ func (rl *RateLimiter) sendGossip() {
 	data := make([]RateLimitData, 0, len(rl.windows))
 
 	for compositeKey, window := range rl.windows {
+		// Windows are reset lazily on the next hit, so a key that is not used
+		// again keeps its last count indefinitely. Never report such a count:
+		// it carries ReportedAt = now, so peers would charge it against the
+		// key in every later window.
+		if window.duration > 0 && now.Sub(window.windowStart) > window.duration {
+			continue
+		}
 		if window.localCount > 0 {
 			data = append(data, RateLimitData{
 				NodeID:       rl.nodeID,
@@ -542,8 +616,13 @@ func (rl *RateLimiter) cleanup() {
 
 	removed := 0
 	for compositeKey, window := range rl.windows {
-		// Remove windows that haven't been updated recently and have no counts
-		if window.localCount == 0 && window.peerCount == 0 && now.Sub(window.lastUpdate) > staleThreshold {
+		// Remove windows that haven't been updated recently and whose counts
+		// no longer matter: either zero, or belonging to a window that has
+		// run out (counts are only reset lazily, on the next hit - which for
+		// a key nobody uses again never comes).
+		empty := window.localCount == 0 && window.peerCount == 0
+		expired := window.duration > 0 && now.Sub(window.windowStart) > window.duration
+		if (empty || expired) && now.Sub(window.lastUpdate) > staleThreshold {
 			delete(rl.windows, compositeKey)
 			removed++
 		}

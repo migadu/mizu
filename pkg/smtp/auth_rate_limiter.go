@@ -90,7 +90,15 @@ type IPFailureInfo struct {
 	FailureCount int
 	FirstFailure time.Time
 	LastDelay    time.Duration
+
+	// perUser counts this window's failures by username, so that a success
+	// can forgive that user's own failures and nothing else. Bounded by
+	// maxTrackedUsersPerIP; failures beyond it are counted but never forgiven.
+	perUser map[string]int
 }
+
+// maxTrackedUsersPerIP bounds IPFailureInfo.perUser.
+const maxTrackedUsersPerIP = 64
 
 // UsernameFailureInfo tracks authentication failures per username
 type UsernameFailureInfo struct {
@@ -235,6 +243,8 @@ func (a *AuthRateLimiter) CanAttemptAuth(ctx context.Context, ip, username strin
 		return nil
 	}
 
+	username = normalizeAuthUsername(username)
+
 	// Every tier keys on the bucketed identity (IPv6 → its /64), or a v6
 	// attacker rotates addresses inside one allocation for free.
 	ip = bucketIP(ip)
@@ -317,6 +327,8 @@ func (a *AuthRateLimiter) RecordAuthAttempt(ctx context.Context, ip, username st
 		return
 	}
 
+	username = normalizeAuthUsername(username)
+
 	ip = bucketIP(ip)
 
 	if success {
@@ -334,10 +346,10 @@ func (a *AuthRateLimiter) recordSuccess(ip, username string) {
 	delete(a.blockedIPUsernames, key)
 	a.ipUsernameMu.Unlock()
 
-	// Clear IP failure
-	a.ipMu.Lock()
-	delete(a.ipFailureCounts, ip)
-	a.ipMu.Unlock()
+	// Forgive this user's own failures from this IP - and only those. Deleting
+	// the whole count let one valid account launder unlimited guesses at
+	// other accounts.
+	a.forgiveIPFailures(ip, username)
 
 	// Stamp the subnet-block bypass and stop counting this address toward
 	// its subnet's fate (the subnet's BLOCK state, if any, stays — one
@@ -373,7 +385,7 @@ func (a *AuthRateLimiter) recordFailure(ip, username string) {
 	}
 
 	// Update Tier 2: IP-only
-	a.updateIPFailure(ip, now)
+	a.updateIPFailure(ip, username, now)
 
 	// Update Tier 3: subnet
 	a.noteSubnetFailure(ip, 0, now)
@@ -432,8 +444,31 @@ func (a *AuthRateLimiter) updateIPUsernameFailure(ip, username string, now time.
 	}
 }
 
+// forgiveIPFailures subtracts username's own failures from ip's count after a
+// successful login.
+func (a *AuthRateLimiter) forgiveIPFailures(ip, username string) {
+	a.ipMu.Lock()
+	defer a.ipMu.Unlock()
+
+	info, exists := a.ipFailureCounts[ip]
+	if !exists {
+		return
+	}
+	info.FailureCount -= info.perUser[username]
+	delete(info.perUser, username)
+	if info.FailureCount <= 0 {
+		delete(a.ipFailureCounts, ip)
+		return
+	}
+	if info.FailureCount >= a.config.DelayStartThreshold {
+		info.LastDelay = a.calculateDelay(info.FailureCount - a.config.DelayStartThreshold)
+	} else {
+		info.LastDelay = 0
+	}
+}
+
 // updateIPFailure updates IP failure count and progressive delays
-func (a *AuthRateLimiter) updateIPFailure(ip string, now time.Time) {
+func (a *AuthRateLimiter) updateIPFailure(ip, username string, now time.Time) {
 	a.ipMu.Lock()
 	defer a.ipMu.Unlock()
 
@@ -456,9 +491,16 @@ func (a *AuthRateLimiter) updateIPFailure(ip string, now time.Time) {
 	if now.Sub(info.FirstFailure) > a.ipWindowDuration {
 		info.FirstFailure = now
 		info.FailureCount = 0
+		info.perUser = nil
 	}
 
 	info.FailureCount++
+	if _, tracked := info.perUser[username]; tracked || len(info.perUser) < maxTrackedUsersPerIP {
+		if info.perUser == nil {
+			info.perUser = make(map[string]int)
+		}
+		info.perUser[username]++
+	}
 
 	// Calculate progressive delay
 	if info.FailureCount >= a.config.DelayStartThreshold {
@@ -569,6 +611,15 @@ func (a *AuthRateLimiter) calculateDelay(failuresSinceThreshold int) time.Durati
 	}
 
 	return delay
+}
+
+// normalizeAuthUsername canonicalizes the client-supplied AUTH username into
+// the identity the limiter keys on. Lowercased because the backend resolves
+// logins case-insensitively - otherwise each case variant of one account gets
+// a fresh tier-1 budget. Invalid UTF-8 is replaced because the value is also
+// used as a Prometheus label, and client_golang panics on an invalid one.
+func normalizeAuthUsername(username string) string {
+	return strings.ToValidUTF8(strings.ToLower(strings.TrimSpace(username)), "\uFFFD")
 }
 
 // makeIPUsernameKey creates a key for IP+username combination
@@ -849,6 +900,18 @@ func (a *AuthRateLimiter) ApplyUnblockIP(ip string) bool {
 	}
 	a.ipMu.Unlock()
 
+	// The IP+username blocks from this address go too: the operator unblocked
+	// the address, not "the address except for the account that was mistyped".
+	// A scan of the whole map is fine for an operator action.
+	a.ipUsernameMu.Lock()
+	for key, info := range a.blockedIPUsernames {
+		if info.IP == ip {
+			delete(a.blockedIPUsernames, key)
+			removed = true
+		}
+	}
+	a.ipUsernameMu.Unlock()
+
 	// An operator vouching for an address also stops it counting toward its
 	// subnet's distinct-failure set (the subnet's own block, if already
 	// standing, is lifted separately via CIDR).
@@ -893,12 +956,19 @@ func (a *AuthRateLimiter) ApplyFailureCount(ip string, failureCount int, lastDel
 	// Only apply if higher count or not exists
 	existing, exists := a.ipFailureCounts[ip]
 	if !exists || failureCount > existing.FailureCount {
-		a.ipFailureCounts[ip] = &IPFailureInfo{
+		info := &IPFailureInfo{
 			IP:           ip,
 			FailureCount: failureCount,
 			LastDelay:    lastDelay,
 			FirstFailure: firstFailure,
 		}
+		// Keep the per-user attribution of the failures this node saw itself.
+		// Dropping it with the old entry meant a later successful login had
+		// nothing to forgive, and the user kept the delays for their own typos.
+		if exists {
+			info.perUser = existing.perUser
+		}
+		a.ipFailureCounts[ip] = info
 
 		a.logger.Debug("applied failure count from cluster",
 			"ip", ip,

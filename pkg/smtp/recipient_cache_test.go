@@ -34,8 +34,7 @@ func TestRecipientCache_NotFoundCaching(t *testing.T) {
 	)
 
 	// Initially, recipient should not be cached
-	found, _, _ := dt.IsRecipientCached("user@example.com")
-	if found {
+	if dt.IsRecipientCached("user@example.com") {
 		t.Fatal("Expected recipient to not be cached initially")
 	}
 
@@ -43,52 +42,8 @@ func TestRecipientCache_NotFoundCaching(t *testing.T) {
 	dt.CacheRecipientNotFound("user@example.com")
 
 	// Now it should be cached
-	found, isBlocked, reason := dt.IsRecipientCached("user@example.com")
-	if !found {
+	if !dt.IsRecipientCached("user@example.com") {
 		t.Fatal("Expected recipient to be cached")
-	}
-	if isBlocked {
-		t.Fatal("Expected recipient to be marked as 'not found', not 'blocked'")
-	}
-	if reason != "recipient not found (cached)" {
-		t.Fatalf("Expected reason 'recipient not found (cached)', got: %s", reason)
-	}
-}
-
-// TestRecipientCache_BlockedCaching tests that 403 responses are cached
-func TestRecipientCache_BlockedCaching(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-
-	local := NewConnectionTracker(100, 10, 0, nil)
-	dt := NewDistributedTracker(
-		local,
-		nil,
-		"",
-		"",
-		DistributedConfig{
-			Hostname:          "server1",
-			Cluster:           newMockCluster(),
-			GossipInterval:    1 * time.Hour,
-			S3SyncInterval:    1 * time.Hour,
-			GlobalMaxPerIP:    20,
-			RecipientCacheTTL: 5 * time.Minute,
-		},
-		logger,
-	)
-
-	// Cache the recipient as blocked
-	dt.CacheRecipientBlocked("blocked@example.com")
-
-	// Should be cached and marked as blocked
-	found, isBlocked, reason := dt.IsRecipientCached("blocked@example.com")
-	if !found {
-		t.Fatal("Expected recipient to be cached")
-	}
-	if !isBlocked {
-		t.Fatal("Expected recipient to be marked as 'blocked'")
-	}
-	if reason != "recipient blocked by destination (cached)" {
-		t.Fatalf("Expected reason 'recipient blocked by destination (cached)', got: %s", reason)
 	}
 }
 
@@ -117,8 +72,7 @@ func TestRecipientCache_Expiry(t *testing.T) {
 	dt.CacheRecipientNotFound("temp@example.com")
 
 	// Should be cached immediately
-	found, _, _ := dt.IsRecipientCached("temp@example.com")
-	if !found {
+	if !dt.IsRecipientCached("temp@example.com") {
 		t.Fatal("Expected recipient to be cached")
 	}
 
@@ -126,8 +80,7 @@ func TestRecipientCache_Expiry(t *testing.T) {
 	time.Sleep(150 * time.Millisecond)
 
 	// Should no longer be cached
-	found, _, _ = dt.IsRecipientCached("temp@example.com")
-	if found {
+	if dt.IsRecipientCached("temp@example.com") {
 		t.Fatal("Expected recipient cache to expire")
 	}
 }
@@ -174,11 +127,9 @@ func TestRecipientCache_GossipPropagation(t *testing.T) {
 
 	// Server 1 caches a recipient
 	dt1.CacheRecipientNotFound("user@example.com")
-	dt1.CacheRecipientBlocked("blocked@example.com")
 
 	// Server 2 should not have it yet
-	found, _, _ := dt2.IsRecipientCached("user@example.com")
-	if found {
+	if dt2.IsRecipientCached("user@example.com") {
 		t.Fatal("Server 2 should not have cached recipient yet")
 	}
 
@@ -189,28 +140,9 @@ func TestRecipientCache_GossipPropagation(t *testing.T) {
 	snapshotJSON, _ := json.Marshal(snapshot)
 	dt2.handleGossipMessage(snapshotJSON)
 
-	// Now server 2 should have the cached entries
-	found, isBlocked, reason := dt2.IsRecipientCached("user@example.com")
-	if !found {
+	// Now server 2 should have the cached entry
+	if !dt2.IsRecipientCached("user@example.com") {
 		t.Fatal("Server 2 should have received cached recipient via gossip")
-	}
-	if isBlocked {
-		t.Fatal("Expected recipient to be marked as 'not found', not 'blocked'")
-	}
-	if reason != "recipient not found (cached)" {
-		t.Fatalf("Expected reason 'recipient not found (cached)', got: %s", reason)
-	}
-
-	// Check blocked recipient
-	found, isBlocked, reason = dt2.IsRecipientCached("blocked@example.com")
-	if !found {
-		t.Fatal("Server 2 should have received blocked recipient via gossip")
-	}
-	if !isBlocked {
-		t.Fatal("Expected recipient to be marked as 'blocked'")
-	}
-	if reason != "recipient blocked by destination (cached)" {
-		t.Fatalf("Expected reason 'recipient blocked by destination (cached)', got: %s", reason)
 	}
 }
 
@@ -301,7 +233,7 @@ func TestRecipientCache_HTTPEndToEnd(t *testing.T) {
 
 	// Cache some recipients on server 1
 	dt1.CacheRecipientNotFound("user1@example.com")
-	dt1.CacheRecipientBlocked("user2@example.com")
+	dt1.CacheRecipientNotFound("user2@example.com")
 
 	// Create server 2
 	local2 := NewConnectionTracker(100, 10, 0, nil)
@@ -328,14 +260,12 @@ func TestRecipientCache_HTTPEndToEnd(t *testing.T) {
 	mockCluster2.simulateIncomingGossip(snapshotJSON)
 
 	// Verify server 2 received the cache from server 1
-	found, _, _ := dt2.IsRecipientCached("user1@example.com")
-	if !found {
+	if !dt2.IsRecipientCached("user1@example.com") {
 		t.Error("Expected server 2 to have user1@example.com in cache")
 	}
 
-	found, isBlocked, _ := dt2.IsRecipientCached("user2@example.com")
-	if !found || !isBlocked {
-		t.Error("Expected server 2 to have user2@example.com as blocked in cache")
+	if !dt2.IsRecipientCached("user2@example.com") {
+		t.Error("Expected server 2 to have user2@example.com in cache")
 	}
 }
 
@@ -382,15 +312,15 @@ func TestRecipientCache_TwoServerIntegration(t *testing.T) {
 	servers[0].CacheRecipientNotFound("notfound@example.com")
 	t.Log("✓ Server 1 cached notfound@example.com as 404")
 
-	// Server 2 caches a 403 recipient
-	servers[1].CacheRecipientBlocked("blocked@example.com")
-	t.Log("✓ Server 2 cached blocked@example.com as 403")
+	// Server 2 caches a different 404 recipient
+	servers[1].CacheRecipientNotFound("other@example.com")
+	t.Log("✓ Server 2 cached other@example.com as 404")
 
 	// Verify initial state - each server only has its own cache
-	if found, _, _ := servers[0].IsRecipientCached("blocked@example.com"); found {
-		t.Fatal("Server 1 should not have blocked@example.com yet")
+	if servers[0].IsRecipientCached("other@example.com") {
+		t.Fatal("Server 1 should not have other@example.com yet")
 	}
-	if found, _, _ := servers[1].IsRecipientCached("notfound@example.com"); found {
+	if servers[1].IsRecipientCached("notfound@example.com") {
 		t.Fatal("Server 2 should not have notfound@example.com yet")
 	}
 	t.Log("✓ Verified initial cache isolation")
@@ -408,29 +338,15 @@ func TestRecipientCache_TwoServerIntegration(t *testing.T) {
 	t.Log("✓ Server 2 broadcasted to Server 1")
 
 	// Verify that cache entries have propagated
-	// Server 1 should now have Server 2's blocked recipient
-	found, isBlocked, reason := servers[0].IsRecipientCached("blocked@example.com")
-	if !found {
-		t.Fatal("Server 1 should have received blocked@example.com from Server 2")
+	// Server 1 should now have Server 2's not found recipient
+	if !servers[0].IsRecipientCached("other@example.com") {
+		t.Fatal("Server 1 should have received other@example.com from Server 2")
 	}
-	if !isBlocked {
-		t.Fatal("Server 1 should have received blocked@example.com as 'blocked'")
-	}
-	if reason != "recipient blocked by destination (cached)" {
-		t.Fatalf("Server 1: Expected reason 'recipient blocked by destination (cached)', got: %s", reason)
-	}
-	t.Log("✓ Server 1 received blocked@example.com from Server 2")
+	t.Log("✓ Server 1 received other@example.com from Server 2")
 
 	// Server 2 should now have Server 1's not found recipient
-	found, isBlocked, reason = servers[1].IsRecipientCached("notfound@example.com")
-	if !found {
+	if !servers[1].IsRecipientCached("notfound@example.com") {
 		t.Fatal("Server 2 should have received notfound@example.com from Server 1")
-	}
-	if isBlocked {
-		t.Fatal("Server 2 should have received notfound@example.com as 'not found'")
-	}
-	if reason != "recipient not found (cached)" {
-		t.Fatalf("Server 2: Expected reason 'recipient not found (cached)', got: %s", reason)
 	}
 	t.Log("✓ Server 2 received notfound@example.com from Server 1")
 
@@ -445,8 +361,7 @@ func TestRecipientCache_TwoServerIntegration(t *testing.T) {
 	t.Log("✓ Server 2 broadcasted again to Server 1")
 
 	// Server 1 should receive it
-	found, _, _ = servers[0].IsRecipientCached("newuser@example.com")
-	if !found {
+	if !servers[0].IsRecipientCached("newuser@example.com") {
 		t.Fatal("Server 1 should have received newuser@example.com from Server 2")
 	}
 	t.Log("✓ Server 1 received newuser@example.com from Server 2")
@@ -478,19 +393,14 @@ func TestRecipientCache_CleanupExpiredEntries(t *testing.T) {
 	// Cache multiple recipients
 	dt.CacheRecipientNotFound("user1@example.com")
 	dt.CacheRecipientNotFound("user2@example.com")
-	dt.CacheRecipientBlocked("user3@example.com")
 
 	// Verify they're cached
 	dt.recipientMu.RLock()
 	notFoundCount := len(dt.recipientNotFound)
-	blockedCount := len(dt.recipientBlocked)
 	dt.recipientMu.RUnlock()
 
 	if notFoundCount != 2 {
 		t.Fatalf("Expected 2 not-found entries, got %d", notFoundCount)
-	}
-	if blockedCount != 1 {
-		t.Fatalf("Expected 1 blocked entry, got %d", blockedCount)
 	}
 
 	// Wait for expiry
@@ -502,14 +412,10 @@ func TestRecipientCache_CleanupExpiredEntries(t *testing.T) {
 	// All entries should be removed
 	dt.recipientMu.RLock()
 	notFoundCount = len(dt.recipientNotFound)
-	blockedCount = len(dt.recipientBlocked)
 	dt.recipientMu.RUnlock()
 
 	if notFoundCount != 0 {
 		t.Fatalf("Expected 0 not-found entries after cleanup, got %d", notFoundCount)
-	}
-	if blockedCount != 0 {
-		t.Fatalf("Expected 0 blocked entries after cleanup, got %d", blockedCount)
 	}
 
 	t.Log("✓ Cleanup successfully removed expired entries")
@@ -517,7 +423,7 @@ func TestRecipientCache_CleanupExpiredEntries(t *testing.T) {
 
 // TestRecipientCache_ClearAfterValidation tests that ClearRecipientCache removes stale entries
 // This prevents the bug where a recipient passes RCPT TO validation but is then
-// rejected during DATA by a stale cached 404/403 from a previous delivery attempt.
+// rejected during DATA by a stale cached 404 from a previous delivery attempt.
 func TestRecipientCache_ClearAfterValidation(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
@@ -542,8 +448,7 @@ func TestRecipientCache_ClearAfterValidation(t *testing.T) {
 	dt.CacheRecipientNotFound("user@example.com")
 
 	// Verify it's cached
-	found, _, _ := dt.IsRecipientCached("user@example.com")
-	if !found {
+	if !dt.IsRecipientCached("user@example.com") {
 		t.Fatal("Expected recipient to be cached as not found")
 	}
 
@@ -552,47 +457,8 @@ func TestRecipientCache_ClearAfterValidation(t *testing.T) {
 	dt.ClearRecipientCache("user@example.com")
 
 	// The cache entry should be gone
-	found, _, _ = dt.IsRecipientCached("user@example.com")
-	if found {
+	if dt.IsRecipientCached("user@example.com") {
 		t.Fatal("Expected recipient cache to be cleared after successful validation")
-	}
-}
-
-// TestRecipientCache_ClearBlockedAfterValidation tests clearing a blocked entry
-func TestRecipientCache_ClearBlockedAfterValidation(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-
-	local := NewConnectionTracker(100, 10, 0, nil)
-	dt := NewDistributedTracker(
-		local,
-		nil,
-		"",
-		"",
-		DistributedConfig{
-			Hostname:          "server1",
-			Cluster:           newMockCluster(),
-			GossipInterval:    1 * time.Hour,
-			S3SyncInterval:    1 * time.Hour,
-			GlobalMaxPerIP:    20,
-			RecipientCacheTTL: 5 * time.Minute,
-		},
-		logger,
-	)
-
-	// Simulate a previous delivery returning 403 — recipient gets cached as "blocked"
-	dt.CacheRecipientBlocked("user@example.com")
-
-	found, isBlocked, _ := dt.IsRecipientCached("user@example.com")
-	if !found || !isBlocked {
-		t.Fatal("Expected recipient to be cached as blocked")
-	}
-
-	// Clear after validation passes
-	dt.ClearRecipientCache("user@example.com")
-
-	found, _, _ = dt.IsRecipientCached("user@example.com")
-	if found {
-		t.Fatal("Expected blocked cache to be cleared after successful validation")
 	}
 }
 
@@ -622,8 +488,7 @@ func TestRecipientCache_ClearNonExistent(t *testing.T) {
 
 	// Other entries should be unaffected
 	dt.CacheRecipientNotFound("other@example.com")
-	found, _, _ := dt.IsRecipientCached("other@example.com")
-	if !found {
+	if !dt.IsRecipientCached("other@example.com") {
 		t.Fatal("Expected other recipient to still be cached")
 	}
 }
@@ -652,25 +517,18 @@ func TestRecipientCache_ClearDoesNotAffectOtherEntries(t *testing.T) {
 	// Cache multiple recipients
 	dt.CacheRecipientNotFound("user1@example.com")
 	dt.CacheRecipientNotFound("user2@example.com")
-	dt.CacheRecipientBlocked("user3@example.com")
 
 	// Clear only user1
 	dt.ClearRecipientCache("user1@example.com")
 
 	// user1 should be gone
-	found, _, _ := dt.IsRecipientCached("user1@example.com")
-	if found {
+	if dt.IsRecipientCached("user1@example.com") {
 		t.Fatal("Expected user1 to be cleared")
 	}
 
-	// user2 and user3 should still be cached
-	found, _, _ = dt.IsRecipientCached("user2@example.com")
-	if !found {
+	// user2 should still be cached
+	if !dt.IsRecipientCached("user2@example.com") {
 		t.Fatal("Expected user2 to still be cached")
-	}
-	found, isBlocked, _ := dt.IsRecipientCached("user3@example.com")
-	if !found || !isBlocked {
-		t.Fatal("Expected user3 to still be cached as blocked")
 	}
 }
 
@@ -704,11 +562,7 @@ func TestRecipientCache_ConcurrentAccess(t *testing.T) {
 		go func(idx int) {
 			defer wg.Done()
 			email := fmt.Sprintf("user%d@example.com", idx)
-			if idx%2 == 0 {
-				dt.CacheRecipientNotFound(email)
-			} else {
-				dt.CacheRecipientBlocked(email)
-			}
+			dt.CacheRecipientNotFound(email)
 		}(i)
 	}
 
@@ -726,7 +580,7 @@ func TestRecipientCache_ConcurrentAccess(t *testing.T) {
 
 	// Verify all entries were added
 	dt.recipientMu.RLock()
-	totalEntries := len(dt.recipientNotFound) + len(dt.recipientBlocked)
+	totalEntries := len(dt.recipientNotFound)
 	dt.recipientMu.RUnlock()
 
 	if totalEntries != concurrency {

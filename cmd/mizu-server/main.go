@@ -230,7 +230,7 @@ func main() {
 
 	// Initialize and start health check server (before starting SMTP servers)
 	// Note: Connection trackers are registered later via AddChecker after server backends are created
-	healthServer := startHealthServer(cfg, logger, statsManager, nil, nil, s3Client)
+	healthServer := startHealthServer(cfg, logger, statsManager, s3Client)
 
 	// Surface cluster leadership in the health endpoint (and `mizu-admin health`).
 	if clusterMgr != nil && healthServer != nil {
@@ -332,6 +332,7 @@ func main() {
 			if backend.DistTracker != nil {
 				backend.DistTracker.SetName("distributed_connections:" + serverCfg.Name)
 				healthServer.AddChecker(backend.DistTracker)
+				healthServer.AddCacheFlusher(backend.DistTracker)
 			} else if backend.ConnTracker != nil {
 				backend.ConnTracker.SetName("connection_tracker:" + serverCfg.Name)
 				healthServer.AddChecker(backend.ConnTracker)
@@ -721,7 +722,7 @@ func initCluster(cfg *config.Config, logger *slog.Logger) (*cluster.Cluster, err
 }
 
 // startHealthServer initializes and starts the health check server.
-func startHealthServer(cfg *config.Config, logger *slog.Logger, statsManager *stats.Manager, connTracker *smtp.ConnectionTracker, distTracker *smtp.DistributedTracker, s3Client *s3.Client) *health.Server {
+func startHealthServer(cfg *config.Config, logger *slog.Logger, statsManager *stats.Manager, s3Client *s3.Client) *health.Server {
 	if !cfg.Health.Enabled {
 		return nil
 	}
@@ -729,11 +730,6 @@ func startHealthServer(cfg *config.Config, logger *slog.Logger, statsManager *st
 	var checkers []health.Checker
 	if statsManager != nil {
 		checkers = append(checkers, statsManager)
-	}
-	if distTracker != nil {
-		checkers = append(checkers, distTracker)
-	} else if connTracker != nil {
-		checkers = append(checkers, connTracker)
 	}
 	if s3Client != nil {
 		checkers = append(checkers, health.NewCheckS3Connection(s3Client, cfg.Storage.S3Bucket))
@@ -794,18 +790,20 @@ func startHealthServer(cfg *config.Config, logger *slog.Logger, statsManager *st
 			healthServer.SetBasicAuth(cfg.Health.Username, cfg.Health.Password)
 		}
 		logger.Info("Health endpoint enabled", "listen_addr", cfg.Health.ListenAddr, "auth_enabled", cfg.Health.Username != "")
+		if cfg.Health.Username == "" {
+			// Deliberately not a startup failure. But this listener also serves
+			// the admin API (unblock-ip, renew-cert, stats), so say loudly that
+			// anyone who can reach it can use it.
+			logger.Warn("Health/admin API has NO authentication (health.username is empty) - anyone who can reach this address can unblock IPs, drop cached certificates and read stats; restrict it with a firewall or set health.username and health.password",
+				"listen_addr", cfg.Health.ListenAddr)
+		}
 	}
 
 	// Set stats provider
 	healthServer.SetStatsProvider(statsManager)
 
 	// Set IP unblocker for /api/unblock-ip endpoint
-	healthServer.SetIPUnblocker(statsManager)
-
-	// Set cache flusher (if distributed tracker exists)
-	if distTracker != nil {
-		healthServer.SetCacheFlusher(distTracker)
-	}
+	healthServer.AddIPUnblocker(statsManager)
 
 	healthServer.Start()
 	return healthServer
@@ -970,7 +968,7 @@ func createServerBackend(
 			connectionsPrefix,
 			smtp.DistributedConfig{
 				Hostname:          nodeName,
-				Cluster:           clusterMgr,
+				Cluster:           clusterMgr.Scoped(serverCfg.Name),
 				GossipInterval:    time.Duration(serverCfg.Distributed.GossipIntervalSeconds) * time.Second,
 				S3SyncInterval:    time.Duration(serverCfg.Distributed.S3SyncIntervalSeconds) * time.Second,
 				GlobalMaxPerIP:    serverCfg.Distributed.GlobalMaxPerIP,
@@ -991,7 +989,14 @@ func createServerBackend(
 			os.Exit(1)
 		}
 
-		rateLimiter = smtp.NewRateLimiter(serverCfg.RateLimit, clusterMgr, serverLogger)
+		// Gossip is scoped to this server so that two servers on one node do
+		// not receive each other's windows. A nil cluster must stay a nil
+		// interface, not a typed nil pointer inside one.
+		var rateLimitCluster smtp.RateLimiterCluster
+		if clusterMgr != nil {
+			rateLimitCluster = clusterMgr.Scoped(serverCfg.Name)
+		}
+		rateLimiter = smtp.NewRateLimiter(serverCfg.RateLimit, rateLimitCluster, serverLogger)
 		serverLogger.Info("Rate limiting enabled",
 			"dimensions", len(serverCfg.RateLimit.Dimensions),
 			"gossip_enabled", serverCfg.RateLimit.GossipEnabled)
@@ -1064,11 +1069,12 @@ func createServerBackend(
 
 			// Set up cluster sync if cluster is enabled and sync is configured
 			if clusterMgr != nil && cfg.ClusterSyncEnabled {
-				clusterLimiter := smtp.NewClusterAuthRateLimiter(limiter, clusterMgr, serverLogger)
+				scopedCluster := clusterMgr.Scoped(serverCfg.Name)
+				clusterLimiter := smtp.NewClusterAuthRateLimiter(limiter, scopedCluster, serverLogger)
 				limiter.SetClusterLimiter(clusterLimiter)
 
-				// Register handler with cluster
-				clusterMgr.RegisterAuthRateLimitHandler(clusterLimiter.HandleClusterEvent)
+				// Register handler with cluster (per server)
+				scopedCluster.RegisterAuthRateLimitHandler(clusterLimiter.HandleClusterEvent)
 
 				serverLogger.Info("Auth rate limiter cluster sync enabled")
 			}
@@ -1454,6 +1460,18 @@ func runSMTPServerInstance(ctx context.Context, serverCfg *config.ServerConfig, 
 		return
 	}
 	defer listener.Close()
+
+	// Bound open sockets at accept, before the client has said anything. The
+	// session-level limits only start at EHLO, so without this a peer that
+	// connects and never greets is not counted at all. It sits directly on the
+	// TCP listener (below PROXY protocol and TLS) and keys on the TCP peer;
+	// with PROXY protocol that peer is the load balancer, so trusted proxies
+	// are exempt from the per-IP count and only bound by the total.
+	var acceptPerIPExempt []*net.IPNet
+	if serverCfg.ProxyProtocol {
+		acceptPerIPExempt = serverCfg.ProxyTrustedNets()
+	}
+	listener = smtp.NewAcceptLimiter(listener, serverCfg.Limits.MaxConnections, serverCfg.Limits.MaxConnectionsPerIP, acceptPerIPExempt, logger.With("server", serverCfg.Name))
 
 	// Wrap with PROXY protocol listener if enabled
 	if serverCfg.ProxyProtocol {

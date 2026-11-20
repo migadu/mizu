@@ -22,6 +22,27 @@ func normalizeToCRLF(s string) string {
 	return strings.ReplaceAll(s, "\n", "\r\n")
 }
 
+// splitHeaderLines splits only the header block of a CRLF-normalised message
+// into lines. The returned lines end with the empty line that terminates the
+// headers (when the message has one), so callers can keep treating "" as the
+// end-of-headers marker; rest is everything after it, starting with the CRLF
+// that follows that empty line. strings.Join(lines, "\r\n")+rest is the
+// original message.
+//
+// The body is never split: a body of bare newlines is 2 bytes per line but 16
+// bytes per slice element, which made every caller allocate many times the
+// message size.
+func splitHeaderLines(rawEmail string) (lines []string, rest string) {
+	if strings.HasPrefix(rawEmail, "\r\n") {
+		return []string{""}, rawEmail
+	}
+	end := strings.Index(rawEmail, "\r\n\r\n")
+	if end == -1 {
+		return strings.Split(rawEmail, "\r\n"), ""
+	}
+	return strings.Split(rawEmail[:end+2], "\r\n"), rawEmail[end+2:]
+}
+
 // InjectMizuHeaders adds Received and X-Mizu-* headers to the email
 // These headers provide email tracing, authentication results, and debugging information
 // toggles selects which X-Mizu-* headers are emitted; the Received header is always added
@@ -355,7 +376,7 @@ func rewriteFromHeader(rawEmail, oldAddress, newAddress string) (string, bool) {
 	}
 
 	const prefix = "From:"
-	lines := strings.Split(rawEmail, "\r\n")
+	lines, body := splitHeaderLines(rawEmail)
 
 	for i := 0; i < len(lines); i++ {
 		line := lines[i]
@@ -391,7 +412,7 @@ func rewriteFromHeader(rawEmail, oldAddress, newAddress string) (string, bool) {
 		out = append(out, lines[:i]...)
 		out = append(out, rewritten)
 		out = append(out, lines[last+1:]...)
-		return strings.Join(out, "\r\n"), true
+		return strings.Join(out, "\r\n") + body, true
 	}
 
 	return rawEmail, false
@@ -400,16 +421,23 @@ func rewriteFromHeader(rawEmail, oldAddress, newAddress string) (string, bool) {
 // modifySubject modifies the Subject header according to the provided pattern
 // The pattern should contain %s which will be replaced with the original subject
 func modifySubject(rawEmail, pattern string) string {
-	lines := strings.Split(rawEmail, "\r\n")
+	lines, body := splitHeaderLines(rawEmail)
 	var result []string
 	subjectModified := false
 
 	// Use index-based loop so we can properly advance past folded continuation lines.
 	// A range loop would revisit continuation lines even after incrementing i.
+	inBody := false
 	for i := 0; i < len(lines); i++ {
 		line := lines[i]
+		// The first empty line ends the header block. Nothing after it is a
+		// header: a body line that happens to start with "Subject:" must not
+		// be rewritten (and must not stop a real Subject from being added).
+		if line == "" {
+			inBody = true
+		}
 		// Look for Subject header (case-insensitive)
-		if !subjectModified && len(line) >= 8 && strings.EqualFold(line[:8], "Subject:") {
+		if !inBody && !subjectModified && len(line) >= 8 && strings.EqualFold(line[:8], "Subject:") {
 			// Extract original subject (everything after "Subject: ")
 			originalSubject := strings.TrimSpace(line[8:])
 
@@ -442,14 +470,14 @@ func modifySubject(rawEmail, pattern string) string {
 		}
 	}
 
-	return strings.Join(result, "\r\n")
+	return strings.Join(result, "\r\n") + body
 }
 
 // fixMissingHeaders adds missing Message-ID and Date headers if they don't exist
 // This is typically used for relay servers that accept mail from other systems
 // Returns the modified email and a list of headers that were added
 func fixMissingHeaders(rawEmail, domain string) (string, []string) {
-	lines := strings.Split(rawEmail, "\r\n")
+	lines, body := splitHeaderLines(rawEmail)
 	hasMessageID := false
 	hasDate := false
 	headerEndIndex := -1
@@ -511,7 +539,7 @@ func fixMissingHeaders(rawEmail, domain string) (string, []string) {
 		result = append(result, lines[headerEndIndex:]...)
 	}
 
-	return strings.Join(result, "\r\n"), addedHeaders
+	return strings.Join(result, "\r\n") + body, addedHeaders
 }
 
 // generateMessageID creates a unique Message-ID header value
@@ -555,7 +583,7 @@ func detectMailLoop(rawEmail, serverHostname string, maxHops int) LoopDetectionR
 		maxHops = 30
 	}
 
-	lines := strings.Split(rawEmail, "\r\n")
+	lines, _ := splitHeaderLines(rawEmail)
 	hostnameCount := 0
 	currentReceivedHeader := ""
 

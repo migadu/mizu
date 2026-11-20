@@ -45,8 +45,9 @@ var (
 	// enumeration oracle: one AUTH per address reveals which ones exist. That
 	// is an accepted trade-off — a client that cannot tell "no such address"
 	// from "server down" retries a hopeless address forever. The auth rate
-	// limiter is what bounds the probing, since these attempts are now recorded
-	// (see the RecordAuthAttempt gate in auth_session.go).
+	// limiter is what bounds the probing: both the 404 and the wrong-password
+	// (ErrCredentialRejected) outcomes are recorded as failures (see the
+	// RecordAuthAttempt gate in auth_session.go).
 	ErrAuthCredentialsInvalid = &smtp.SMTPError{
 		Code:         535,
 		EnhancedCode: smtp.EnhancedCode{5, 7, 8},

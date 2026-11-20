@@ -24,7 +24,7 @@ func TestUnblockIPHandler_Success(t *testing.T) {
 	s := NewServer(":0", slog.New(slog.NewTextHandler(io.Discard, nil)))
 	s.SetHealthEnabled(true)
 	ub := &mockUnblocker{removed: true}
-	s.SetIPUnblocker(ub)
+	s.AddIPUnblocker(ub)
 
 	body := strings.NewReader(`{"ip": "1.2.3.4"}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/unblock-ip", body)
@@ -48,7 +48,7 @@ func TestUnblockIPHandler_NotTracked(t *testing.T) {
 	s := NewServer(":0", slog.New(slog.NewTextHandler(io.Discard, nil)))
 	s.SetHealthEnabled(true)
 	ub := &mockUnblocker{removed: false}
-	s.SetIPUnblocker(ub)
+	s.AddIPUnblocker(ub)
 
 	body := strings.NewReader(`{"ip": "5.6.7.8"}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/unblock-ip", body)
@@ -68,7 +68,7 @@ func TestUnblockIPHandler_NotTracked(t *testing.T) {
 func TestUnblockIPHandler_InvalidIP(t *testing.T) {
 	s := NewServer(":0", slog.New(slog.NewTextHandler(io.Discard, nil)))
 	s.SetHealthEnabled(true)
-	s.SetIPUnblocker(&mockUnblocker{})
+	s.AddIPUnblocker(&mockUnblocker{})
 
 	body := strings.NewReader(`{"ip": "not-an-ip"}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/unblock-ip", body)
@@ -85,7 +85,7 @@ func TestUnblockIPHandler_InvalidIP(t *testing.T) {
 func TestUnblockIPHandler_MalformedBody(t *testing.T) {
 	s := NewServer(":0", slog.New(slog.NewTextHandler(io.Discard, nil)))
 	s.SetHealthEnabled(true)
-	s.SetIPUnblocker(&mockUnblocker{})
+	s.AddIPUnblocker(&mockUnblocker{})
 
 	body := strings.NewReader(`{not json}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/unblock-ip", body)
@@ -105,7 +105,7 @@ func TestUnblockIPHandler_MalformedBody(t *testing.T) {
 func TestUnblockIPHandler_EmptyBody(t *testing.T) {
 	s := NewServer(":0", slog.New(slog.NewTextHandler(io.Discard, nil)))
 	s.SetHealthEnabled(true)
-	s.SetIPUnblocker(&mockUnblocker{})
+	s.AddIPUnblocker(&mockUnblocker{})
 
 	req := httptest.NewRequest(http.MethodPost, "/api/unblock-ip", strings.NewReader(""))
 	req.Header.Set("Content-Type", "application/json")
@@ -127,7 +127,7 @@ func TestUnblockIPHandler_CIDR(t *testing.T) {
 	s := NewServer(":0", slog.New(slog.NewTextHandler(io.Discard, nil)))
 	s.SetHealthEnabled(true)
 	ub := &mockUnblocker{removed: true}
-	s.SetIPUnblocker(ub)
+	s.AddIPUnblocker(ub)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/unblock-ip?ip=203.0.113.0/24", nil)
 	w := httptest.NewRecorder()
@@ -146,7 +146,7 @@ func TestUnblockIPHandler_CIDR(t *testing.T) {
 func TestUnblockIPHandler_BadCIDR(t *testing.T) {
 	s := NewServer(":0", slog.New(slog.NewTextHandler(io.Discard, nil)))
 	s.SetHealthEnabled(true)
-	s.SetIPUnblocker(&mockUnblocker{})
+	s.AddIPUnblocker(&mockUnblocker{})
 
 	req := httptest.NewRequest(http.MethodPost, "/api/unblock-ip?ip=garbage/24", nil)
 	w := httptest.NewRecorder()
@@ -162,7 +162,7 @@ func TestUnblockIPHandler_QueryParam(t *testing.T) {
 	s := NewServer(":0", slog.New(slog.NewTextHandler(io.Discard, nil)))
 	s.SetHealthEnabled(true)
 	ub := &mockUnblocker{removed: true}
-	s.SetIPUnblocker(ub)
+	s.AddIPUnblocker(ub)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/unblock-ip?ip=10.0.0.1", nil)
 	w := httptest.NewRecorder()
@@ -180,7 +180,7 @@ func TestUnblockIPHandler_QueryParam(t *testing.T) {
 func TestUnblockIPHandler_MethodNotAllowed(t *testing.T) {
 	s := NewServer(":0", slog.New(slog.NewTextHandler(io.Discard, nil)))
 	s.SetHealthEnabled(true)
-	s.SetIPUnblocker(&mockUnblocker{})
+	s.AddIPUnblocker(&mockUnblocker{})
 
 	req := httptest.NewRequest(http.MethodGet, "/api/unblock-ip?ip=1.2.3.4", nil)
 	w := httptest.NewRecorder()

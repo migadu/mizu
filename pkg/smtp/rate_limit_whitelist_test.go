@@ -114,6 +114,10 @@ func TestRateLimiter_WhitelistFromFile(t *testing.T) {
 	}
 
 	cfg := oneDimConfig(1)
+	// A sender-keyed dimension too, so the Mail-stage checks below exercise a
+	// limit (per_ip alone is only charged at connect).
+	cfg.Dimensions = append(cfg.Dimensions,
+		config.RateLimitDimension{Name: "per_ip_from", Keys: []string{"IP", "FROM"}, Limit: 1, WindowSeconds: 60})
 	cfg.WhitelistedIPsFile = ipsFile
 	cfg.WhitelistedDomainsFile = domainsFile
 	cfg.WhitelistedSendersFile = sendersFile
@@ -123,10 +127,13 @@ func TestRateLimiter_WhitelistFromFile(t *testing.T) {
 
 	cases := []SessionContext{
 		{RemoteAddr: "203.0.113.7:25", From: "who@nowhere.test"}, // file IP
-		{RemoteAddr: "8.8.8.8:25", From: "bob@trusted.org"},      // file domain (case-insensitive)
-		{RemoteAddr: "8.8.8.8:25", From: "admin@example.com"},    // file sender (case-insensitive)
+		// Sender entries exempt every dimension only for a verified
+		// (authenticated) sender, hence AuthenticatedUser on these two.
+		{RemoteAddr: "8.8.8.8:25", From: "bob@trusted.org", AuthenticatedUser: "bob@trusted.org"},     // file domain (case-insensitive)
+		{RemoteAddr: "8.8.8.8:25", From: "admin@example.com", AuthenticatedUser: "admin@example.com"}, // file sender (case-insensitive)
 	}
 	for _, ctx := range cases {
+		ctx.Stage = StageMail
 		for i := 0; i < 10; i++ {
 			if err := rl.CheckRateLimit(ctx); err != nil {
 				t.Fatalf("whitelisted (from file) %+v should bypass at %d: %v", ctx, i+1, err)

@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"log/slog"
@@ -30,7 +31,11 @@ const (
 
 // GossipMessage is the envelope for all gossip messages
 type GossipMessage struct {
-	Type    MessageType     `json:"type"`
+	Type MessageType `json:"type"`
+	// Scope names the [[server]] the message belongs to, so that a node
+	// running several servers routes it to the matching one. Empty for a
+	// process-wide (unscoped) sender.
+	Scope   string          `json:"scope,omitempty"`
 	Payload json.RawMessage `json:"payload"`
 }
 
@@ -49,14 +54,14 @@ type EventDelegate interface {
 
 // Cluster manages memberlist-based cluster membership and gossip
 type Cluster struct {
-	ml                     *memberlist.Memberlist
-	broadcasts             *memberlist.TransmitLimitedQueue
-	logger                 *slog.Logger
-	connectionStateHandler func(data []byte)
-	rateLimitHandler       func(data []byte)
-	authRateLimitHandler   func(data []byte)
-	stateDelegate          StateDelegate
-	eventDelegate          EventDelegate
+	ml               *memberlist.Memberlist
+	broadcasts       *memberlist.TransmitLimitedQueue
+	reliableInFlight sync.Map // handlerKey -> *atomic.Bool: a large direct send is in progress
+	logger           *slog.Logger
+	handlersMu       sync.RWMutex
+	handlers         map[handlerKey]func(data []byte) // per message type and server scope
+	stateDelegates   map[string]StateDelegate         // per server scope, guarded by handlersMu
+	eventDelegates   map[string]EventDelegate         // per server scope, guarded by handlersMu
 
 	// Leader election
 	leader    string
@@ -97,10 +102,14 @@ func NewCluster(cfg Config) (*Cluster, error) {
 	}
 
 	cluster := &Cluster{
-		logger:        cfg.Logger,
-		stateDelegate: cfg.StateDelegate,
-		eventDelegate: cfg.EventDelegate,
-		done:          make(chan struct{}),
+		logger: cfg.Logger,
+		done:   make(chan struct{}),
+	}
+	if cfg.StateDelegate != nil {
+		cluster.setStateDelegate("", cfg.StateDelegate)
+	}
+	if cfg.EventDelegate != nil {
+		cluster.setEventDelegate("", cfg.EventDelegate)
 	}
 	cluster.rejoinInterval = cfg.RejoinInterval
 	if cluster.rejoinInterval <= 0 {
@@ -256,90 +265,171 @@ func (c *Cluster) missingPeers(peers []string) []string {
 	return missing
 }
 
-// SetStateDelegate sets the state delegate for the cluster
+// SetStateDelegate sets the unscoped state delegate for the cluster. A process
+// with several servers must use Scoped instead.
 func (c *Cluster) SetStateDelegate(delegate StateDelegate) {
-	c.stateDelegate = delegate
+	c.setStateDelegate("", delegate)
 }
 
-// SetEventDelegate sets the event delegate for the cluster
+// SetEventDelegate sets the unscoped event delegate for the cluster. A process
+// with several servers must use Scoped instead.
 func (c *Cluster) SetEventDelegate(delegate EventDelegate) {
-	c.eventDelegate = delegate
+	c.setEventDelegate("", delegate)
 }
 
-// RegisterConnectionStateHandler registers a handler for connection state gossip
+func (c *Cluster) setStateDelegate(scope string, delegate StateDelegate) {
+	c.handlersMu.Lock()
+	defer c.handlersMu.Unlock()
+	if c.stateDelegates == nil {
+		c.stateDelegates = make(map[string]StateDelegate)
+	}
+	c.stateDelegates[scope] = delegate
+}
+
+func (c *Cluster) setEventDelegate(scope string, delegate EventDelegate) {
+	c.handlersMu.Lock()
+	defer c.handlersMu.Unlock()
+	if c.eventDelegates == nil {
+		c.eventDelegates = make(map[string]EventDelegate)
+	}
+	c.eventDelegates[scope] = delegate
+}
+
+// stateDelegatesSnapshot copies the registered state delegates so they can be
+// called without holding handlersMu.
+func (c *Cluster) stateDelegatesSnapshot() map[string]StateDelegate {
+	c.handlersMu.RLock()
+	defer c.handlersMu.RUnlock()
+	out := make(map[string]StateDelegate, len(c.stateDelegates))
+	for scope, d := range c.stateDelegates {
+		out[scope] = d
+	}
+	return out
+}
+
+// eventDelegatesSnapshot copies the registered event delegates so they can be
+// called without holding handlersMu.
+func (c *Cluster) eventDelegatesSnapshot() []EventDelegate {
+	c.handlersMu.RLock()
+	defer c.handlersMu.RUnlock()
+	out := make([]EventDelegate, 0, len(c.eventDelegates))
+	for _, d := range c.eventDelegates {
+		out = append(out, d)
+	}
+	return out
+}
+
+// handlerKey identifies who a gossip message is for: its type, and the
+// [[server]] scope it was sent under.
+type handlerKey struct {
+	kind  MessageType
+	scope string
+}
+
+func (c *Cluster) registerHandler(kind MessageType, scope string, handler func(data []byte)) {
+	c.handlersMu.Lock()
+	defer c.handlersMu.Unlock()
+	if c.handlers == nil {
+		c.handlers = make(map[handlerKey]func(data []byte))
+	}
+	c.handlers[handlerKey{kind, scope}] = handler
+}
+
+func (c *Cluster) handlerFor(kind MessageType, scope string) func(data []byte) {
+	c.handlersMu.RLock()
+	defer c.handlersMu.RUnlock()
+	return c.handlers[handlerKey{kind, scope}]
+}
+
+// RegisterConnectionStateHandler registers the unscoped handler for connection
+// state gossip. A process with several servers must use Scoped instead.
 func (c *Cluster) RegisterConnectionStateHandler(handler func(data []byte)) {
-	c.connectionStateHandler = handler
+	c.registerHandler(MessageTypeConnectionState, "", handler)
 }
 
-// RegisterRateLimitHandler registers a handler for rate limit gossip
+// RegisterRateLimitHandler registers the unscoped handler for rate limit gossip
 func (c *Cluster) RegisterRateLimitHandler(handler func(data []byte)) {
-	c.rateLimitHandler = handler
+	c.registerHandler(MessageTypeRateLimit, "", handler)
 }
 
-// RegisterAuthRateLimitHandler registers a handler for auth rate limit gossip
+// RegisterAuthRateLimitHandler registers the unscoped handler for auth rate limit gossip
 func (c *Cluster) RegisterAuthRateLimitHandler(handler func(data []byte)) {
-	c.authRateLimitHandler = handler
+	c.registerHandler(MessageTypeAuthRateLimit, "", handler)
 }
 
-// BroadcastConnectionState broadcasts connection state to the cluster
+// BroadcastConnectionState broadcasts a connection state snapshot to the cluster
 func (c *Cluster) BroadcastConnectionState(data []byte) error {
-	msg := GossipMessage{
-		Type:    MessageTypeConnectionState,
-		Payload: json.RawMessage(data),
-	}
-
-	msgBytes, err := json.Marshal(msg)
-	if err != nil {
-		return fmt.Errorf("failed to marshal message: %w", err)
-	}
-
-	c.broadcasts.QueueBroadcast(&broadcast{
-		msg:    msgBytes,
-		notify: nil,
-	})
-
-	return nil
+	return c.send(MessageTypeConnectionState, "", data, true)
 }
 
-// BroadcastRateLimit broadcasts rate limit data to the cluster
+// BroadcastRateLimit broadcasts a rate limit snapshot to the cluster
 func (c *Cluster) BroadcastRateLimit(data []byte) error {
-	msg := GossipMessage{
-		Type:    MessageTypeRateLimit,
-		Payload: json.RawMessage(data),
-	}
-
-	msgBytes, err := json.Marshal(msg)
-	if err != nil {
-		return fmt.Errorf("failed to marshal message: %w", err)
-	}
-
-	c.broadcasts.QueueBroadcast(&broadcast{
-		msg:    msgBytes,
-		notify: nil,
-	})
-
-	return nil
+	return c.send(MessageTypeRateLimit, "", data, true)
 }
 
-// BroadcastAuthRateLimit broadcasts auth rate limit data to the cluster
+// BroadcastAuthRateLimit broadcasts one auth rate limit event to the cluster
 func (c *Cluster) BroadcastAuthRateLimit(data []byte) error {
-	msg := GossipMessage{
-		Type:    MessageTypeAuthRateLimit,
-		Payload: json.RawMessage(data),
-	}
-
-	msgBytes, err := json.Marshal(msg)
-	if err != nil {
-		return fmt.Errorf("failed to marshal message: %w", err)
-	}
-
-	c.broadcasts.QueueBroadcast(&broadcast{
-		msg:    msgBytes,
-		notify: nil,
-	})
-
-	return nil
+	return c.send(MessageTypeAuthRateLimit, "", data, false)
 }
+
+// Scoped returns a view of the cluster for one [[server]]. Messages broadcast
+// through it are tagged with the scope and delivered only to handlers
+// registered under the same scope on the receiving node.
+//
+// There used to be a single handler slot per message type for the whole
+// process: with two servers on a node, the last to register received both
+// servers' gossip (mixing their connection counts, rate-limit windows and auth
+// blocks) and the other received none.
+func (c *Cluster) Scoped(scope string) *ScopedCluster {
+	return &ScopedCluster{c: c, scope: scope}
+}
+
+// ScopedCluster is a per-server view of a Cluster. See Cluster.Scoped.
+type ScopedCluster struct {
+	c     *Cluster
+	scope string
+}
+
+func (s *ScopedCluster) RegisterConnectionStateHandler(handler func(data []byte)) {
+	s.c.registerHandler(MessageTypeConnectionState, s.scope, handler)
+}
+
+func (s *ScopedCluster) RegisterRateLimitHandler(handler func(data []byte)) {
+	s.c.registerHandler(MessageTypeRateLimit, s.scope, handler)
+}
+
+func (s *ScopedCluster) RegisterAuthRateLimitHandler(handler func(data []byte)) {
+	s.c.registerHandler(MessageTypeAuthRateLimit, s.scope, handler)
+}
+
+func (s *ScopedCluster) BroadcastConnectionState(data []byte) error {
+	return s.c.send(MessageTypeConnectionState, s.scope, data, true)
+}
+
+func (s *ScopedCluster) BroadcastRateLimit(data []byte) error {
+	return s.c.send(MessageTypeRateLimit, s.scope, data, true)
+}
+
+func (s *ScopedCluster) BroadcastAuthRateLimit(data []byte) error {
+	return s.c.send(MessageTypeAuthRateLimit, s.scope, data, false)
+}
+
+// SetStateDelegate registers this server's push/pull state delegate. State is
+// exchanged per scope, so each server syncs with its counterpart on the peer.
+func (s *ScopedCluster) SetStateDelegate(delegate StateDelegate) {
+	s.c.setStateDelegate(s.scope, delegate)
+}
+
+// SetEventDelegate registers this server's membership event delegate. Every
+// registered delegate is notified of every membership event.
+func (s *ScopedCluster) SetEventDelegate(delegate EventDelegate) {
+	s.c.setEventDelegate(s.scope, delegate)
+}
+
+// NumMembers and LocalNodeName are not per-server; they pass through to the
+// cluster.
+func (s *ScopedCluster) NumMembers() int       { return s.c.NumMembers() }
+func (s *ScopedCluster) LocalNodeName() string { return s.c.LocalNodeName() }
 
 // Members returns the list of cluster members
 func (c *Cluster) Members() []*memberlist.Node {
@@ -477,17 +567,11 @@ func (c *Cluster) NotifyMsg(data []byte) {
 	}
 
 	switch msg.Type {
-	case MessageTypeConnectionState:
-		if c.connectionStateHandler != nil {
-			c.connectionStateHandler(msg.Payload)
-		}
-	case MessageTypeRateLimit:
-		if c.rateLimitHandler != nil {
-			c.rateLimitHandler(msg.Payload)
-		}
-	case MessageTypeAuthRateLimit:
-		if c.authRateLimitHandler != nil {
-			c.authRateLimitHandler(msg.Payload)
+	case MessageTypeConnectionState, MessageTypeRateLimit, MessageTypeAuthRateLimit:
+		// Delivered only to the handler registered under the sender's scope: a
+		// message from a server this node does not run is dropped.
+		if handler := c.handlerFor(msg.Type, msg.Scope); handler != nil {
+			handler(msg.Payload)
 		}
 	default:
 		c.logger.Warn("Unknown gossip message type", "type", uint8(msg.Type))
@@ -500,17 +584,42 @@ func (c *Cluster) GetBroadcasts(overhead, limit int) [][]byte {
 }
 
 // LocalState is used for state synchronization on node join
+//
+// The state is a JSON object of server scope -> that server's state, so a node
+// running several servers syncs each with its counterpart on the peer.
 func (c *Cluster) LocalState(join bool) []byte {
-	if c.stateDelegate != nil {
-		return c.stateDelegate.GetState()
+	delegates := c.stateDelegatesSnapshot()
+	if len(delegates) == 0 {
+		return []byte{}
 	}
-	return []byte{}
+	states := make(map[string][]byte, len(delegates))
+	for scope, d := range delegates {
+		states[scope] = d.GetState()
+	}
+	buf, err := json.Marshal(states)
+	if err != nil {
+		c.logger.Warn("Failed to marshal local cluster state", "error", err)
+		return []byte{}
+	}
+	return buf
 }
 
 // MergeRemoteState is called to merge state from a remote node
+// State for a scope this node does not run is dropped.
 func (c *Cluster) MergeRemoteState(buf []byte, join bool) {
-	if c.stateDelegate != nil {
-		c.stateDelegate.MergeState(buf)
+	if len(buf) == 0 {
+		return
+	}
+	var states map[string][]byte
+	if err := json.Unmarshal(buf, &states); err != nil {
+		c.logger.Warn("Failed to unmarshal remote cluster state", "error", err)
+		return
+	}
+	delegates := c.stateDelegatesSnapshot()
+	for scope, state := range states {
+		if d := delegates[scope]; d != nil {
+			d.MergeState(state)
+		}
 	}
 }
 
@@ -526,8 +635,8 @@ func (c *Cluster) NotifyJoin(node *memberlist.Node) {
 	// (memberlist holds a read lock when calling this)
 	concurrency.SafeGo(c.logger, "cluster-update-leader-join", c.updateLeader)
 
-	if c.eventDelegate != nil {
-		c.eventDelegate.NotifyJoin(node)
+	for _, d := range c.eventDelegatesSnapshot() {
+		d.NotifyJoin(node)
 	}
 }
 
@@ -541,8 +650,8 @@ func (c *Cluster) NotifyLeave(node *memberlist.Node) {
 	// (memberlist holds a read lock when calling this)
 	concurrency.SafeGo(c.logger, "cluster-update-leader-leave", c.updateLeader)
 
-	if c.eventDelegate != nil {
-		c.eventDelegate.NotifyLeave(node)
+	for _, d := range c.eventDelegatesSnapshot() {
+		d.NotifyLeave(node)
 	}
 }
 
@@ -552,21 +661,96 @@ func (c *Cluster) NotifyUpdate(node *memberlist.Node) {
 		"node", node.Name,
 		"addr", node.Address())
 
-	if c.eventDelegate != nil {
-		c.eventDelegate.NotifyUpdate(node)
+	for _, d := range c.eventDelegatesSnapshot() {
+		d.NotifyUpdate(node)
 	}
+}
+
+// maxGossipMessageSize is the largest message handed to the UDP gossip queue.
+// memberlist only ever transmits queued broadcasts that fit what is left of one
+// UDP packet (UDPBufferSize 1400, minus its own framing, the compound-message
+// header and encryption overhead) and never drops the ones that do not, so
+// anything larger would sit in the queue forever. Kept comfortably below that.
+const maxGossipMessageSize = 1024
+
+// send distributes one message to the cluster.
+//
+// Small messages ride on gossip. A snapshot (full state, where only the latest
+// matters) replaces an older queued snapshot of the same type instead of
+// queueing behind it; events do not invalidate one another.
+//
+// Messages too large for a UDP packet are sent directly to every member over
+// memberlist's reliable (TCP) channel. If the previous large snapshot of the
+// same type and scope is still being sent, a new snapshot is skipped: they are
+// periodic, so the next tick carries fresher state, and a slow peer must not
+// make sends pile up. Events are never skipped.
+func (c *Cluster) send(msgType MessageType, scope string, data []byte, snapshot bool) error {
+	msgBytes, err := json.Marshal(GossipMessage{Type: msgType, Scope: scope, Payload: json.RawMessage(data)})
+	if err != nil {
+		return fmt.Errorf("failed to marshal message: %w", err)
+	}
+
+	if len(msgBytes) <= maxGossipMessageSize {
+		c.broadcasts.QueueBroadcast(&broadcast{msg: msgBytes, kind: msgType, scope: scope, snapshot: snapshot})
+		return nil
+	}
+
+	// Only snapshots may be skipped while an earlier one is in flight. An event
+	// is sent once and never repeated, so skipping it would lose it; events are
+	// small in number (the callers bound their queues) and each gets its send.
+	release := func() {}
+	if snapshot {
+		flag, _ := c.reliableInFlight.LoadOrStore(handlerKey{msgType, scope}, new(atomic.Bool))
+		inFlight := flag.(*atomic.Bool)
+		if !inFlight.CompareAndSwap(false, true) {
+			c.logger.Debug("Skipping large cluster snapshot - previous send still in progress",
+				"type", uint8(msgType), "bytes", len(msgBytes))
+			return nil
+		}
+		release = func() { inFlight.Store(false) }
+	}
+
+	concurrency.SafeGo(c.logger, "cluster-send-reliable", func() {
+		defer release()
+
+		c.leaderMtx.RLock()
+		ml := c.ml
+		c.leaderMtx.RUnlock()
+		if ml == nil {
+			return
+		}
+		local := ml.LocalNode().Name
+		for _, node := range ml.Members() {
+			if node.Name == local {
+				continue
+			}
+			if err := ml.SendReliable(node, msgBytes); err != nil {
+				c.logger.Debug("Failed to send cluster message to peer",
+					"peer", node.Name, "type", uint8(msgType), "bytes", len(msgBytes), "error", err)
+			}
+		}
+	})
+	return nil
 }
 
 // --- Helper Types ---
 
 // broadcast implements memberlist.Broadcast
 type broadcast struct {
-	msg    []byte
-	notify chan<- struct{}
+	msg      []byte
+	kind     MessageType
+	scope    string
+	snapshot bool // full-state message: a newer one of the same kind supersedes it
+	notify   chan<- struct{}
 }
 
+// Invalidates reports whether b makes an older queued broadcast pointless. A
+// snapshot supersedes any queued snapshot of the same kind and server scope,
+// which keeps the queue at one entry per kind and scope however fast snapshots
+// are produced.
 func (b *broadcast) Invalidates(other memberlist.Broadcast) bool {
-	return false // Don't invalidate other broadcasts
+	o, ok := other.(*broadcast)
+	return ok && b.snapshot && o.snapshot && o.kind == b.kind && o.scope == b.scope
 }
 
 func (b *broadcast) Message() []byte {

@@ -83,13 +83,13 @@ func TestDistributedTracker_LocalAndGlobalLimits(t *testing.T) {
 
 	// Acquire 5 connections locally (local limit)
 	for i := 0; i < 5; i++ {
-		if err := dt.TryAcquire("192.168.1.100:5000"); err != nil {
+		if _, err := dt.Acquire("192.168.1.100:5000"); err != nil {
 			t.Fatalf("Expected to acquire connection %d, got error: %v", i+1, err)
 		}
 	}
 
 	// 6th connection should fail (local limit reached)
-	if err := dt.TryAcquire("192.168.1.100:5000"); err == nil {
+	if _, err := dt.Acquire("192.168.1.100:5000"); err == nil {
 		t.Fatal("Expected error when exceeding local per-IP limit, got nil")
 	}
 
@@ -108,12 +108,12 @@ func TestDistributedTracker_LocalAndGlobalLimits(t *testing.T) {
 
 	// Now we have 5 local + 4 peer = 9 total for this IP
 	// Global limit is 8, so new connection should fail even though local has room
-	if err := dt.TryAcquire("192.168.1.100:5001"); err == nil {
+	if _, err := dt.Acquire("192.168.1.100:5001"); err == nil {
 		t.Fatal("Expected error when exceeding global per-IP limit, got nil")
 	}
 
 	// Different IP should still work
-	if err := dt.TryAcquire("192.168.1.200:5000"); err != nil {
+	if _, err := dt.Acquire("192.168.1.200:5000"); err != nil {
 		t.Fatalf("Expected to acquire connection from different IP, got error: %v", err)
 	}
 }
@@ -141,7 +141,7 @@ func TestDistributedTracker_StalePeersIgnored(t *testing.T) {
 
 	// Acquire 5 connections locally
 	for i := 0; i < 5; i++ {
-		if err := dt.TryAcquire("192.168.1.100:5000"); err != nil {
+		if _, err := dt.Acquire("192.168.1.100:5000"); err != nil {
 			t.Fatalf("Failed to acquire connection %d: %v", i+1, err)
 		}
 	}
@@ -161,7 +161,7 @@ func TestDistributedTracker_StalePeersIgnored(t *testing.T) {
 
 	// Should succeed because stale peer data is ignored
 	// Local: 5, Stale peer: 100 (ignored), Global limit: 15
-	if err := dt.TryAcquire("192.168.1.100:5001"); err != nil {
+	if _, err := dt.Acquire("192.168.1.100:5001"); err != nil {
 		t.Fatalf("Expected to acquire connection (stale peer should be ignored), got error: %v", err)
 	}
 }
@@ -188,9 +188,9 @@ func TestDistributedTracker_GossipHandler(t *testing.T) {
 	)
 
 	// Acquire some connections
-	dt.TryAcquire("192.168.1.100:5000")
-	dt.TryAcquire("192.168.1.100:5001")
-	dt.TryAcquire("192.168.1.101:5000")
+	dt.Acquire("192.168.1.100:5000")
+	dt.Acquire("192.168.1.100:5001")
+	dt.Acquire("192.168.1.101:5000")
 
 	// Create a peer snapshot to send via gossip
 	peerSnapshot := ConnectionSnapshot{
@@ -244,10 +244,10 @@ func TestDistributedTracker_GetGlobalStats(t *testing.T) {
 
 	// Acquire 5 connections from 2 IPs locally
 	for i := 0; i < 3; i++ {
-		dt.TryAcquire("192.168.1.100:5000")
+		dt.Acquire("192.168.1.100:5000")
 	}
 	for i := 0; i < 2; i++ {
-		dt.TryAcquire("192.168.1.101:5000")
+		dt.Acquire("192.168.1.101:5000")
 	}
 
 	// Add peer data
@@ -325,8 +325,8 @@ func TestDistributedTracker_ConcurrentAccess(t *testing.T) {
 			defer wg.Done()
 			addr := "192.168.1.100:5000"
 			for j := 0; j < operationsPerGoroutine; j++ {
-				if err := dt.TryAcquire(addr); err == nil {
-					dt.Release(addr)
+				if lease, err := dt.Acquire(addr); err == nil {
+					lease.Release()
 				}
 			}
 		}(i)
@@ -394,7 +394,7 @@ func TestDistributedTracker_ReleaseRollback(t *testing.T) {
 
 	// Acquire 5 locally
 	for i := 0; i < 5; i++ {
-		if err := dt.TryAcquire("192.168.1.100:5000"); err != nil {
+		if _, err := dt.Acquire("192.168.1.100:5000"); err != nil {
 			t.Fatalf("Failed to acquire connection %d: %v", i+1, err)
 		}
 	}
@@ -413,7 +413,7 @@ func TestDistributedTracker_ReleaseRollback(t *testing.T) {
 	dt.peerMu.Unlock()
 
 	// Try to acquire 6th connection - should fail global limit
-	if err := dt.TryAcquire("192.168.1.100:5001"); err == nil {
+	if _, err := dt.Acquire("192.168.1.100:5001"); err == nil {
 		t.Fatal("Expected error due to global limit, got nil")
 	}
 
@@ -505,7 +505,7 @@ func TestDistributedTracker_NoGlobalLimit(t *testing.T) {
 
 	// Acquire 5 connections (local limit)
 	for i := 0; i < 5; i++ {
-		if err := dt.TryAcquire("192.168.1.100:5000"); err != nil {
+		if _, err := dt.Acquire("192.168.1.100:5000"); err != nil {
 			t.Fatalf("Failed to acquire connection %d: %v", i+1, err)
 		}
 	}
@@ -524,7 +524,7 @@ func TestDistributedTracker_NoGlobalLimit(t *testing.T) {
 	dt.peerMu.Unlock()
 
 	// 6th connection should fail due to LOCAL limit only (global is disabled)
-	if err := dt.TryAcquire("192.168.1.100:5001"); err == nil {
+	if _, err := dt.Acquire("192.168.1.100:5001"); err == nil {
 		t.Fatal("Expected error due to local limit, got nil")
 	} else if !strings.Contains(err.Error(), "maximum connections per IP") {
 		t.Errorf("Expected local limit error, got: %v", err)
