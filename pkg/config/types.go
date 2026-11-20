@@ -172,7 +172,6 @@ type ServerLimitsConfig struct {
 
 // ServerValidationConfig holds message validation settings (applies to both relay and submission)
 type ServerValidationConfig struct {
-	AllowNullSender      bool   `toml:"allow_null_sender"`      // Allow bounce messages with null sender (<>) - typically true for relay, false for submission
 	MissingHeadersAction string `toml:"missing_headers_action"` // Action for missing Message-ID/Date headers: "reject", "fix", "none" (default: "reject" for submission, "fix" for relay)
 	LoopDetection        *bool  `toml:"loop_detection"`         // Enable mail loop detection by checking Received headers (default: true, set to false to disable)
 	MaxHops              int    `toml:"max_hops"`               // Maximum number of hops (Received headers) before rejecting (default: 30, RFC 5321 recommends 100)
@@ -495,7 +494,10 @@ type RateLimitConfig struct {
 	Enabled               bool `toml:"enabled"`                 // Enable rate limiting (default: true)
 	GossipEnabled         bool `toml:"gossip_enabled"`          // Share rate limit state across cluster via gossip (default: false)
 	GossipIntervalSeconds int  `toml:"gossip_interval_seconds"` // How often to gossip rate limit data in seconds (default: 5)
-	// Whitelist entries below are exempt from ALL rate limit dimensions. Each
+	// Whitelisted IPs are exempt from ALL rate limit dimensions. Whitelisted
+	// sender domains/addresses are exempt from all dimensions on an
+	// authenticated session, and only from the FROM / FROM_DOMAIN dimensions
+	// otherwise (an unauthenticated MAIL FROM is unverified). Each
 	// kind accepts an inline array and/or an external file (one entry per line,
 	// blank lines and '#' comments ignored); the effective set is the union of
 	// both. Files are re-read automatically when they change on disk.
