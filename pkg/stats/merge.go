@@ -9,6 +9,9 @@ func (m *Manager) mergeStats(remote *StatsExport) int {
 
 	// Merge IP stats
 	for ip, remoteEntry := range remote.IPs {
+		if remoteEntry == nil {
+			continue // `"ip": null` in a peer's file
+		}
 		merged += m.mergeIPEntry(ip, remoteEntry)
 	}
 
