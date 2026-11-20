@@ -185,6 +185,14 @@ Key packages:
   - `enable_junk_header`: `X-Mizu-Junk` — governs only this header;
     `junk.apply_action` adds its own marker (e.g. `X-Spam`) independently, and
     rspamd's forwarded `add_headers` (X-Migadu-*) bypass these toggles entirely
+  - `enable_envelope_to_header` decides who stamps `X-Envelope-To`, and with
+    it the shape of delivery (`deliverSynchronous`). On (default): Mizu stamps
+    it, which needs a copy per recipient, so one POST per recipient - works
+    with any backend. Off: ONE POST for the whole message with every recipient
+    in `X-Mail-To` (comma-separated), all-or-nothing as far as the sender can
+    tell; only for a backend that splits `X-Mail-To` and stamps the header
+    itself (mailqueuer does, at delivery). A sender-supplied `X-Envelope-To`
+    is stripped either way
   - Any `X-Mizu-*` header the sender supplied is stripped first
     (`stripHeaderPrefix` in `InjectMizuHeaders`), whatever the toggles:
     otherwise, with `enable_auth_results_header` off, mailqueuer would record a

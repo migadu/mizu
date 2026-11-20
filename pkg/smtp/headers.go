@@ -279,7 +279,8 @@ func addJunkHeader(rawEmail, headerName string) string {
 }
 
 // addEnvelopeToHeader prepends an X-Envelope-To header carrying the envelope
-// recipient address. Delivery is per-recipient, so each delivered copy records
+// recipient address. It is used only when delivery is one request per
+// recipient (enable_envelope_to_header on), so each delivered copy records
 // exactly the recipient it was sent for. Any X-Envelope-To header already
 // present (e.g. forged by an upstream sender) is removed first so the value we
 // emit is authoritative and never duplicated. The address comes from RCPT TO

@@ -2156,44 +2156,60 @@ func (s *Session) deliverMessage(ctx context.Context, rawEmail string) error {
 	return s.deliverSynchronous(ctx, emailWithHeaders)
 }
 
-// deliverSynchronous handles synchronous delivery
+// deliverSynchronous hands the message to the delivery backend. How depends
+// on who stamps X-Envelope-To (enable_envelope_to_header):
+//
+// Mizu stamps it (default): each recipient needs its own copy, so there is one
+// request per recipient, stopping at the first failure. SMTP gives a single
+// reply to DATA, so a failure on a later recipient makes the sender retry them
+// all - a duplicate for those already delivered, unless the backend
+// deduplicates - or bounces a message some have received.
+//
+// The backend stamps it: ONE request carries every recipient (X-Mail-To,
+// comma-separated). That is all-or-nothing as far as the sender can tell; the
+// backend publishes per recipient, and a retry of a partly published request
+// publishes only what is missing. The shared body carries no X-Envelope-To.
+//
+// A sender-supplied X-Envelope-To never gets through in either mode, or it
+// would stand as the envelope recipient.
 func (s *Session) deliverSynchronous(ctx context.Context, signedEmail string) error {
-	// Per-recipient POST to Mailqueuer. Each request is atomic: one recipient,
-	// one queue message, one S3 object. On first failure, stop and return the
-	// error — the sending MTA will retry all recipients.
-	for _, recipient := range s.to {
-		if err := s.deliverToRecipient(ctx, signedEmail, recipient); err != nil {
-			return err
+	if s.serverConfig.HeaderToggles().EnvelopeTo {
+		for _, recipient := range s.to {
+			if err := s.deliverRequest(ctx, addEnvelopeToHeader(signedEmail, recipient), []string{recipient}); err != nil {
+				return err
+			}
 		}
+	} else if err := s.deliverRequest(ctx, stripHeader(signedEmail, "X-Envelope-To"), s.to); err != nil {
+		return err
 	}
 
 	s.Logger.Info("Successfully delivered message to destination", "recipients", len(s.to))
 	return nil
 }
 
-func (s *Session) deliverToRecipient(ctx context.Context, signedEmail string, recipient string) error {
-	// Check recipient cache first (if distributed tracking is enabled)
+// deliverRequest sends one delivery request for the given recipients and maps
+// its failure to an SMTP reply.
+func (s *Session) deliverRequest(ctx context.Context, email string, recipients []string) error {
+	// A recipient the backend recently reported as unknown fails the request
+	// before anything is sent (only with distributed tracking enabled).
 	if s.distTracker != nil {
-		if s.distTracker.IsRecipientCached(recipient) {
-			s.Logger.Info(fmt.Sprintf("Recipient %s found in cache: recipient not found (cached)", recipient))
-			return &smtp.SMTPError{Code: 550, EnhancedCode: smtp.EnhancedCode{5, 1, 1}, Message: "Recipient not found"}
+		for _, recipient := range recipients {
+			if s.distTracker.IsRecipientCached(recipient) {
+				s.Logger.Info(fmt.Sprintf("Recipient %s found in cache: recipient not found (cached)", recipient))
+				return &smtp.SMTPError{Code: 550, EnhancedCode: smtp.EnhancedCode{5, 1, 1}, Message: "Recipient not found"}
+			}
 		}
 	}
 
-	// Add the X-Envelope-To header for this specific recipient. Delivery is
-	// per-recipient, so each delivered copy carries exactly the envelope
-	// recipient it was sent for.
-	emailForRecipient := addEnvelopeToHeader(signedEmail, recipient)
-
 	err := poster.PostEmailToDestinationWithContext(
 		ctx,
-		emailForRecipient,
+		email,
 		s.serverConfig.Delivery.URL,
 		s.serverConfig.Delivery.AuthToken,
 		s.serverConfig.Delivery.MaxRetryAttempts,
 		s.isJunk,
 		s.from,
-		recipient,
+		strings.Join(recipients, ","), // a comma inside an address is refused at RCPT
 		s.traceID,
 		s.authenticatedUser,
 		s.circuitBreaker,
@@ -2203,7 +2219,7 @@ func (s *Session) deliverToRecipient(ctx context.Context, signedEmail string, re
 	)
 
 	if err != nil {
-		s.Logger.Error(fmt.Sprintf("Failed to deliver message for recipient %s: %v", recipient, err))
+		s.Logger.Error(fmt.Sprintf("Failed to deliver message for %v: %v", recipients, err))
 
 		var httpErr *poster.HTTPStatusError
 		if errors.As(err, &httpErr) {
@@ -2216,7 +2232,11 @@ func (s *Session) deliverToRecipient(ctx context.Context, signedEmail string, re
 			}
 
 			if httpErr.IsRecipientNotFound() && s.distTracker != nil && s.distTracker.recipientCacheTTL > 0 {
-				s.distTracker.CacheRecipientNotFound(recipient)
+				// The verdict is for the request. It can be pinned on a
+				// recipient - and cached - only when there was just one.
+				if len(recipients) == 1 {
+					s.distTracker.CacheRecipientNotFound(recipients[0])
+				}
 				return &smtp.SMTPError{Code: 550, EnhancedCode: smtp.EnhancedCode{5, 1, 1}, Message: "Recipient not found"}
 			}
 

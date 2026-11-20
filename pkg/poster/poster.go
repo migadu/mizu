@@ -70,7 +70,8 @@ func NewHTTPClient(timeout time.Duration, maxIdleConnsPerHost, maxConnsPerHost i
 // PostEmailToDestinationWithContext sends the raw email content to the destination with retry logic and context support.
 // It implements exponential backoff between retries and respects context cancellation.
 // The isJunk parameter adds an X-Junk header to help the destination system handle spam appropriately.
-// The mailFrom and mailTo parameters are added as X-Mail-From and X-Mail-To headers with envelope addresses.
+// The mailFrom and mailTo parameters are added as X-Mail-From and X-Mail-To headers with envelope addresses;
+// mailTo may hold several recipients, comma-separated (one request for all of them).
 // The traceID parameter is added as X-Trace-ID header for distributed tracing and log correlation.
 // The authenticatedUser parameter is added as X-Auth-User header when the message was sent via authenticated submission.
 // The circuitBreaker parameter is optional - if provided, each retry attempt will be protected by the circuit breaker.
