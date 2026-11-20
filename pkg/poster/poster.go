@@ -116,7 +116,7 @@ func postEmailWithRetries(ctx context.Context, rawEmail string, destinationURL, 
 		var err error
 		if circuitBreaker != nil {
 			// Circuit breaker protects each individual attempt
-			err = circuitBreaker.Call(func() error {
+			err = circuitBreaker.Call(ctx, func() error {
 				return postEmailAttemptWithContext(ctx, rawEmail, destinationURL, apiKey, isJunk, mailFrom, mailTo, traceID, authenticatedUser, httpClient, logger, m)
 			})
 		} else {
@@ -224,7 +224,7 @@ func postEmailAttemptWithContext(ctx context.Context, rawEmail string, destinati
 }
 
 // IsRetryableError determines if an error should trigger a retry.
-// Returns false for permanent failures (4xx HTTP codes, context cancellation).
+// Returns false for permanent failures (4xx HTTP codes, cancellation by the caller).
 // Returns true for temporary failures (5xx codes, network errors, timeouts).
 func IsRetryableError(err error) bool {
 	if err == nil {
@@ -242,9 +242,18 @@ func IsRetryableError(err error) bool {
 		return httpErr.IsRetryable() // 5xx errors are retryable, 4xx are not
 	}
 
-	// Context errors indicate intentional cancellation - don't retry
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	// Cancellation is the caller giving up - don't retry.
+	if errors.Is(err, context.Canceled) {
 		return false
+	}
+	// A deadline is a timeout, and a timeout is retryable: this is what an
+	// http.Client timeout against a slow backend looks like. If instead the
+	// caller's own deadline has passed, the retry loop notices on its next
+	// pass (it checks ctx before every attempt) and stops there. Retrying
+	// after a timeout is safe because the receiver drops a repeat carrying
+	// the same trace ID.
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
 	}
 
 	// Check for specific network errors that are generally retryable.
