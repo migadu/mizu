@@ -57,6 +57,13 @@ func (e *HTTPStatusError) IsPayloadTooLarge() bool {
 	return e.StatusCode == 413
 }
 
+// IsUnprocessable returns true if the backend refused the request as one it
+// can never accept (422): mailqueuer answers it for a recipient address it
+// considers malformed and for an empty message.
+func (e *HTTPStatusError) IsUnprocessable() bool {
+	return e.StatusCode == 422
+}
+
 // NewHTTPStatusError creates a new HTTPStatusError
 func NewHTTPStatusError(statusCode int, body string) *HTTPStatusError {
 	return &HTTPStatusError{

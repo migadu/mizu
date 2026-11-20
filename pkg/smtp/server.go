@@ -1501,6 +1501,18 @@ func (s *Session) Rcpt(ctx context.Context, to string, opts *smtp.RcptOptions) e
 			Message:      "invalid characters in address",
 		}
 	}
+	// An address the delivery backend will refuse is refused here, where the
+	// reply is for this recipient alone. Accepted, it fails the delivery
+	// request with a 422, and the one reply to DATA then bounces the message
+	// for every recipient.
+	if !isDeliverableAddress(to) {
+		s.Logger.Warn("Rejecting RCPT TO - address the delivery backend does not accept", "to", to)
+		return &smtp.SMTPError{
+			Code:         553,
+			EnhancedCode: smtp.EnhancedCode{5, 1, 3},
+			Message:      "invalid recipient address",
+		}
+	}
 
 	// Set timeout for this command
 	if err := s.setCommandTimeout(ProcessingTimeout); err != nil {
@@ -2247,11 +2259,20 @@ func (s *Session) deliverRequest(ctx context.Context, email string, recipients [
 			if httpErr.IsRecipientBlocked() {
 				return &smtp.SMTPError{Code: 550, EnhancedCode: smtp.EnhancedCode{5, 7, 1}, Message: "Recipient blocked by destination"}
 			}
+
+			// A 422 is the backend saying it can never take this request (a
+			// recipient address it considers malformed, an empty message).
+			// As a 451 the sender retried it until its queue expired, and
+			// with one request for all recipients that held back every
+			// recipient of the message for that long.
+			if httpErr.IsUnprocessable() {
+				return &smtp.SMTPError{Code: 554, EnhancedCode: smtp.EnhancedCode{5, 6, 0}, Message: "Message not accepted by destination"}
+			}
 		}
 
 		// Any other delivery failure is treated as temporary so the sender's MTA
 		// retries rather than bouncing the message (zero message loss). Deliberate
-		// backend rejections (404/403/413) are handled above and remain permanent.
+		// backend rejections (404/403/413/422) are handled above and remain permanent.
 		return &smtp.SMTPError{Code: 451, EnhancedCode: smtp.EnhancedCode{4, 4, 0}, Message: "Temporary failure, please try again later"}
 	}
 
