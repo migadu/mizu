@@ -385,14 +385,34 @@ throwaway test; "trace" = reviewer's code trace only, not re-checked.
 - [x] **C16** `validation.allow_null_sender` removed (config struct, CLAUDE.md,
   role template, mizu_out inventory). What refuses `<>` on submission is
   `allowed_from`; pinned by `TestAudit_AuthenticatedNullSenderIsRefused`.
-- [ ] **C9, blocked:** one POST for all recipients cannot be done in Mizu
-  alone. Mizu prepends `X-Envelope-To: <recipient>` to each recipient's copy
-  of the message; with one body for all recipients that header has to be
-  added per recipient downstream. Mailqueuer passes the recipient to its
-  backend as an HTTP header and Strela prepends its own in-body header on
-  outbound, but nothing does so for inbound mailbox delivery - stored
-  messages (and users' filters on that header) would lose it. Needs
-  mailqueuer to prepend it at delivery first.
+- [x] **C9** decided 2026-11-20: option 2. Mailqueuer stamps
+  `X-Envelope-To` per recipient at delivery (`withEnvelopeTo` in its
+  `internal/pipeline/processor.go`, with the recipient the message was
+  ingested for; a body already carrying exactly that line is left alone, so
+  it is safe next to an older Mizu). Mizu hands a message over in one POST
+  with all recipients in `X-Mail-To` and strips any sender-supplied
+  `X-Envelope-To` - **when `enable_envelope_to_header = false`**. The default
+  (true) keeps one POST per recipient with Mizu stamping the header, so any
+  backend keeps working and nothing changes until the setting is flipped. A
+  404 is cached against a recipient only when the request had exactly one.
+  Tests: `TestDeliver_SingleRequestForAllRecipients`,
+  `TestDeliver_EnvelopeToToggle`, `TestMultipleRecipients_*`,
+  `TestAudit_Delivery404IsCachedOnlyForASingleRecipient`, mailqueuer
+  `TestProcessDelivery_PrependsEnvelopeToHeader`.
+  **Rollout:** deploy mailqueuer, then set `enable_envelope_to_header: false`
+  for the mizu groups in the inventory. Until then C9 (duplicates / false
+  bounce on a partial failure) is unchanged.
+  A recipient address mailqueuer would refuse (two `@`, a space, a domain
+  without a dot) is refused at RCPT with a 553, for that recipient alone
+  (`isDeliverableAddress`, the same rule as emailutil's `IsValidEmail`: keep
+  them identical). Accepted, it failed the delivery request for every
+  recipient of the message. Should a 422 still come back (an empty message,
+  or the two rules drifting apart), it is a permanent 554 instead of a 451
+  the sender retried until its queue expired. Tests:
+  `TestIsDeliverableAddress`, `TestRcpt_RefusesAddressTheBackendWouldRefuse`,
+  `TestAudit_Delivery422IsPermanent`.
+  **After the rollout:** remove the setting and the per-recipient path
+  (forward-only: no second delivery shape kept for compatibility).
 
 ### Review of round 2 (2026-11-20)
 
