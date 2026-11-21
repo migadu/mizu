@@ -153,7 +153,7 @@ func (a *HTTPAuthenticator) AuthenticateWithIP(username, password, remoteIP stri
 
 			// Password still doesn't match - cache fresh credentials
 			a.cacheCredentials(username, creds.PasswordHashes, creds.AllowedFrom, creds.Identity)
-			return false, fmt.Errorf("password verification failed")
+			return false, fmt.Errorf("password verification failed: %w", ErrCredentialRejected)
 		}
 	}
 
@@ -195,7 +195,7 @@ func (a *HTTPAuthenticator) AuthenticateWithIP(username, password, remoteIP stri
 		}
 		// Cache credentials anyway so future attempts can use them
 		a.cacheCredentials(username, creds.PasswordHashes, creds.AllowedFrom, creds.Identity)
-		return false, fmt.Errorf("password verification failed")
+		return false, fmt.Errorf("password verification failed: %w", ErrCredentialRejected)
 	}
 
 	// Cache successful authentication
@@ -213,6 +213,15 @@ func (a *HTTPAuthenticator) AuthenticateWithIP(username, password, remoteIP stri
 func (a *HTTPAuthenticator) verifyAgainstHashes(hashes []string, password string) bool {
 	return passwd.VerifyAny(hashes, password).Matched
 }
+
+// ErrCredentialRejected marks an authentication error as a verdict on the
+// credential: the account exists and the password did not match its hashes.
+// It is still returned as an error (never as (false, nil)) so the client gets
+// a temporary 454 - see the Authenticator contract in server.go - but unlike a
+// backend failure it is a failed guess, and the session layer records it with
+// the auth rate limiter. An Authenticator that wants its wrong-password
+// rejections rate limited must wrap this sentinel.
+var ErrCredentialRejected = errors.New("credential rejected")
 
 // errUserUnknown reports that the auth backend has no row for this address
 // (HTTP 404) - the account does not exist, as opposed to existing but failing
@@ -364,30 +373,40 @@ func (a *HTTPAuthenticator) CanSendAs(authenticatedUser, fromAddress string) boo
 // FROM address is not in the cached allowed list, refetches from the backend to
 // detect changes.
 func (a *HTTPAuthenticator) ResolveSender(authenticatedUser, fromAddress string) (string, bool) {
-	// Get cached credentials entry to check allowed FROM addresses
-	entry := a.getCredCached(authenticatedUser)
-	if entry == nil {
-		// Not in cache - shouldn't happen if Authenticate was called first
-		a.logger.Warn("CanSendAs called but user credentials not in cache", "user", authenticatedUser)
-		return "", false
-	}
-
-	// Normalize addresses for comparison
 	authUser := strings.ToLower(strings.TrimSpace(authenticatedUser))
-	identity := resolveIdentity(authUser, entry.identity)
-	fromAddr := resolveFrom(extractEmail(fromAddress), authUser, identity)
 
-	// Check against cached allowed_from list
-	if a.checkAllowedFrom(entry.allowedFromAddresses, identity, fromAddr) {
-		return fromAddr, true
+	// A cache miss is not a verdict. The entry may have expired during a long
+	// session (the TTL is shorter than the session budget) or never been
+	// stored because the cache was full at AUTH; rejecting here answered both
+	// with a permanent 550 and let anyone who could fill the cache lock every
+	// sender out. Fall through to the refetch below instead.
+	if entry := a.getCredCached(authenticatedUser); entry != nil {
+		identity := resolveIdentity(authUser, entry.identity)
+		fromAddr := resolveFrom(normalizeEnvelopeSender(fromAddress), authUser, identity)
+
+		// The address being authorized is the address that goes on the
+		// envelope, so it must be one plain address. Refusing here, before any
+		// allowed_from pattern is consulted, keeps wildcard and regex entries
+		// from matching a string that merely contains an authorized address.
+		if !isPlainEnvelopeAddress(fromAddr) {
+			a.logger.Warn("Rejecting malformed envelope sender", "user", authenticatedUser, "from", fromAddress)
+			return "", false
+		}
+
+		// Check against cached allowed_from list
+		if a.checkAllowedFrom(entry.allowedFromAddresses, identity, fromAddr) {
+			return fromAddr, true
+		}
+
+		// FROM address not in cached list - refetch credentials to check for
+		// updates (admin might have added/removed aliases)
+		a.logger.Debug("FROM address not in cached allowed_from, refetching credentials",
+			"user", authenticatedUser,
+			"from", fromAddr,
+			"cached_allowed", entry.allowedFromAddresses)
+	} else {
+		a.logger.Debug("credentials not cached at MAIL FROM, refetching", "user", authenticatedUser)
 	}
-
-	// FROM address not in cached list - refetch credentials to check for updates
-	// (admin might have added/removed aliases)
-	a.logger.Debug("FROM address not in cached allowed_from, refetching credentials",
-		"user", authenticatedUser,
-		"from", fromAddr,
-		"cached_allowed", entry.allowedFromAddresses)
 
 	a.clearCredCacheEntry(authenticatedUser)
 	creds, err := a.fetchCredentials(authenticatedUser, "")
@@ -411,8 +430,11 @@ func (a *HTTPAuthenticator) ResolveSender(authenticatedUser, fromAddress string)
 
 	// The identity may have moved with the refetch, so redo the resolution
 	// against the fresh answer rather than the one the cache held.
-	identity = resolveIdentity(authUser, creds.Identity)
-	fromAddr = resolveFrom(extractEmail(fromAddress), authUser, identity)
+	identity := resolveIdentity(authUser, creds.Identity)
+	fromAddr := resolveFrom(normalizeEnvelopeSender(fromAddress), authUser, identity)
+	if !isPlainEnvelopeAddress(fromAddr) {
+		return "", false
+	}
 
 	// Check again with fresh allowed_from list
 	if a.checkAllowedFrom(creds.AllowedFrom, identity, fromAddr) {
@@ -577,7 +599,30 @@ func (c *compiledRegexCache) get(pattern string) (*regexp.Regexp, error) {
 	return entry.re, entry.err
 }
 
-// extractEmail extracts the email address from "Name <email>" or just "email" format
+// normalizeEnvelopeSender canonicalizes a MAIL FROM path for comparison. It
+// only trims and lowercases: an envelope path is already a bare address, so
+// it must never go through extractEmail, whose "Name <email>" handling would
+// authorize the text between angle brackets while the envelope keeps the rest
+// (go-smtp unquotes `"<a@x>"@victim` into `<a@x>@victim`).
+func normalizeEnvelopeSender(address string) string {
+	return strings.ToLower(strings.TrimSpace(address))
+}
+
+// isPlainEnvelopeAddress reports whether a resolved envelope sender is a single
+// unambiguous address: no angle brackets and at most one "@". The second rule
+// refuses quoted local parts containing "@" - legal in RFC 5321, unused in
+// practice - because every downstream consumer splits on "@" and they do not
+// agree on which one. The null sender ("") is plain; whether it is allowed is
+// decided by allowed_from like any other address. A master login string has
+// two "@" but has already been resolved to its identity by the time it gets
+// here.
+func isPlainEnvelopeAddress(addr string) bool {
+	return !strings.ContainsAny(addr, "<>") && strings.Count(addr, "@") <= 1
+}
+
+// extractEmail extracts the email address from "Name <email>" or just "email"
+// format. For header values and backend-served allowed_from entries only -
+// never for an envelope path (see normalizeEnvelopeSender).
 func extractEmail(address string) string {
 	addr := strings.TrimSpace(address)
 
@@ -593,12 +638,20 @@ func extractEmail(address string) string {
 	return strings.ToLower(strings.TrimSpace(addr))
 }
 
+// credCacheKey is the cache identity of a login. The backend resolves logins
+// case-insensitively, so the cache must too: keyed on the raw string, every
+// case variant of one address took its own slot, which let an unauthenticated
+// client fill the capped cache from a single known address.
+func credCacheKey(username string) string {
+	return strings.ToLower(strings.TrimSpace(username))
+}
+
 // getCredCached retrieves cached credentials entry
 func (a *HTTPAuthenticator) getCredCached(username string) *credCacheEntry {
 	a.credCacheMu.RLock()
 	defer a.credCacheMu.RUnlock()
 
-	entry, ok := a.credCache[username]
+	entry, ok := a.credCache[credCacheKey(username)]
 	if !ok {
 		return nil
 	}
@@ -624,6 +677,7 @@ func (a *HTTPAuthenticator) cacheCredentials(username string, passwordHashes []s
 	a.credCacheMu.Lock()
 	defer a.credCacheMu.Unlock()
 
+	username = credCacheKey(username)
 	if _, exists := a.credCache[username]; !exists && len(a.credCache) >= maxCredCacheEntries {
 		// At capacity: opportunistically drop expired entries before giving up.
 		now := time.Now()
@@ -649,7 +703,7 @@ func (a *HTTPAuthenticator) cacheCredentials(username string, passwordHashes []s
 func (a *HTTPAuthenticator) clearCredCacheEntry(username string) {
 	a.credCacheMu.Lock()
 	defer a.credCacheMu.Unlock()
-	delete(a.credCache, username)
+	delete(a.credCache, credCacheKey(username))
 }
 
 // cleanupCredCache periodically removes expired credentials entries
@@ -662,7 +716,7 @@ func (a *HTTPAuthenticator) cleanupCredCache() {
 		now := time.Now()
 		for username, entry := range a.credCache {
 			if now.After(entry.expiresAt) {
-				delete(a.credCache, username)
+				delete(a.credCache, credCacheKey(username))
 			}
 		}
 		a.credCacheMu.Unlock()

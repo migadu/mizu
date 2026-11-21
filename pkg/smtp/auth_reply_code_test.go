@@ -49,7 +49,7 @@ func newAuthReplySessionWith(t *testing.T, auth Authenticator) *Session {
 		serverConfig:  &sc,
 		globalConfig:  &cfg,
 		Logger:        logger,
-		remoteAddr:    "192.0.2.10:54321",
+		remoteAddr:    "192.0.2.10", // bare IP, as NewSession stores it
 		authenticator: auth,
 	}
 }

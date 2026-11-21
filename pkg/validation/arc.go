@@ -10,6 +10,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"net/mail"
@@ -214,6 +215,10 @@ func extractARCSets(h emersiontextproto.Header, logger *slog.Logger) (map[int]*A
 	return sets, maxInstance
 }
 
+// maxARCInstance is the highest instance number an ARC set may carry
+// (RFC 8617 §4.2.1: "ARC-Seal ... i ... between 1 and 50").
+const maxARCInstance = 50
+
 // extractInstance extracts the instance number (i=) from an ARC header
 func extractInstance(header string) int {
 	// Look for i=N in the header
@@ -223,7 +228,21 @@ func extractInstance(header string) int {
 		if strings.HasPrefix(part, "i=") {
 			instanceStr := strings.TrimPrefix(part, "i=")
 			instanceStr = strings.TrimSpace(instanceStr)
-			if instance, err := strconv.Atoi(instanceStr); err == nil {
+			instance, err := strconv.Atoi(instanceStr)
+			switch {
+			case errors.Is(err, strconv.ErrRange):
+				// Too large for an int: out of range, not absent.
+				return maxARCInstance + 1
+			case err != nil || instance < 1:
+				return 0
+			case instance > maxARCInstance:
+				// Collapse every out-of-range value onto one marker just past
+				// the limit. Callers loop from 1 to the highest instance seen,
+				// so an attacker-chosen i=9223372036854775807 must never become
+				// a loop bound; the marker keeps the set visible so the chain
+				// is failed rather than the header silently ignored.
+				return maxARCInstance + 1
+			default:
 				return instance
 			}
 		}
@@ -249,6 +268,12 @@ func extractDomain(header string) string {
 // validateARCChain validates the entire ARC chain by verifying signatures
 func validateARCChain(rawEmail string, sets map[int]*ARCSet, maxInstance int, lookupTXT func(string) ([]string, error), logger *slog.Logger) (bool, []string) {
 	reasons := make([]string, 0)
+
+	if maxInstance > maxARCInstance {
+		reason := fmt.Sprintf("ARC instance exceeds the RFC 8617 maximum of %d", maxARCInstance)
+		logger.Warn("ARC chain validation failed", "reason", reason)
+		return false, append(reasons, reason)
+	}
 
 	// Check that we have a complete chain from 1 to maxInstance
 	for i := 1; i <= maxInstance; i++ {

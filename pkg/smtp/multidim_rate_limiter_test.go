@@ -78,6 +78,7 @@ func TestRateLimiter_FromDimension(t *testing.T) {
 		ctx := SessionContext{
 			RemoteAddr: "192.168.1.100:12345",
 			From:       "spammer@example.com",
+			Stage:      StageMail,
 		}
 		if err := rl.CheckRateLimit(ctx); err != nil {
 			t.Fatalf("Email %d should be allowed, got error: %v", i+1, err)
@@ -88,6 +89,7 @@ func TestRateLimiter_FromDimension(t *testing.T) {
 	ctx := SessionContext{
 		RemoteAddr: "192.168.1.200:12345", // Different IP
 		From:       "spammer@example.com",
+		Stage:      StageMail,
 	}
 	if err := rl.CheckRateLimit(ctx); err == nil {
 		t.Fatal("6th email from same sender should be rate limited")
@@ -97,6 +99,7 @@ func TestRateLimiter_FromDimension(t *testing.T) {
 	ctx2 := SessionContext{
 		RemoteAddr: "192.168.1.200:12345",
 		From:       "legitimate@example.com",
+		Stage:      StageMail,
 	}
 	if err := rl.CheckRateLimit(ctx2); err != nil {
 		t.Fatalf("Different sender should be allowed, got error: %v", err)
@@ -127,6 +130,7 @@ func TestRateLimiter_FromDomainDimension(t *testing.T) {
 		ctx := SessionContext{
 			RemoteAddr: "192.168.1.100:12345",
 			From:       "user" + string(rune('a'+i)) + "@spam-domain.com",
+			Stage:      StageMail,
 		}
 		if err := rl.CheckRateLimit(ctx); err != nil {
 			t.Fatalf("Email %d should be allowed, got error: %v", i+1, err)
@@ -137,6 +141,7 @@ func TestRateLimiter_FromDomainDimension(t *testing.T) {
 	ctx := SessionContext{
 		RemoteAddr: "192.168.1.100:12345",
 		From:       "another@spam-domain.com",
+		Stage:      StageMail,
 	}
 	if err := rl.CheckRateLimit(ctx); err == nil {
 		t.Fatal("11th email from same domain should be rate limited")
@@ -146,6 +151,7 @@ func TestRateLimiter_FromDomainDimension(t *testing.T) {
 	ctx2 := SessionContext{
 		RemoteAddr: "192.168.1.100:12345",
 		From:       "user@different-domain.com",
+		Stage:      StageMail,
 	}
 	if err := rl.CheckRateLimit(ctx2); err != nil {
 		t.Fatalf("Different domain should be allowed, got error: %v", err)
@@ -177,6 +183,7 @@ func TestRateLimiter_ToDimension(t *testing.T) {
 			RemoteAddr: "192.168.1.100:12345",
 			From:       "sender" + string(rune('a'+i)) + "@example.com",
 			To:         []string{"victim@example.com"},
+			Stage:      StageRcpt,
 		}
 		if err := rl.CheckRateLimit(ctx); err != nil {
 			t.Fatalf("Email %d should be allowed, got error: %v", i+1, err)
@@ -188,6 +195,7 @@ func TestRateLimiter_ToDimension(t *testing.T) {
 		RemoteAddr: "192.168.1.200:12345",
 		From:       "another@example.com",
 		To:         []string{"victim@example.com"},
+		Stage:      StageRcpt,
 	}
 	if err := rl.CheckRateLimit(ctx); err == nil {
 		t.Fatal("4th email to same recipient should be rate limited")
@@ -198,6 +206,7 @@ func TestRateLimiter_ToDimension(t *testing.T) {
 		RemoteAddr: "192.168.1.100:12345",
 		From:       "sender@example.com",
 		To:         []string{"other@example.com"},
+		Stage:      StageRcpt,
 	}
 	if err := rl.CheckRateLimit(ctx2); err != nil {
 		t.Fatalf("Different recipient should be allowed, got error: %v", err)
@@ -227,6 +236,7 @@ func TestRateLimiter_CompositeKeys(t *testing.T) {
 		RemoteAddr: "192.168.1.100:12345",
 		From:       "stalker@example.com",
 		To:         []string{"victim@example.com"},
+		Stage:      StageRcpt,
 	}
 
 	// First 2 emails from same sender to same recipient
@@ -246,6 +256,7 @@ func TestRateLimiter_CompositeKeys(t *testing.T) {
 		RemoteAddr: "192.168.1.100:12345",
 		From:       "stalker@example.com",
 		To:         []string{"other@example.com"},
+		Stage:      StageRcpt,
 	}
 	if err := rl.CheckRateLimit(ctx2); err != nil {
 		t.Fatalf("Same sender to different recipient should be allowed, got error: %v", err)
@@ -256,6 +267,7 @@ func TestRateLimiter_CompositeKeys(t *testing.T) {
 		RemoteAddr: "192.168.1.100:12345",
 		From:       "different@example.com",
 		To:         []string{"victim@example.com"},
+		Stage:      StageRcpt,
 	}
 	if err := rl.CheckRateLimit(ctx3); err != nil {
 		t.Fatalf("Different sender to same recipient should be allowed, got error: %v", err)
@@ -292,6 +304,7 @@ func TestRateLimiter_MultipleDimensions(t *testing.T) {
 		ctx := SessionContext{
 			RemoteAddr: "192.168.1.100:12345",
 			From:       "sender@example.com",
+			Stage:      StageMail,
 		}
 		if err := rl.CheckRateLimit(ctx); err != nil {
 			t.Fatalf("Email %d should be allowed, got error: %v", i+1, err)
@@ -302,30 +315,37 @@ func TestRateLimiter_MultipleDimensions(t *testing.T) {
 	ctx := SessionContext{
 		RemoteAddr: "192.168.1.100:12345",
 		From:       "sender@example.com",
+		Stage:      StageMail,
 	}
 	if err := rl.CheckRateLimit(ctx); err == nil {
 		t.Fatal("6th email should be blocked by sender limit")
 	}
 
-	// Different sender, same IP - should be allowed up to IP limit
-	// We already have 5 emails, limit is 10, so 4 more are allowed (total 9)
-	for i := 0; i < 4; i++ {
-		ctx := SessionContext{
-			RemoteAddr: "192.168.1.100:12345",
-			From:       "different@example.com",
-		}
-		if err := rl.CheckRateLimit(ctx); err != nil {
-			t.Fatalf("Email %d from different sender should be allowed, got error: %v", i+6, err)
-		}
-	}
-
-	// 10th email should be blocked by IP limit (5 from first sender + 4 from second = 9, limit is 10 but check is >=)
-	ctx = SessionContext{
+	// A different sender has its own budget.
+	other := SessionContext{
 		RemoteAddr: "192.168.1.100:12345",
 		From:       "different@example.com",
+		Stage:      StageMail,
 	}
-	if err := rl.CheckRateLimit(ctx); err == nil {
-		t.Fatal("10th email from different@example.com should be blocked by sender limit (5)")
+	for i := 0; i < 5; i++ {
+		if err := rl.CheckRateLimit(other); err != nil {
+			t.Fatalf("Email %d from different sender should be allowed, got error: %v", i+1, err)
+		}
+	}
+	if err := rl.CheckRateLimit(other); err == nil {
+		t.Fatal("6th email from different@example.com should be blocked by sender limit (5)")
+	}
+
+	// The IP dimension is charged per connection, independently of messages:
+	// the 11 messages above cost it nothing.
+	conn := SessionContext{RemoteAddr: "192.168.1.100:12345"}
+	for i := 0; i < 10; i++ {
+		if err := rl.CheckRateLimit(conn); err != nil {
+			t.Fatalf("Connection %d should be allowed, got error: %v", i+1, err)
+		}
+	}
+	if err := rl.CheckRateLimit(conn); err == nil {
+		t.Fatal("11th connection should be blocked by IP limit (10)")
 	}
 }
 
@@ -447,6 +467,7 @@ func TestRateLimiter_WhitelistedDomain(t *testing.T) {
 	ctx := SessionContext{
 		RemoteAddr: "192.168.1.100:12345",
 		From:       "user@nonwhitelisted.com",
+		Stage:      StageMail,
 	}
 	for i := 0; i < 2; i++ {
 		if err := rl.CheckRateLimit(ctx); err != nil {
@@ -461,6 +482,7 @@ func TestRateLimiter_WhitelistedDomain(t *testing.T) {
 	ctxWhitelisted := SessionContext{
 		RemoteAddr: "192.168.1.200:12345",
 		From:       "admin@trusted.com",
+		Stage:      StageMail,
 	}
 	for i := 0; i < 100; i++ {
 		if err := rl.CheckRateLimit(ctxWhitelisted); err != nil {
@@ -472,6 +494,7 @@ func TestRateLimiter_WhitelistedDomain(t *testing.T) {
 	ctxWhitelisted2 := SessionContext{
 		RemoteAddr: "192.168.1.200:12345",
 		From:       "user@example.org",
+		Stage:      StageMail,
 	}
 	for i := 0; i < 100; i++ {
 		if err := rl.CheckRateLimit(ctxWhitelisted2); err != nil {
@@ -504,6 +527,7 @@ func TestRateLimiter_WhitelistedSender(t *testing.T) {
 	ctx := SessionContext{
 		RemoteAddr: "192.168.1.100:12345",
 		From:       "user@example.com",
+		Stage:      StageMail,
 	}
 	for i := 0; i < 2; i++ {
 		if err := rl.CheckRateLimit(ctx); err != nil {
@@ -518,6 +542,7 @@ func TestRateLimiter_WhitelistedSender(t *testing.T) {
 	ctxWhitelisted := SessionContext{
 		RemoteAddr: "192.168.1.200:12345",
 		From:       "admin@example.com",
+		Stage:      StageMail,
 	}
 	for i := 0; i < 100; i++ {
 		if err := rl.CheckRateLimit(ctxWhitelisted); err != nil {
@@ -529,6 +554,7 @@ func TestRateLimiter_WhitelistedSender(t *testing.T) {
 	ctxWhitelisted2 := SessionContext{
 		RemoteAddr: "192.168.1.200:12345",
 		From:       "noreply@service.com",
+		Stage:      StageMail,
 	}
 	for i := 0; i < 100; i++ {
 		if err := rl.CheckRateLimit(ctxWhitelisted2); err != nil {
@@ -562,6 +588,7 @@ func TestRateLimiter_WhitelistCaseInsensitive(t *testing.T) {
 	ctx1 := SessionContext{
 		RemoteAddr: "192.168.1.100:12345",
 		From:       "user@trusteddomain.com",
+		Stage:      StageMail,
 	}
 	for i := 0; i < 10; i++ {
 		if err := rl.CheckRateLimit(ctx1); err != nil {
@@ -573,6 +600,7 @@ func TestRateLimiter_WhitelistCaseInsensitive(t *testing.T) {
 	ctx2 := SessionContext{
 		RemoteAddr: "192.168.1.100:12345",
 		From:       "USER@TRUSTEDDOMAIN.COM",
+		Stage:      StageMail,
 	}
 	for i := 0; i < 10; i++ {
 		if err := rl.CheckRateLimit(ctx2); err != nil {
@@ -584,6 +612,7 @@ func TestRateLimiter_WhitelistCaseInsensitive(t *testing.T) {
 	ctx3 := SessionContext{
 		RemoteAddr: "192.168.1.100:12345",
 		From:       "aDmIn@eXaMpLe.CoM",
+		Stage:      StageMail,
 	}
 	for i := 0; i < 10; i++ {
 		if err := rl.CheckRateLimit(ctx3); err != nil {
@@ -618,10 +647,15 @@ func TestRateLimiter_WhitelistWithMultipleDimensions(t *testing.T) {
 	rl := NewRateLimiter(cfg, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	defer rl.Shutdown()
 
-	// Whitelisted sender should bypass both IP and FROM rate limits
+	// A whitelisted sender on an authenticated session (MAIL FROM verified
+	// against allowed_from) bypasses both IP and FROM rate limits. The
+	// unauthenticated case, where only sender-keyed dimensions are lifted, is
+	// covered by TestAudit_ForgedWhitelistedSenderDoesNotBypassIPLimit.
 	ctx := SessionContext{
-		RemoteAddr: "192.168.1.100:12345",
-		From:       "admin@trusted.com",
+		RemoteAddr:        "192.168.1.100:12345",
+		From:              "admin@trusted.com",
+		AuthenticatedUser: "admin@trusted.com",
+		Stage:             StageMail,
 	}
 	for i := 0; i < 100; i++ {
 		if err := rl.CheckRateLimit(ctx); err != nil {
@@ -633,6 +667,7 @@ func TestRateLimiter_WhitelistWithMultipleDimensions(t *testing.T) {
 	ctxNonWhitelisted := SessionContext{
 		RemoteAddr: "192.168.1.100:12345",
 		From:       "user@other.com",
+		Stage:      StageMail,
 	}
 	for i := 0; i < 2; i++ {
 		if err := rl.CheckRateLimit(ctxNonWhitelisted); err != nil {

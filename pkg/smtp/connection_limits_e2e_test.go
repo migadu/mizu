@@ -15,12 +15,14 @@ func TestE2E_PerIPConnectionLimit(t *testing.T) {
 	ip := "192.168.1.100:5000"
 	var successful []string
 	var rejected []string
+	var leases []*ConnLease
 
 	for i := 0; i < 5; i++ {
 		connID := fmt.Sprintf("%s-conn%d", ip, i)
-		err := tracker.TryAcquire(ip)
+		lease, err := tracker.Acquire(ip)
 		if err == nil {
 			successful = append(successful, connID)
+			leases = append(leases, lease)
 			t.Logf("✓ Connection %d from %s: ACCEPTED", i+1, ip)
 		} else {
 			rejected = append(rejected, connID)
@@ -48,20 +50,25 @@ func TestE2E_PerIPConnectionLimit(t *testing.T) {
 	}
 
 	// Release one connection
-	tracker.Release(ip)
+	leases[0].Release()
+	leases = leases[1:]
 	t.Logf("Released 1 connection from %s", ip)
 
 	// Now we should be able to connect again
-	err := tracker.TryAcquire(ip)
+	lease, err := tracker.Acquire(ip)
 	if err != nil {
 		t.Errorf("Should be able to connect after release, got error: %v", err)
 	} else {
+		leases = append(leases, lease)
 		t.Logf("✓ New connection after release: ACCEPTED")
 	}
 
 	// Cleanup
-	for i := 0; i < 3; i++ {
-		tracker.Release(ip)
+	if len(leases) != 3 {
+		t.Errorf("Expected 3 open connections to clean up, got %d", len(leases))
+	}
+	for _, l := range leases {
+		l.Release()
 	}
 
 	total, _, _ = tracker.GetStats()
@@ -80,7 +87,7 @@ func TestE2E_GlobalConnectionLimit(t *testing.T) {
 	// Try to create 8 connections from different IPs
 	for i := 0; i < 8; i++ {
 		ip := fmt.Sprintf("192.168.1.%d:5000", 100+i)
-		err := tracker.TryAcquire(ip)
+		_, err := tracker.Acquire(ip)
 		if err == nil {
 			successful++
 			t.Logf("✓ Connection %d from %s: ACCEPTED", i+1, ip)
@@ -124,14 +131,14 @@ func TestE2E_ConcurrentConnectionsFromSameIP(t *testing.T) {
 		go func(connNum int) {
 			defer wg.Done()
 
-			err := tracker.TryAcquire(ip)
+			lease, err := tracker.Acquire(ip)
 			successMu.Lock()
 			if err == nil {
 				successCount++
 				t.Logf("✓ Concurrent connection %d: ACCEPTED", connNum)
 				// Simulate connection doing work
 				time.Sleep(5 * time.Millisecond)
-				tracker.Release(ip)
+				lease.Release()
 			} else {
 				failCount++
 				t.Logf("✗ Concurrent connection %d: REJECTED", connNum)
@@ -162,8 +169,9 @@ func TestE2E_MixedIPScenario(t *testing.T) {
 	tracker := NewConnectionTracker(100, 10, 0, nil)
 
 	type connection struct {
-		ip string
-		id int
+		ip    string
+		id    int
+		lease *ConnLease
 	}
 
 	var activeConns []connection
@@ -174,10 +182,10 @@ func TestE2E_MixedIPScenario(t *testing.T) {
 	for ipNum := 0; ipNum < 5; ipNum++ {
 		ip := fmt.Sprintf("10.0.%d.1:5000", ipNum)
 		for connNum := 0; connNum < 8; connNum++ {
-			err := tracker.TryAcquire(ip)
+			lease, err := tracker.Acquire(ip)
 			if err == nil {
 				mu.Lock()
-				activeConns = append(activeConns, connection{ip: ip, id: connNum})
+				activeConns = append(activeConns, connection{ip: ip, id: connNum, lease: lease})
 				mu.Unlock()
 				t.Logf("✓ Legitimate: IP %s connection %d accepted", ip, connNum)
 			} else {
@@ -200,11 +208,11 @@ func TestE2E_MixedIPScenario(t *testing.T) {
 	attackBlocked := 0
 
 	for i := 0; i < 20; i++ {
-		err := tracker.TryAcquire(attackIP)
+		lease, err := tracker.Acquire(attackIP)
 		if err == nil {
 			attackSuccess++
 			mu.Lock()
-			activeConns = append(activeConns, connection{ip: attackIP, id: i})
+			activeConns = append(activeConns, connection{ip: attackIP, id: i, lease: lease})
 			mu.Unlock()
 			t.Logf("⚠ Attack: connection %d accepted (within per-IP limit)", i+1)
 		} else {
@@ -240,7 +248,7 @@ func TestE2E_MixedIPScenario(t *testing.T) {
 	t.Log("=== Cleaning up ===")
 	mu.Lock()
 	for _, conn := range activeConns {
-		tracker.Release(conn.ip)
+		conn.lease.Release()
 	}
 	mu.Unlock()
 
@@ -274,7 +282,7 @@ func TestE2E_HealthCheckUtilization(t *testing.T) {
 		// Add connections
 		for i := 0; i < scenario.connections; i++ {
 			ip := fmt.Sprintf("192.168.1.%d:5000", i)
-			if err := tracker.TryAcquire(ip); err != nil {
+			if _, err := tracker.Acquire(ip); err != nil {
 				t.Fatalf("Failed to acquire connection: %v", err)
 			}
 		}
@@ -306,10 +314,10 @@ func TestE2E_RapidConnectDisconnect(t *testing.T) {
 
 			for i := 0; i < iterations; i++ {
 				// Try to connect
-				if err := tracker.TryAcquire(ip); err == nil {
+				if lease, err := tracker.Acquire(ip); err == nil {
 					// Immediately disconnect
 					time.Sleep(1 * time.Millisecond)
-					tracker.Release(ip)
+					lease.Release()
 				}
 			}
 		}(ipNum)

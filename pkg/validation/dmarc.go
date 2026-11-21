@@ -51,6 +51,17 @@ const DNSLookupTimeout = 5 * time.Second
 // RFC 6376 recommends rejecting signatures older than a few days to prevent replay attacks
 const MaxDKIMSignatureAge = 7 * 24 * time.Hour // 7 days
 
+// MaxDKIMClockSkew is how far ahead of this host's clock a signature's t= may
+// be. Signer and verifier clocks routinely differ by seconds; with no
+// allowance a valid signature made "one second from now" was thrown away.
+const MaxDKIMClockSkew = 5 * time.Minute
+
+// maxDKIMVerifications caps how many DKIM signatures of one message are
+// verified. Each costs a goroutine, a DNS TXT lookup and a hash over the body,
+// and the count is otherwise sender-controlled. Signatures beyond the cap are
+// ignored (go-msgauth verifies the first N); real mail carries a handful.
+const maxDKIMVerifications = 10
+
 // TXTResolver is the minimal interface CheckDMARC needs to perform TXT lookups
 // for both the DMARC policy record and DKIM key records.
 //
@@ -110,24 +121,28 @@ func CheckDMARC(ctx context.Context, rawEmail string, spfResult *SPFResult, quar
 		}, nil
 	}
 
+	// Exactly one From header (RFC 5322 section 3.6). With several, which one
+	// a mail client shows is up to the client; evaluating the first let a
+	// message pass on the attacker's domain while displaying another.
+	if len(msg.Header["From"]) > 1 {
+		return unparseableFromResult("multiple From headers"), nil
+	}
+
 	// Parse From address to get domain
 	fromAddrs, err := mail.ParseAddressList(fromHeader)
 	if err != nil || len(fromAddrs) == 0 {
-		return &DMARCResult{
-			Pass:           false,
-			Policy:         "none",
-			FailureReasons: []string{"invalid From header format"},
-		}, nil
+		return unparseableFromResult("invalid From header format"), nil
+	}
+	// One author address. RFC 7489 section 6.6.1: a From with several
+	// addresses has no single domain to evaluate; same hole as above.
+	if len(fromAddrs) > 1 {
+		return unparseableFromResult("multiple addresses in From header"), nil
 	}
 
 	fromAddr := fromAddrs[0].Address
 	parts := strings.Split(fromAddr, "@")
-	if len(parts) != 2 {
-		return &DMARCResult{
-			Pass:           false,
-			Policy:         "none",
-			FailureReasons: []string{"invalid From address format"},
-		}, nil
+	if len(parts) != 2 || parts[1] == "" {
+		return unparseableFromResult("invalid From address format"), nil
 	}
 	fromDomain := parts[1]
 
@@ -172,6 +187,25 @@ func CheckDMARC(ctx context.Context, rawEmail string, spfResult *SPFResult, quar
 
 	// Look up DMARC policy via DNS TXT record (_dmarc.domain.com)
 	record, err := dmarcLookup(fromDomain, lookupTXT)
+
+	// RFC 7489 §6.6.3: with no record at the From domain itself, the policy of
+	// its organizational domain applies - and for a subdomain that is the sp=
+	// tag when present, p= otherwise. Without this fallback any made-up
+	// subdomain of a p=reject domain counted as "no DMARC record".
+	//
+	// A temporary DNS failure is not "no record": the From domain may publish
+	// its own (possibly more lenient) policy, so the organizational domain's
+	// must not be applied in its place.
+	fromOrgRecord := false
+	if err != nil && !dmarc.IsTempFail(err) {
+		if orgDomain := getOrganizationalDomain(fromDomain); orgDomain != "" && orgDomain != normalizeDomain(fromDomain) {
+			if orgRecord, orgErr := dmarcLookup(orgDomain, lookupTXT); orgErr == nil {
+				logger.Debug("Using organizational domain DMARC record", "domain", fromDomain, "org_domain", orgDomain)
+				record, err, fromOrgRecord = orgRecord, nil, true
+			}
+		}
+	}
+
 	noDMARCRecord := false
 	if err != nil {
 		logger.Debug("DMARC lookup failed", "domain", fromDomain, "error", err)
@@ -182,15 +216,23 @@ func CheckDMARC(ctx context.Context, rawEmail string, spfResult *SPFResult, quar
 	} else {
 		// Set the DMARC policy
 		result.Policy = string(record.Policy)
+		if fromOrgRecord && record.SubdomainPolicy != "" {
+			result.Policy = string(record.SubdomainPolicy)
+		}
 	}
 
 	// Verify DKIM signatures using the same resolver-aware TXT lookup
 	reader := strings.NewReader(rawEmail)
 	verifyOpts := &dkim.VerifyOptions{
-		LookupTXT: lookupTXT,
+		LookupTXT:        lookupTXT,
+		MaxVerifications: maxDKIMVerifications,
 	}
 	verifications, err := dkim.VerifyWithOptions(reader, verifyOpts)
-	if err != nil && err != io.EOF {
+	if errors.Is(err, dkim.ErrTooManySignatures) {
+		// Not a verification failure: the first maxDKIMVerifications
+		// signatures were verified and are judged below as usual.
+		logger.Debug("DKIM signatures beyond the verification cap ignored", "cap", maxDKIMVerifications, "from_domain", fromDomain)
+	} else if err != nil && err != io.EOF {
 		logger.Warn("DKIM verification error", "error", err, "from_domain", fromDomain)
 		result.FailureReasons = append(result.FailureReasons, fmt.Sprintf("DKIM verification error: %v", err))
 	}
@@ -224,30 +266,14 @@ func CheckDMARC(ctx context.Context, rawEmail string, spfResult *SPFResult, quar
 			}
 
 			// Check signature age to prevent replay attacks
-			if !v.Time.IsZero() {
-				signatureAge := time.Since(v.Time)
-				if signatureAge > MaxDKIMSignatureAge {
-					logger.Warn("DKIM signature too old",
-						"domain", v.Domain,
-						"identifier", v.Identifier,
-						"age", signatureAge,
-						"max_age", MaxDKIMSignatureAge,
-						"signature_time", v.Time)
-					result.FailureReasons = append(result.FailureReasons,
-						fmt.Sprintf("DKIM signature too old: %v (max: %v)", signatureAge.Round(time.Hour), MaxDKIMSignatureAge))
-					continue // Skip this signature, try others
-				}
-				if signatureAge < 0 {
-					// Signature timestamp is in the future
-					logger.Warn("DKIM signature timestamp in future",
-						"domain", v.Domain,
-						"identifier", v.Identifier,
-						"signature_time", v.Time,
-						"time_offset", -signatureAge)
-					result.FailureReasons = append(result.FailureReasons,
-						"DKIM signature timestamp is in the future")
-					continue
-				}
+			if problem := dkimTimestampProblem(v.Time, time.Now()); problem != "" {
+				logger.Warn("DKIM signature timestamp not acceptable",
+					"domain", v.Domain,
+					"identifier", v.Identifier,
+					"signature_time", v.Time,
+					"problem", problem)
+				result.FailureReasons = append(result.FailureReasons, problem)
+				continue // Skip this signature, try others
 			}
 
 			// Check signature expiration
@@ -377,12 +403,56 @@ func CheckDMARC(ctx context.Context, rawEmail string, spfResult *SPFResult, quar
 	return result, nil
 }
 
+// dkimTimestampProblem returns why a signature's t= timestamp makes it
+// unusable, or "" if it is fine. A missing timestamp is fine.
+func dkimTimestampProblem(signed, now time.Time) string {
+	if signed.IsZero() {
+		return ""
+	}
+	age := now.Sub(signed)
+	if age > MaxDKIMSignatureAge {
+		return fmt.Sprintf("DKIM signature too old: %v (max: %v)", age.Round(time.Hour), MaxDKIMSignatureAge)
+	}
+	if age < -MaxDKIMClockSkew {
+		return "DKIM signature timestamp is in the future"
+	}
+	return ""
+}
+
+// unparseableFromResult is the verdict for a From header no domain can be
+// extracted from. There is no domain, so there is no policy to look up - but
+// that must not read as "nothing to enforce": returning a bare Policy "none"
+// let a spoofer skip a p=reject domain's policy by breaking the header syntax
+// slightly (lenient MUAs still show the address). The message is marked as
+// junk, the same treatment as an unauthenticated message from a domain with no
+// DMARC record.
+func unparseableFromResult(reason string) *DMARCResult {
+	return &DMARCResult{
+		Pass:           false,
+		Policy:         "none",
+		ShouldBeJunk:   true,
+		FailureReasons: []string{reason, "From header has no single parseable domain - marking as junk"},
+	}
+}
+
+// normalizeDomain lowercases a domain and drops the root label's trailing dot,
+// so "Example.COM." and "example.com" compare equal.
+func normalizeDomain(domain string) string {
+	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(domain)), ".")
+}
+
 // isAligned checks if two domains are aligned according to DMARC rules
 // Alignment ensures the authenticated domain matches the visible From domain
 func isAligned(fromDomain, authDomain string, strict bool) bool {
 	// Normalize domains for comparison
-	fromDomain = strings.ToLower(strings.TrimSpace(fromDomain))
-	authDomain = strings.ToLower(strings.TrimSpace(authDomain))
+	fromDomain = normalizeDomain(fromDomain)
+	authDomain = normalizeDomain(authDomain)
+
+	// An absent domain aligns with nothing - in particular not with another
+	// absent domain.
+	if fromDomain == "" || authDomain == "" {
+		return false
+	}
 
 	if strict {
 		// Strict alignment requires exact domain match
@@ -399,7 +469,14 @@ func isAligned(fromDomain, authDomain string, strict bool) bool {
 // getOrganizationalDomain returns the organizational domain using the Public Suffix List.
 // This correctly handles multi-level TLDs like .co.uk.
 func getOrganizationalDomain(domain string) string {
-	eTLD, _ := publicsuffix.EffectiveTLDPlusOne(domain)
-	// On error (e.g., for "localhost"), it returns the original domain, which is fine.
-	return eTLD
+	domain = normalizeDomain(domain)
+	org, err := publicsuffix.EffectiveTLDPlusOne(domain)
+	if err != nil || org == "" {
+		// EffectiveTLDPlusOne fails - and returns "" - for a name that is
+		// itself a public suffix ("gov.in", "github.io") and for malformed
+		// names. Such a domain is its own organizational domain. Returning ""
+		// here made every such pair compare equal under relaxed alignment.
+		return domain
+	}
+	return org
 }

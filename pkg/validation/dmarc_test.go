@@ -134,8 +134,11 @@ This is a test email that should be quarantined by DMARC.
 }
 
 func TestCheckDMARC_NoDMARCRecord(t *testing.T) {
-	// Use a domain that is unlikely to have a DMARC record.
-	domain := fmt.Sprintf("no-dmarc-record-%d.example.com", time.Now().UnixNano())
+	// Use a domain that cannot have a DMARC record, at the domain itself or at
+	// its organizational domain. (A subdomain of example.com does not qualify:
+	// example.com publishes p=reject, which the RFC 7489 organizational-domain
+	// fallback now finds.)
+	domain := fmt.Sprintf("no-dmarc-record-%d.invalid", time.Now().UnixNano())
 	rawEmail := fmt.Sprintf(`From: Test User <test@%s>
 To: Recipient <recipient@example.com>
 Subject: No DMARC Record Test

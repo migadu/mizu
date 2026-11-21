@@ -65,7 +65,6 @@ type DistributedTracker struct {
 
 	// Recipient cache (distributed via gossip)
 	recipientNotFound map[string]time.Time // email -> expiry (404 responses)
-	recipientBlocked  map[string]time.Time // email -> expiry (403 responses)
 	recipientMu       sync.RWMutex
 	recipientCacheTTL time.Duration // How long to cache recipient results
 
@@ -137,7 +136,6 @@ type ConnectionSnapshot struct {
 // RecipientCacheSnapshot holds cached recipient validation results
 type RecipientCacheSnapshot struct {
 	NotFound map[string]time.Time `json:"not_found,omitempty"` // email -> expiry (404 responses)
-	Blocked  map[string]time.Time `json:"blocked,omitempty"`   // email -> expiry (403 responses)
 }
 
 // DistributedConfig holds configuration for distributed tracking
@@ -172,7 +170,6 @@ func NewDistributedTracker(
 		s3SyncInterval:    config.S3SyncInterval,
 		globalMaxPerIP:    config.GlobalMaxPerIP,
 		recipientNotFound: make(map[string]time.Time),
-		recipientBlocked:  make(map[string]time.Time),
 		recipientCacheTTL: config.RecipientCacheTTL,
 		peerConnections:   make(map[string]*PeerConnectionState),
 		logger:            logger,
@@ -303,18 +300,10 @@ func (dt *DistributedTracker) cleanupExpiredRecipients() {
 		}
 	}
 
-	for email, expiry := range dt.recipientBlocked {
-		if now.After(expiry) {
-			delete(dt.recipientBlocked, email)
-			removed++
-		}
-	}
-
 	if removed > 0 {
 		dt.logger.Debug("Cleaned up expired recipient cache entries",
 			"removed", removed,
-			"not_found_remaining", len(dt.recipientNotFound),
-			"blocked_remaining", len(dt.recipientBlocked))
+			"not_found_remaining", len(dt.recipientNotFound))
 	}
 }
 
@@ -372,66 +361,32 @@ func (dt *DistributedTracker) CacheRecipientNotFound(email string) {
 		"expiry", expiry)
 }
 
-// CacheRecipientBlocked adds a recipient to the "blocked" cache (403 responses)
-func (dt *DistributedTracker) CacheRecipientBlocked(email string) {
-	dt.recipientMu.Lock()
-	defer dt.recipientMu.Unlock()
-
-	if _, exists := dt.recipientBlocked[email]; !exists && len(dt.recipientBlocked) >= maxRecipientCacheEntries {
-		return // At capacity; avoid unbounded growth from attacker-controlled addresses
-	}
-	expiry := time.Now().Add(dt.recipientCacheTTL)
-	dt.recipientBlocked[email] = expiry
-
-	dt.logger.Debug("Cached recipient as blocked",
-		"email", email,
-		"expiry", expiry)
-}
-
-// ClearRecipientCache removes a recipient from both the "not found" and "blocked" caches.
+// ClearRecipientCache removes a recipient from the "not found" cache.
 // This should be called when a fresh recipient validation confirms the recipient exists,
-// to prevent stale cached 404/403 responses from overriding the validation result.
+// to prevent a stale cached 404 from overriding the validation result.
 func (dt *DistributedTracker) ClearRecipientCache(email string) {
 	dt.recipientMu.Lock()
 	defer dt.recipientMu.Unlock()
 
-	_, hadNotFound := dt.recipientNotFound[email]
-	_, hadBlocked := dt.recipientBlocked[email]
-
-	delete(dt.recipientNotFound, email)
-	delete(dt.recipientBlocked, email)
-
-	if hadNotFound || hadBlocked {
-		dt.logger.Info("Cleared stale recipient cache entry after successful validation",
-			"email", email,
-			"was_not_found", hadNotFound,
-			"was_blocked", hadBlocked)
+	if _, had := dt.recipientNotFound[email]; had {
+		delete(dt.recipientNotFound, email)
+		dt.logger.Info("Cleared stale recipient cache entry after successful validation", "email", email)
 	}
 }
 
-// IsRecipientCached checks if a recipient is in the cache and returns the status
-// Returns (found, isBlocked, reason)
-func (dt *DistributedTracker) IsRecipientCached(email string) (bool, bool, string) {
+// IsRecipientCached reports whether a recipient is in the "not found" cache
+// (a delivery 404 within the TTL).
+//
+// Only "not found" is cached. A delivery 403 is deliberately NOT: it means
+// this delivery was refused - a recipient blocking a sender - which says
+// nothing about the next sender. Caching it per recipient (and gossiping it)
+// made one blocked sender bounce everyone else's mail to that address.
+func (dt *DistributedTracker) IsRecipientCached(email string) bool {
 	dt.recipientMu.RLock()
 	defer dt.recipientMu.RUnlock()
 
-	now := time.Now()
-
-	// Check if recipient is in "not found" cache
-	if expiry, exists := dt.recipientNotFound[email]; exists {
-		if now.Before(expiry) {
-			return true, false, "recipient not found (cached)"
-		}
-	}
-
-	// Check if recipient is in "blocked" cache
-	if expiry, exists := dt.recipientBlocked[email]; exists {
-		if now.Before(expiry) {
-			return true, true, "recipient blocked by destination (cached)"
-		}
-	}
-
-	return false, false, ""
+	expiry, exists := dt.recipientNotFound[email]
+	return exists && time.Now().Before(expiry)
 }
 
 // Stop gracefully shuts down the distributed tracker
@@ -441,13 +396,16 @@ func (dt *DistributedTracker) Stop() {
 	dt.wg.Wait()
 }
 
-// TryAcquire attempts to acquire a connection slot with cluster-wide limit checking
-func (dt *DistributedTracker) TryAcquire(remoteAddr string) error {
+// Acquire attempts to acquire a connection slot with cluster-wide limit
+// checking and returns the lease that owns it.
+func (dt *DistributedTracker) Acquire(remoteAddr string) (*ConnLease, error) {
 	host, _, _ := parseAddr(remoteAddr)
+	host = bucketIP(host) // same key the local tracker counts under
 
 	// Step 1: Check local limit (fast path)
-	if err := dt.local.TryAcquire(remoteAddr); err != nil {
-		return err
+	lease, err := dt.local.Acquire(remoteAddr)
+	if err != nil {
+		return nil, err
 	}
 
 	// Step 2: Check estimated global limit (if configured)
@@ -473,17 +431,12 @@ func (dt *DistributedTracker) TryAcquire(remoteAddr string) error {
 
 		if globalCount > dt.globalMaxPerIP {
 			// Rollback local acquisition
-			dt.local.Release(remoteAddr)
-			return fmt.Errorf("estimated global connections per IP limit reached (%d)", dt.globalMaxPerIP)
+			lease.Release()
+			return nil, fmt.Errorf("estimated global connections per IP limit reached (%d)", dt.globalMaxPerIP)
 		}
 	}
 
-	return nil
-}
-
-// Release releases a connection slot
-func (dt *DistributedTracker) Release(remoteAddr string) {
-	dt.local.Release(remoteAddr)
+	return lease, nil
 }
 
 // GetStats returns current connection statistics from the local tracker
@@ -573,17 +526,12 @@ func (dt *DistributedTracker) createSnapshot() *ConnectionSnapshot {
 	for k, v := range dt.recipientNotFound {
 		notFoundCopy[k] = v
 	}
-	blockedCopy := make(map[string]time.Time, len(dt.recipientBlocked))
-	for k, v := range dt.recipientBlocked {
-		blockedCopy[k] = v
-	}
 	dt.recipientMu.RUnlock()
 
 	var recipientCache *RecipientCacheSnapshot
-	if len(notFoundCopy) > 0 || len(blockedCopy) > 0 {
+	if len(notFoundCopy) > 0 {
 		recipientCache = &RecipientCacheSnapshot{
 			NotFound: notFoundCopy,
-			Blocked:  blockedCopy,
 		}
 	}
 
@@ -728,27 +676,10 @@ func (dt *DistributedTracker) mergeRecipientCache(peerCache *RecipientCacheSnaps
 		}
 	}
 
-	// Merge "blocked" entries
-	for email, expiry := range peerCache.Blocked {
-		if email == "" || !now.Before(expiry) {
-			continue
-		}
-		expiry = clamp(expiry)
-		localExpiry, exists := dt.recipientBlocked[email]
-		if !exists && len(dt.recipientBlocked) >= maxRecipientCacheEntries {
-			continue // At capacity - don't accept new attacker-controlled entries
-		}
-		if !exists || expiry.After(localExpiry) {
-			dt.recipientBlocked[email] = expiry
-			merged++
-		}
-	}
-
 	if merged > 0 {
 		dt.logger.Debug("Merged recipient cache from peer",
 			"entries_merged", merged,
-			"total_not_found", len(dt.recipientNotFound),
-			"total_blocked", len(dt.recipientBlocked))
+			"total_not_found", len(dt.recipientNotFound))
 	}
 }
 
@@ -1081,15 +1012,12 @@ func (dt *DistributedTracker) FlushCache() map[string]int {
 	flushedCounts := make(map[string]int)
 
 	flushedCounts["recipient_not_found"] = len(dt.recipientNotFound)
-	flushedCounts["recipient_blocked"] = len(dt.recipientBlocked)
 
 	// Re-initialize the maps to clear them
 	dt.recipientNotFound = make(map[string]time.Time)
-	dt.recipientBlocked = make(map[string]time.Time)
 
 	dt.logger.Info("Recipient cache flushed via API",
-		"not_found_flushed", flushedCounts["recipient_not_found"],
-		"blocked_flushed", flushedCounts["recipient_blocked"])
+		"not_found_flushed", flushedCounts["recipient_not_found"])
 
 	return flushedCounts
 }

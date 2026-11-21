@@ -1,6 +1,7 @@
 package poster
 
 import (
+	"context"
 	"io"
 
 	"errors"
@@ -31,7 +32,7 @@ func TestCircuitBreaker_OpenAfterFailureThreshold(t *testing.T) {
 
 	// First 2 failures should keep it closed
 	for i := 0; i < 2; i++ {
-		err := cb.Call(func() error {
+		err := cb.Call(context.Background(), func() error {
 			return errors.New("test error")
 		})
 		if err == nil {
@@ -43,7 +44,7 @@ func TestCircuitBreaker_OpenAfterFailureThreshold(t *testing.T) {
 	}
 
 	// Third failure should open the circuit
-	err := cb.Call(func() error {
+	err := cb.Call(context.Background(), func() error {
 		return errors.New("test error")
 	})
 	if err == nil {
@@ -54,7 +55,7 @@ func TestCircuitBreaker_OpenAfterFailureThreshold(t *testing.T) {
 	}
 
 	// Circuit is open - should reject immediately
-	err = cb.Call(func() error {
+	err = cb.Call(context.Background(), func() error {
 		t.Error("Function should not be called when circuit is open")
 		return nil
 	})
@@ -72,7 +73,7 @@ func TestCircuitBreaker_TransitionToHalfOpen(t *testing.T) {
 
 	// Open the circuit
 	for i := 0; i < 2; i++ {
-		cb.Call(func() error {
+		cb.Call(context.Background(), func() error {
 			return errors.New("test error")
 		})
 	}
@@ -86,7 +87,7 @@ func TestCircuitBreaker_TransitionToHalfOpen(t *testing.T) {
 
 	// Next call should transition to half-open
 	var called bool
-	err := cb.Call(func() error {
+	err := cb.Call(context.Background(), func() error {
 		called = true
 		return nil
 	})
@@ -109,7 +110,7 @@ func TestCircuitBreaker_CloseAfterSuccessThreshold(t *testing.T) {
 
 	// Open the circuit
 	for i := 0; i < 2; i++ {
-		cb.Call(func() error {
+		cb.Call(context.Background(), func() error {
 			return errors.New("test error")
 		})
 	}
@@ -118,7 +119,7 @@ func TestCircuitBreaker_CloseAfterSuccessThreshold(t *testing.T) {
 	time.Sleep(150 * time.Millisecond)
 
 	// First success in half-open
-	err := cb.Call(func() error {
+	err := cb.Call(context.Background(), func() error {
 		return nil
 	})
 	if err != nil {
@@ -131,7 +132,7 @@ func TestCircuitBreaker_CloseAfterSuccessThreshold(t *testing.T) {
 	}
 
 	// Second success should close the circuit
-	err = cb.Call(func() error {
+	err = cb.Call(context.Background(), func() error {
 		return nil
 	})
 	if err != nil {
@@ -152,7 +153,7 @@ func TestCircuitBreaker_HalfOpenFailureReopens(t *testing.T) {
 
 	// Open the circuit
 	for i := 0; i < 2; i++ {
-		cb.Call(func() error {
+		cb.Call(context.Background(), func() error {
 			return errors.New("test error")
 		})
 	}
@@ -161,7 +162,7 @@ func TestCircuitBreaker_HalfOpenFailureReopens(t *testing.T) {
 	time.Sleep(150 * time.Millisecond)
 
 	// Failure in half-open should reopen
-	err := cb.Call(func() error {
+	err := cb.Call(context.Background(), func() error {
 		return errors.New("test error")
 	})
 	if err == nil {
@@ -182,13 +183,13 @@ func TestCircuitBreaker_SuccessResetsConsecutiveFailures(t *testing.T) {
 
 	// 2 failures
 	for i := 0; i < 2; i++ {
-		cb.Call(func() error {
+		cb.Call(context.Background(), func() error {
 			return errors.New("test error")
 		})
 	}
 
 	// 1 success should reset consecutive failures
-	err := cb.Call(func() error {
+	err := cb.Call(context.Background(), func() error {
 		return nil
 	})
 	if err != nil {
@@ -197,7 +198,7 @@ func TestCircuitBreaker_SuccessResetsConsecutiveFailures(t *testing.T) {
 
 	// 2 more failures shouldn't open (need 3 consecutive)
 	for i := 0; i < 2; i++ {
-		cb.Call(func() error {
+		cb.Call(context.Background(), func() error {
 			return errors.New("test error")
 		})
 	}
@@ -229,7 +230,7 @@ func TestCircuitBreaker_GetStats(t *testing.T) {
 	}
 
 	// Add a failure
-	cb.Call(func() error {
+	cb.Call(context.Background(), func() error {
 		return errors.New("test error")
 	})
 
@@ -252,7 +253,7 @@ func TestCircuitBreaker_Reset(t *testing.T) {
 
 	// Open the circuit
 	for i := 0; i < 2; i++ {
-		cb.Call(func() error {
+		cb.Call(context.Background(), func() error {
 			return errors.New("test error")
 		})
 	}
@@ -286,7 +287,7 @@ func TestCircuitBreaker_HalfOpenMaxCalls(t *testing.T) {
 
 	// Open the circuit
 	for i := 0; i < 2; i++ {
-		cb.Call(func() error {
+		cb.Call(context.Background(), func() error {
 			return errors.New("test error")
 		})
 	}
@@ -299,7 +300,7 @@ func TestCircuitBreaker_HalfOpenMaxCalls(t *testing.T) {
 	time.Sleep(150 * time.Millisecond)
 
 	// Verify we're in half-open and can make one call
-	err := cb.Call(func() error {
+	err := cb.Call(context.Background(), func() error {
 		return nil
 	})
 	if err != nil {
@@ -312,7 +313,7 @@ func TestCircuitBreaker_HalfOpenMaxCalls(t *testing.T) {
 	}
 
 	// Second call should also succeed (halfOpenCalls was decremented)
-	err = cb.Call(func() error {
+	err = cb.Call(context.Background(), func() error {
 		return nil
 	})
 	if err != nil {
@@ -325,7 +326,7 @@ func TestCircuitBreaker_HalfOpenMaxCalls(t *testing.T) {
 	}
 
 	// Third call should succeed and transition to closed
-	err = cb.Call(func() error {
+	err = cb.Call(context.Background(), func() error {
 		return nil
 	})
 	if err != nil {
@@ -370,7 +371,7 @@ func TestCircuitBreaker_ResetTimeoutInClosed(t *testing.T) {
 
 	// Add 2 failures
 	for i := 0; i < 2; i++ {
-		cb.Call(func() error {
+		cb.Call(context.Background(), func() error {
 			return errors.New("test error")
 		})
 	}
@@ -384,7 +385,7 @@ func TestCircuitBreaker_ResetTimeoutInClosed(t *testing.T) {
 	time.Sleep(150 * time.Millisecond)
 
 	// Next call should reset counters
-	cb.Call(func() error {
+	cb.Call(context.Background(), func() error {
 		return nil
 	})
 

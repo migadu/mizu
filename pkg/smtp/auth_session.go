@@ -1,8 +1,8 @@
 package smtp
 
 import (
+	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/emersion/go-sasl"
@@ -58,6 +58,19 @@ func (s *Session) Auth(mech string) (sasl.Server, error) {
 		}
 	}
 
+	// AUTH is not permitted during a mail transaction (RFC 4954 section 4).
+	// The sender is authorised against allowed_from inside Mail; a login
+	// arriving after MAIL FROM would attach an identity to an envelope sender
+	// it was never checked against.
+	if s.commandState >= stateMail {
+		s.Logger.Warn("AUTH attempted during mail transaction", "remote_addr", s.remoteAddr)
+		return nil, &smtp.SMTPError{
+			Code:         503,
+			EnhancedCode: smtp.EnhancedCode{5, 5, 1},
+			Message:      "AUTH not permitted during a mail transaction",
+		}
+	}
+
 	// Check if already authenticated
 	if s.isAuthenticated {
 		s.Logger.Warn("Already authenticated", "user", s.authenticatedUser)
@@ -79,11 +92,11 @@ func (s *Session) Auth(mech string) (sasl.Server, error) {
 
 		s.Logger.Debug("Authentication attempt", "username", user, "mechanism", mech)
 
-		// Extract IP from remoteAddr (format: "ip:port")
+		// s.remoteAddr is already a bare IP: NewSession strips the port. Do not
+		// cut at a colon here - on IPv6 that removes the last hextet, which
+		// leaves the limiter an unparseable key (no /64 bucketing, no subnet
+		// tier) and hands the auth backend a mangled $ip.
 		remoteIP := s.remoteAddr
-		if idx := strings.LastIndex(remoteIP, ":"); idx != -1 {
-			remoteIP = remoteIP[:idx]
-		}
 
 		// Rate-limiter work is bounded by the session budget: s.ctx carries only
 		// cancellation now that the deadline lives in sessionDeadline.
@@ -128,8 +141,18 @@ func (s *Session) Auth(mech string) (sasl.Server, error) {
 		// Only a genuine verdict feeds the brute-force damper. A transient
 		// backend error is neither a success nor a failed guess; counting it
 		// would spend a legitimate user's attempt budget on OUR outage.
-		if s.authRateLimiter != nil && err == nil {
-			s.authRateLimiter.RecordAuthAttempt(authCtx, remoteIP, user, authenticated)
+		//
+		// A wrong password IS a verdict, though it arrives as an error (so the
+		// reply stays a temporary 454): it carries ErrCredentialRejected.
+		// Without this branch, guessing against an existing account - the only
+		// kind worth guessing against - was never counted at all.
+		if s.authRateLimiter != nil {
+			switch {
+			case err == nil:
+				s.authRateLimiter.RecordAuthAttempt(authCtx, remoteIP, user, authenticated)
+			case errors.Is(err, ErrCredentialRejected):
+				s.authRateLimiter.RecordAuthAttempt(authCtx, remoteIP, user, false)
+			}
 		}
 
 		// ERROR IS CHECKED FIRST, and the order is the safety property. Per the

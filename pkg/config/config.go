@@ -72,6 +72,11 @@ func (c *Config) Validate() error {
 		return errors.New("no [[server]] sections defined - at least one server is required")
 	}
 
+	// Before the local-mode return below: these hold in every mode.
+	if err := c.validateNonNegative(); err != nil {
+		return err
+	}
+
 	// Handle duplicate server names (warn and de-duplicate)
 	seenNames := make(map[string]int)
 	for i := range c.Servers {
@@ -169,6 +174,16 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	// The gossip key is required in every mode. Local mode relaxes TLS and
+	// storage requirements, but the server still starts the cluster when
+	// cluster.enabled is set, and an unkeyed cluster accepts block, unblock and
+	// rate-limit state from anyone who can reach the gossip port.
+	if c.Cluster.Enabled {
+		if err := c.validateClusterSecretKey(); err != nil {
+			return err
+		}
+	}
+
 	// Production mode validations (skip in local mode)
 	if c.Local {
 		return nil
@@ -251,27 +266,39 @@ func (c *Config) Validate() error {
 		if bindPort < 1 || bindPort > 65535 {
 			return fmt.Errorf("cluster bind port must be between 1 and 65535, got %d", bindPort)
 		}
-
-		// A secret key is mandatory: without it gossip runs unauthenticated and
-		// unencrypted, so any host that reaches the gossip port can join the
-		// cluster and inject rate-limit / connection-state / auth-block messages.
-		// (CLUSTER_SECRET_KEY env var is copied into SecretKey during load.)
-		if c.Cluster.SecretKey == "" {
-			return errors.New("cluster.secret_key (or CLUSTER_SECRET_KEY env var) must be set when cluster.enabled=true - gossip must be authenticated and encrypted")
-		}
-		decoded, err := base64.StdEncoding.DecodeString(c.Cluster.SecretKey)
-		if err != nil {
-			return fmt.Errorf("cluster.secret_key must be base64-encoded: %w", err)
-		}
-		if len(decoded) != 32 {
-			return fmt.Errorf("cluster.secret_key must decode to exactly 32 bytes (got %d) - generate with: openssl rand -base64 32", len(decoded))
-		}
 	}
 
 	return nil
 }
 
 // Validate validates a single server configuration
+// validateNonNegative rejects negative values for settings where 0 means
+// "use the default". A negative number is not caught by those "== 0" default
+// checks and then misbehaves at runtime: half_open_max_calls = -1 wedges the
+// delivery circuit breaker in half-open, and a negative DNS timeout makes
+// every lookup time out (which the sender-domain check treats as a pass).
+func (c *Config) validateNonNegative() error {
+	if c.DNS.TimeoutSeconds < 0 {
+		return fmt.Errorf("dns.timeout_seconds must not be negative, got %d", c.DNS.TimeoutSeconds)
+	}
+	for i := range c.Servers {
+		cb := c.Servers[i].Delivery.CircuitBreaker
+		for name, v := range map[string]int{
+			"failure_threshold":     cb.FailureThreshold,
+			"success_threshold":     cb.SuccessThreshold,
+			"timeout_seconds":       cb.TimeoutSeconds,
+			"half_open_max_calls":   cb.HalfOpenMaxCalls,
+			"reset_timeout_seconds": cb.ResetTimeoutSeconds,
+		} {
+			if v < 0 {
+				return fmt.Errorf("server %q: delivery.circuit_breaker.%s must not be negative, got %d",
+					c.Servers[i].Name, name, v)
+			}
+		}
+	}
+	return nil
+}
+
 func (s *ServerConfig) Validate() error {
 	// Required fields
 	if s.Name == "" {
@@ -437,5 +464,24 @@ func (s *ServerConfig) Validate() error {
 		}
 	}
 
+	return nil
+}
+
+// validateClusterSecretKey checks that the gossip key is present and well
+// formed. A secret key is mandatory: without it gossip runs unauthenticated and
+// unencrypted, so any host that reaches the gossip port can join the cluster
+// and inject rate-limit / connection-state / auth-block messages.
+// (CLUSTER_SECRET_KEY env var is copied into SecretKey during load.)
+func (c *Config) validateClusterSecretKey() error {
+	if c.Cluster.SecretKey == "" {
+		return errors.New("cluster.secret_key (or CLUSTER_SECRET_KEY env var) must be set when cluster.enabled=true - gossip must be authenticated and encrypted")
+	}
+	decoded, err := base64.StdEncoding.DecodeString(c.Cluster.SecretKey)
+	if err != nil {
+		return fmt.Errorf("cluster.secret_key must be base64-encoded: %w", err)
+	}
+	if len(decoded) != 32 {
+		return fmt.Errorf("cluster.secret_key must decode to exactly 32 bytes (got %d) - generate with: openssl rand -base64 32", len(decoded))
+	}
 	return nil
 }

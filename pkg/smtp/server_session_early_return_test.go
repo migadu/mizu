@@ -66,7 +66,7 @@ func TestBackend_EarlyReturn_WaitGroupLeak(t *testing.T) {
 
 	// Simulate what happens in NewSession when validation fails
 	// This is the sequence that caused the bug:
-	// 1. Connection limit check passes (TryAcquire)
+	// 1. Connection limit check passes (Acquire)
 	// 2. WaitGroup.Add(1) and sessionCount.Add(1)
 	// 3. Early return due to rDNS/blacklist/etc BEFORE sessionCreated = true
 	// 4. Bug: WaitGroup and counter were NOT decremented
@@ -75,8 +75,9 @@ func TestBackend_EarlyReturn_WaitGroupLeak(t *testing.T) {
 	remoteAddr := "192.0.2.1:12345" // TEST-NET-1, no rDNS
 
 	// Step 1: Acquire connection slot (this would succeed)
-	if err := tracker.TryAcquire(remoteAddr); err != nil {
-		t.Fatalf("TryAcquire failed: %v", err)
+	connLease, err := tracker.Acquire(remoteAddr)
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
 	}
 
 	// Step 2: Increment WaitGroup and counter (like NewSession does)
@@ -94,7 +95,7 @@ func TestBackend_EarlyReturn_WaitGroupLeak(t *testing.T) {
 	// This is what the buggy code was missing - simulate the defer executing
 	if !sessionCreated {
 		// Connection tracker cleanup (this was working)
-		tracker.Release(remoteAddr)
+		connLease.Release()
 
 		// WaitGroup and counter cleanup (this was MISSING in buggy code)
 		sessionCount.Add(-1)
@@ -146,8 +147,9 @@ func TestBackend_EarlyReturn_MultipleRejects(t *testing.T) {
 		remoteAddr := "192.0.2.1:12345"
 
 		// Acquire
-		if err := tracker.TryAcquire(remoteAddr); err != nil {
-			t.Fatalf("Attempt %d: TryAcquire failed: %v", i, err)
+		connLease, err := tracker.Acquire(remoteAddr)
+		if err != nil {
+			t.Fatalf("Attempt %d: Acquire failed: %v", i, err)
 		}
 
 		// Increment
@@ -157,7 +159,7 @@ func TestBackend_EarlyReturn_MultipleRejects(t *testing.T) {
 		// Early return cleanup
 		sessionCreated := false
 		if !sessionCreated {
-			tracker.Release(remoteAddr)
+			connLease.Release()
 			sessionCount.Add(-1)
 			wg.Done()
 		}

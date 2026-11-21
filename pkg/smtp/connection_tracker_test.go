@@ -13,26 +13,27 @@ func TestConnectionTracker_GlobalLimit(t *testing.T) {
 	tracker := NewConnectionTracker(3, 0, 0, nil) // Max 3 total, unlimited per IP
 
 	// Acquire 3 connections from different IPs
-	if err := tracker.TryAcquire("192.168.1.1:1234"); err != nil {
+	first, err := tracker.Acquire("192.168.1.1:1234")
+	if err != nil {
 		t.Errorf("Expected to acquire connection 1, got error: %v", err)
 	}
-	if err := tracker.TryAcquire("192.168.1.2:1234"); err != nil {
+	if _, err := tracker.Acquire("192.168.1.2:1234"); err != nil {
 		t.Errorf("Expected to acquire connection 2, got error: %v", err)
 	}
-	if err := tracker.TryAcquire("192.168.1.3:1234"); err != nil {
+	if _, err := tracker.Acquire("192.168.1.3:1234"); err != nil {
 		t.Errorf("Expected to acquire connection 3, got error: %v", err)
 	}
 
 	// 4th connection should fail
-	if err := tracker.TryAcquire("192.168.1.4:1234"); err == nil {
+	if _, err := tracker.Acquire("192.168.1.4:1234"); err == nil {
 		t.Error("Expected error when exceeding global limit, got nil")
 	}
 
 	// Release one connection
-	tracker.Release("192.168.1.1:1234")
+	first.Release()
 
 	// Now should be able to acquire again
-	if err := tracker.TryAcquire("192.168.1.4:1234"); err != nil {
+	if _, err := tracker.Acquire("192.168.1.4:1234"); err != nil {
 		t.Errorf("Expected to acquire connection after release, got error: %v", err)
 	}
 
@@ -50,28 +51,29 @@ func TestConnectionTracker_PerIPLimit(t *testing.T) {
 	tracker := NewConnectionTracker(0, 2, 0, nil) // Unlimited total, max 2 per IP
 
 	// Acquire 2 connections from same IP
-	if err := tracker.TryAcquire("192.168.1.1:1234"); err != nil {
+	first, err := tracker.Acquire("192.168.1.1:1234")
+	if err != nil {
 		t.Errorf("Expected to acquire connection 1, got error: %v", err)
 	}
-	if err := tracker.TryAcquire("192.168.1.1:5678"); err != nil {
+	if _, err := tracker.Acquire("192.168.1.1:5678"); err != nil {
 		t.Errorf("Expected to acquire connection 2, got error: %v", err)
 	}
 
 	// 3rd connection from same IP should fail
-	if err := tracker.TryAcquire("192.168.1.1:9999"); err == nil {
+	if _, err := tracker.Acquire("192.168.1.1:9999"); err == nil {
 		t.Error("Expected error when exceeding per-IP limit, got nil")
 	}
 
 	// Different IP should work
-	if err := tracker.TryAcquire("192.168.1.2:1234"); err != nil {
+	if _, err := tracker.Acquire("192.168.1.2:1234"); err != nil {
 		t.Errorf("Expected to acquire connection from different IP, got error: %v", err)
 	}
 
 	// Release one connection from first IP
-	tracker.Release("192.168.1.1:1234")
+	first.Release()
 
 	// Now should be able to acquire from that IP again
-	if err := tracker.TryAcquire("192.168.1.1:9999"); err != nil {
+	if _, err := tracker.Acquire("192.168.1.1:9999"); err != nil {
 		t.Errorf("Expected to acquire connection after release, got error: %v", err)
 	}
 
@@ -92,23 +94,23 @@ func TestConnectionTracker_BothLimits(t *testing.T) {
 	tracker := NewConnectionTracker(5, 2, 0, nil) // Max 5 total, max 2 per IP
 
 	// Acquire 2 connections from IP1
-	tracker.TryAcquire("192.168.1.1:1234")
-	tracker.TryAcquire("192.168.1.1:5678")
+	tracker.Acquire("192.168.1.1:1234")
+	tracker.Acquire("192.168.1.1:5678")
 
 	// 3rd from IP1 should fail (per-IP limit)
-	if err := tracker.TryAcquire("192.168.1.1:9999"); err == nil {
+	if _, err := tracker.Acquire("192.168.1.1:9999"); err == nil {
 		t.Error("Expected error for per-IP limit, got nil")
 	}
 
 	// Acquire 2 from IP2
-	tracker.TryAcquire("192.168.1.2:1234")
-	tracker.TryAcquire("192.168.1.2:5678")
+	tracker.Acquire("192.168.1.2:1234")
+	tracker.Acquire("192.168.1.2:5678")
 
 	// Acquire 1 from IP3 (total = 5)
-	tracker.TryAcquire("192.168.1.3:1234")
+	tracker.Acquire("192.168.1.3:1234")
 
 	// Next connection should fail (global limit)
-	if err := tracker.TryAcquire("192.168.1.4:1234"); err == nil {
+	if _, err := tracker.Acquire("192.168.1.4:1234"); err == nil {
 		t.Error("Expected error for global limit, got nil")
 	}
 }
@@ -119,7 +121,7 @@ func TestConnectionTracker_UnlimitedMode(t *testing.T) {
 	// Should accept many connections
 	for i := 0; i < 1000; i++ {
 		addr := fmt.Sprintf("192.168.1.1:%d", 1000+i)
-		if err := tracker.TryAcquire(addr); err != nil {
+		if _, err := tracker.Acquire(addr); err != nil {
 			t.Errorf("Expected unlimited mode to accept connection, got error: %v", err)
 		}
 	}
@@ -134,15 +136,15 @@ func TestConnectionTracker_IPv6(t *testing.T) {
 	tracker := NewConnectionTracker(0, 2, 0, nil) // Max 2 per IP
 
 	// Test with IPv6 addresses
-	if err := tracker.TryAcquire("[2001:db8::1]:1234"); err != nil {
+	if _, err := tracker.Acquire("[2001:db8::1]:1234"); err != nil {
 		t.Errorf("Expected to acquire IPv6 connection 1, got error: %v", err)
 	}
-	if err := tracker.TryAcquire("[2001:db8::1]:5678"); err != nil {
+	if _, err := tracker.Acquire("[2001:db8::1]:5678"); err != nil {
 		t.Errorf("Expected to acquire IPv6 connection 2, got error: %v", err)
 	}
 
 	// 3rd connection from same IPv6 should fail
-	if err := tracker.TryAcquire("[2001:db8::1]:9999"); err == nil {
+	if _, err := tracker.Acquire("[2001:db8::1]:9999"); err == nil {
 		t.Error("Expected error when exceeding per-IP limit for IPv6, got nil")
 	}
 }
@@ -157,12 +159,13 @@ func TestConnectionTracker_ConcurrentAccess(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			addr := fmt.Sprintf("192.168.1.%d:1234", id%10) // 10 different IPs
-			if err := tracker.TryAcquire(addr); err != nil {
+			lease, err := tracker.Acquire(addr)
+			if err != nil {
 				// Expected if limit reached
 				return
 			}
 			// Simulate some work
-			tracker.Release(addr)
+			lease.Release()
 		}(i)
 	}
 
@@ -181,8 +184,10 @@ func TestConnectionTracker_ConcurrentAccess(t *testing.T) {
 func TestConnectionTracker_ReleaseNonExistent(t *testing.T) {
 	tracker := NewConnectionTracker(10, 5, 0, nil)
 
-	// Release without acquire should not panic or cause issues
-	tracker.Release("192.168.1.1:1234")
+	// Releasing a slot that was never acquired (a nil lease, as held by a
+	// connection whose Acquire failed) should not panic or cause issues
+	var none *ConnLease
+	none.Release()
 
 	total, uniqueIPs, _ := tracker.GetStats()
 	if total != 0 {
@@ -190,6 +195,29 @@ func TestConnectionTracker_ReleaseNonExistent(t *testing.T) {
 	}
 	if uniqueIPs != 0 {
 		t.Errorf("Expected 0 unique IPs, got %d", uniqueIPs)
+	}
+
+	// Releasing a slot that is already gone must not underflow the counters
+	// or take the slot of another connection from the same IP.
+	gone, err := tracker.Acquire("192.168.1.1:1234")
+	if err != nil {
+		t.Fatalf("Expected to acquire connection, got error: %v", err)
+	}
+	if _, err := tracker.Acquire("192.168.1.1:5678"); err != nil {
+		t.Fatalf("Expected to acquire second connection, got error: %v", err)
+	}
+	gone.Release()
+	gone.Release()
+
+	total, uniqueIPs, perIP := tracker.GetStats()
+	if total != 1 {
+		t.Errorf("Expected 1 connection after double release, got %d", total)
+	}
+	if uniqueIPs != 1 {
+		t.Errorf("Expected 1 unique IP after double release, got %d", uniqueIPs)
+	}
+	if perIP["192.168.1.1"] != 1 {
+		t.Errorf("Expected 1 connection from 192.168.1.1, got %d", perIP["192.168.1.1"])
 	}
 }
 
@@ -211,8 +239,11 @@ func TestConnectionTracker_MemoryLeak(t *testing.T) {
 	// Acquire and release many connections
 	for i := 0; i < 100; i++ {
 		addr := fmt.Sprintf("192.168.1.%d:1234", i)
-		tracker.TryAcquire(addr)
-		tracker.Release(addr)
+		lease, err := tracker.Acquire(addr)
+		if err != nil {
+			t.Fatalf("Expected to acquire connection for %s, got error: %v", addr, err)
+		}
+		lease.Release()
 	}
 
 	// Map should be empty after all releases
@@ -245,7 +276,7 @@ func TestConnectionTracker_ReaperForceRelease(t *testing.T) {
 	}
 
 	for _, ip := range ips {
-		if err := tracker.TryAcquire(ip); err != nil {
+		if _, err := tracker.Acquire(ip); err != nil {
 			t.Fatalf("Failed to acquire connection for %s: %v", ip, err)
 		}
 	}
@@ -302,15 +333,15 @@ func TestConnectionTracker_ReaperPartialRelease(t *testing.T) {
 	defer tracker.Stop()
 
 	// Acquire 2 connections initially
-	tracker.TryAcquire("192.168.1.1:1111")
-	tracker.TryAcquire("192.168.1.2:2222")
+	tracker.Acquire("192.168.1.1:1111")
+	tracker.Acquire("192.168.1.2:2222")
 
 	// Wait 2 seconds
 	time.Sleep(2 * time.Second)
 
 	// Acquire 2 more connections (these are newer)
-	tracker.TryAcquire("192.168.1.3:3333")
-	tracker.TryAcquire("192.168.1.4:4444")
+	tracker.Acquire("192.168.1.3:3333")
+	tracker.Acquire("192.168.1.4:4444")
 
 	// Verify 4 total connections
 	total, _, _ := tracker.GetStats()
@@ -355,12 +386,15 @@ func TestConnectionTracker_ReaperWithManualRelease(t *testing.T) {
 	defer tracker.Stop()
 
 	// Acquire 3 connections
-	tracker.TryAcquire("192.168.1.1:1111")
-	tracker.TryAcquire("192.168.1.2:2222")
-	tracker.TryAcquire("192.168.1.3:3333")
+	tracker.Acquire("192.168.1.1:1111")
+	second, err := tracker.Acquire("192.168.1.2:2222")
+	if err != nil {
+		t.Fatalf("Failed to acquire connection: %v", err)
+	}
+	tracker.Acquire("192.168.1.3:3333")
 
 	// Manually release one connection
-	tracker.Release("192.168.1.2:2222")
+	second.Release()
 
 	// Wait for reaper to run
 	time.Sleep(3 * time.Second)
@@ -390,8 +424,8 @@ func TestConnectionTracker_ReaperDisabled(t *testing.T) {
 	defer tracker.Stop()                             // Should be no-op
 
 	// Acquire connections
-	tracker.TryAcquire("192.168.1.1:1111")
-	tracker.TryAcquire("192.168.1.2:2222")
+	tracker.Acquire("192.168.1.1:1111")
+	tracker.Acquire("192.168.1.2:2222")
 
 	// Wait (reaper should not run)
 	time.Sleep(1 * time.Second)

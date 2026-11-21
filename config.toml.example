@@ -17,6 +17,7 @@ debug = false
 enable_trace_id_header = true
 enable_auth_results_header = true
 enable_junk_header = true
+enable_envelope_to_header = true
 strip_client_identity = false
 helo_validation = true
 spf_check = false
@@ -38,7 +39,6 @@ min_tls_version = "1.2"
 max_tls_version = ""
 extra_cipher_suites = []
 [server.validation]
-allow_null_sender = true
 missing_headers_action = "fix"
 loop_detection = true
 max_hops = 30

@@ -14,6 +14,17 @@ import (
 	"migadu/mizu/pkg/metrics"
 )
 
+// Bounds on the response cache. Keys and values are both chosen by whoever
+// sends us mail (DKIM selectors, SPF includes, HELO names, and the contents of
+// their zones), so the cache needs a hard ceiling.
+const (
+	// maxCacheEntries caps the number of cached responses.
+	maxCacheEntries = 50000
+	// maxCachedAnswerBytes caps the size of one cached response. Larger answers
+	// are still returned to the caller, just not retained.
+	maxCachedAnswerBytes = 16 * 1024
+)
+
 // cacheEntry represents a cached DNS response
 type cacheEntry struct {
 	addrs     []string
@@ -167,8 +178,20 @@ func (r *ResilientResolver) getCached(key string) ([]string, bool) {
 
 // putCache stores a DNS response in the cache
 func (r *ResilientResolver) putCache(key string, addrs []string) {
+	size := 0
+	for _, a := range addrs {
+		size += len(a)
+	}
+	if size > maxCachedAnswerBytes {
+		return // Too large to retain; the caller already has the answer
+	}
+
 	r.cacheMu.Lock()
 	defer r.cacheMu.Unlock()
+
+	if _, exists := r.cache[key]; !exists && len(r.cache) >= maxCacheEntries {
+		r.evictLocked()
+	}
 
 	// Store copy to prevent external modification
 	cachedAddrs := make([]string, len(addrs))
@@ -177,6 +200,31 @@ func (r *ResilientResolver) putCache(key string, addrs []string) {
 	r.cache[key] = &cacheEntry{
 		addrs:     cachedAddrs,
 		expiresAt: time.Now().Add(r.cacheTTL),
+	}
+}
+
+// evictLocked makes room in a full cache: expired entries go first, and if that
+// frees nothing, a tenth of the cache is dropped. Go's map iteration order is
+// randomized, so this is random eviction - good enough for a cache whose
+// entries are cheap to refetch, and it cannot be steered by the sender.
+// cacheMu must be held.
+func (r *ResilientResolver) evictLocked() {
+	now := time.Now()
+	for key, entry := range r.cache {
+		if now.After(entry.expiresAt) {
+			delete(r.cache, key)
+		}
+	}
+	if len(r.cache) < maxCacheEntries {
+		return
+	}
+	drop := maxCacheEntries / 10
+	for key := range r.cache {
+		if drop == 0 {
+			break
+		}
+		delete(r.cache, key)
+		drop--
 	}
 }
 

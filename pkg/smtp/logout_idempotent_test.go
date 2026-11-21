@@ -26,8 +26,9 @@ func TestLogout_Idempotent(t *testing.T) {
 	remoteAddr := "192.168.1.1"
 
 	// Acquire a connection slot (like NewSession does)
-	if err := tracker.TryAcquire(remoteAddr); err != nil {
-		t.Fatalf("TryAcquire failed: %v", err)
+	lease1, err := tracker.Acquire(remoteAddr)
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
 	}
 	wg.Add(1)
 	sessionCount.Add(1)
@@ -35,6 +36,7 @@ func TestLogout_Idempotent(t *testing.T) {
 	session := &Session{
 		remoteAddr:   remoteAddr,
 		connTracker:  tracker,
+		connLease:    lease1,
 		sessionsWg:   &wg,
 		sessionCount: &sessionCount,
 		Logger:       logger,
@@ -107,8 +109,9 @@ func TestLogout_Idempotent_WithDistributedTracker(t *testing.T) {
 	remoteAddr := "10.0.0.1"
 
 	// Acquire via distributed tracker
-	if err := distTracker.TryAcquire(remoteAddr); err != nil {
-		t.Fatalf("TryAcquire failed: %v", err)
+	lease2, err := distTracker.Acquire(remoteAddr)
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
 	}
 	wg.Add(1)
 	sessionCount.Add(1)
@@ -116,6 +119,7 @@ func TestLogout_Idempotent_WithDistributedTracker(t *testing.T) {
 	session := &Session{
 		remoteAddr:   remoteAddr,
 		distTracker:  distTracker,
+		connLease:    lease2,
 		sessionsWg:   &wg,
 		sessionCount: &sessionCount,
 		Logger:       logger,
@@ -172,8 +176,9 @@ func TestLogout_SimulateReEHLO(t *testing.T) {
 	remoteAddr := "172.16.0.1"
 
 	// --- First EHLO: create session A ---
-	if err := tracker.TryAcquire(remoteAddr); err != nil {
-		t.Fatalf("TryAcquire for session A failed: %v", err)
+	lease3, err := tracker.Acquire(remoteAddr)
+	if err != nil {
+		t.Fatalf("Acquire for session A failed: %v", err)
 	}
 	wg.Add(1)
 	sessionCount.Add(1)
@@ -181,6 +186,7 @@ func TestLogout_SimulateReEHLO(t *testing.T) {
 	sessionA := &Session{
 		remoteAddr:   remoteAddr,
 		connTracker:  tracker,
+		connLease:    lease3,
 		sessionsWg:   &wg,
 		sessionCount: &sessionCount,
 		Logger:       logger,
@@ -207,8 +213,9 @@ func TestLogout_SimulateReEHLO(t *testing.T) {
 	}
 
 	// NewSession acquires a new slot for session B
-	if err := tracker.TryAcquire(remoteAddr); err != nil {
-		t.Fatalf("TryAcquire for session B failed: %v", err)
+	lease4, err := tracker.Acquire(remoteAddr)
+	if err != nil {
+		t.Fatalf("Acquire for session B failed: %v", err)
 	}
 	wg.Add(1)
 	sessionCount.Add(1)
@@ -216,6 +223,7 @@ func TestLogout_SimulateReEHLO(t *testing.T) {
 	sessionB := &Session{
 		remoteAddr:   remoteAddr,
 		connTracker:  tracker,
+		connLease:    lease4,
 		sessionsWg:   &wg,
 		sessionCount: &sessionCount,
 		Logger:       logger,
@@ -280,8 +288,9 @@ func TestLogout_ConcurrentCalls(t *testing.T) {
 
 	remoteAddr := "10.0.0.5"
 
-	if err := tracker.TryAcquire(remoteAddr); err != nil {
-		t.Fatalf("TryAcquire failed: %v", err)
+	lease5, err := tracker.Acquire(remoteAddr)
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
 	}
 	wg.Add(1)
 	sessionCount.Add(1)
@@ -289,6 +298,7 @@ func TestLogout_ConcurrentCalls(t *testing.T) {
 	session := &Session{
 		remoteAddr:   remoteAddr,
 		connTracker:  tracker,
+		connLease:    lease5,
 		sessionsWg:   &wg,
 		sessionCount: &sessionCount,
 		Logger:       logger,

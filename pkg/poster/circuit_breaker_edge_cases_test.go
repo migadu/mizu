@@ -1,6 +1,7 @@
 package poster
 
 import (
+	"context"
 	"io"
 
 	"errors"
@@ -26,7 +27,7 @@ func TestCircuitBreaker_HalfOpenCallsNeverNegative(t *testing.T) {
 
 	// Force circuit to Open state by triggering failures
 	for i := 0; i < 3; i++ {
-		cb.Call(func() error {
+		cb.Call(context.Background(), func() error {
 			return errors.New("failure")
 		})
 	}
@@ -42,7 +43,7 @@ func TestCircuitBreaker_HalfOpenCallsNeverNegative(t *testing.T) {
 	time.Sleep(150 * time.Millisecond)
 
 	// First call in Half-Open - should increment halfOpenCalls to 1
-	err := cb.Call(func() error {
+	err := cb.Call(context.Background(), func() error {
 		return nil // Success
 	})
 	if err != nil {
@@ -57,7 +58,7 @@ func TestCircuitBreaker_HalfOpenCallsNeverNegative(t *testing.T) {
 	cb.mu.RUnlock()
 
 	// Second successful call (should close circuit if successThreshold=2)
-	err = cb.Call(func() error {
+	err = cb.Call(context.Background(), func() error {
 		return nil
 	})
 	if err != nil {
@@ -95,8 +96,8 @@ func TestCircuitBreaker_ConcurrentHalfOpenCalls(t *testing.T) {
 	cb := NewCircuitBreaker(config, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 
 	// Force to Open state
-	cb.Call(func() error { return errors.New("fail") })
-	cb.Call(func() error { return errors.New("fail") })
+	cb.Call(context.Background(), func() error { return errors.New("fail") })
+	cb.Call(context.Background(), func() error { return errors.New("fail") })
 
 	// Wait for Half-Open
 	time.Sleep(150 * time.Millisecond)
@@ -111,7 +112,7 @@ func TestCircuitBreaker_ConcurrentHalfOpenCalls(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			err := cb.Call(func() error {
+			err := cb.Call(context.Background(), func() error {
 				time.Sleep(10 * time.Millisecond) // Simulate work
 				return nil
 			})
@@ -165,14 +166,14 @@ func TestCircuitBreaker_HalfOpenFailureResetsCounter(t *testing.T) {
 	cb := NewCircuitBreaker(config, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 
 	// Force to Open
-	cb.Call(func() error { return errors.New("fail") })
-	cb.Call(func() error { return errors.New("fail") })
+	cb.Call(context.Background(), func() error { return errors.New("fail") })
+	cb.Call(context.Background(), func() error { return errors.New("fail") })
 
 	// Wait for Half-Open
 	time.Sleep(150 * time.Millisecond)
 
 	// First call succeeds - increments and decrements
-	cb.Call(func() error { return nil })
+	cb.Call(context.Background(), func() error { return nil })
 
 	// Check state is still Half-Open (needs 2 successes)
 	cb.mu.RLock()
@@ -185,7 +186,7 @@ func TestCircuitBreaker_HalfOpenFailureResetsCounter(t *testing.T) {
 	}
 
 	// Second call fails - should reset to Open and reset halfOpenCalls to 0
-	cb.Call(func() error { return errors.New("fail") })
+	cb.Call(context.Background(), func() error { return errors.New("fail") })
 
 	cb.mu.RLock()
 	state2 := cb.state
@@ -251,10 +252,10 @@ func TestCircuitBreaker_StateTransitions(t *testing.T) {
 	checkInvariants("Initial")
 
 	// Closed → Open (2 failures)
-	cb.Call(func() error { return errors.New("fail1") })
+	cb.Call(context.Background(), func() error { return errors.New("fail1") })
 	checkInvariants("After 1 failure")
 
-	cb.Call(func() error { return errors.New("fail2") })
+	cb.Call(context.Background(), func() error { return errors.New("fail2") })
 	checkInvariants("After 2 failures (should be Open)")
 
 	// Open → Half-Open (wait timeout)
@@ -262,10 +263,10 @@ func TestCircuitBreaker_StateTransitions(t *testing.T) {
 	checkInvariants("After timeout (before Half-Open call)")
 
 	// Half-Open → Closed (2 successes)
-	cb.Call(func() error { return nil })
+	cb.Call(context.Background(), func() error { return nil })
 	checkInvariants("After 1 success in Half-Open")
 
-	cb.Call(func() error { return nil })
+	cb.Call(context.Background(), func() error { return nil })
 	checkInvariants("After 2 successes (should be Closed)")
 
 	cb.mu.RLock()

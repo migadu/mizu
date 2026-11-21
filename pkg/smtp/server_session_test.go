@@ -198,7 +198,6 @@ func TestSession_Reset(t *testing.T) {
 	session := &Session{
 		from:         "sender@example.com",
 		to:           []string{"recipient1@example.com", "recipient2@example.com"},
-		mailData:     bytes.Buffer{},
 		isJunk:       true,
 		junkReasons:  []string{"test reason"},
 		senderDomain: "example.com",
@@ -211,9 +210,6 @@ func TestSession_Reset(t *testing.T) {
 		globalConfig: backend.GlobalConfig,
 	}
 
-	// Write some data
-	session.mailData.WriteString("test data")
-
 	// Reset
 	session.Reset()
 
@@ -223,9 +219,6 @@ func TestSession_Reset(t *testing.T) {
 	}
 	if len(session.to) != 0 {
 		t.Error("to should be empty after reset")
-	}
-	if session.mailData.Len() != 0 {
-		t.Error("mailData should be empty after reset")
 	}
 	if session.isJunk {
 		t.Error("isJunk should be false after reset")
@@ -296,13 +289,13 @@ func TestConnectionTracker_Basic(t *testing.T) {
 	tracker := NewConnectionTracker(10, 2, 0, nil)
 
 	// Test acquiring connection
-	err := tracker.TryAcquire("192.168.1.1:12345")
+	lease, err := tracker.Acquire("192.168.1.1:12345")
 	if err != nil {
 		t.Fatalf("First acquire should succeed: %v", err)
 	}
 
 	// Test releasing connection
-	tracker.Release("192.168.1.1:12345")
+	lease.Release()
 
 	// Verify released
 	total, _, _ := tracker.GetStats()
@@ -318,25 +311,25 @@ func TestConnectionTracker_Limits(t *testing.T) {
 	tracker := NewConnectionTracker(3, 2, 0, nil)
 
 	// Acquire up to per-IP limit
-	if err := tracker.TryAcquire("192.168.1.1:1"); err != nil {
+	if _, err := tracker.Acquire("192.168.1.1:1"); err != nil {
 		t.Fatalf("First acquire failed: %v", err)
 	}
-	if err := tracker.TryAcquire("192.168.1.1:2"); err != nil {
+	if _, err := tracker.Acquire("192.168.1.1:2"); err != nil {
 		t.Fatalf("Second acquire failed: %v", err)
 	}
 
 	// Third from same IP should fail
-	if err := tracker.TryAcquire("192.168.1.1:3"); err == nil {
+	if _, err := tracker.Acquire("192.168.1.1:3"); err == nil {
 		t.Error("Expected per-IP limit to be enforced")
 	}
 
 	// Different IP should work
-	if err := tracker.TryAcquire("192.168.1.2:1"); err != nil {
+	if _, err := tracker.Acquire("192.168.1.2:1"); err != nil {
 		t.Fatalf("Acquire from different IP failed: %v", err)
 	}
 
 	// Fourth connection should fail (global limit)
-	if err := tracker.TryAcquire("192.168.1.3:1"); err == nil {
+	if _, err := tracker.Acquire("192.168.1.3:1"); err == nil {
 		t.Error("Expected global limit to be enforced")
 	}
 
@@ -371,9 +364,9 @@ func TestConnectionTracker_Stats(t *testing.T) {
 	tracker := NewConnectionTracker(10, 5, 0, nil)
 
 	// Acquire some connections
-	tracker.TryAcquire("192.168.1.1:1")
-	tracker.TryAcquire("192.168.1.1:2")
-	tracker.TryAcquire("192.168.1.2:1")
+	tracker.Acquire("192.168.1.1:1")
+	tracker.Acquire("192.168.1.1:2")
+	tracker.Acquire("192.168.1.2:1")
 
 	total, uniqueIPs, perIP := tracker.GetStats()
 
